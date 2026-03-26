@@ -10,17 +10,19 @@ Handles:
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
+import traceback
 import uuid
 from typing import Any, Callable, Optional
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from .notifier import register_client, unregister_client, set_store
+from .notifier import register_client, unregister_client, set_store, get_sync_registry
 from .store import EntityStore
-from .sync import sync_registry, resolve_sync
+from .sync import resolve_sync
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +34,10 @@ def create_ws_handler(
 ):
     """Create a Starlette WebSocket handler for the Entangled protocol."""
 
+    # One-time setup — not per-connection
+    set_store(store)
+
     async def ws_handler(websocket: WebSocket):
-        set_store(store)
         await websocket.accept()
 
         # ── Auth ─────────────────────────────────────────────────
@@ -52,24 +56,36 @@ def create_ws_handler(
 
         client_id = str(uuid.uuid4())
 
-        # ── Push callback ────────────────────────────────────────
-        import asyncio
+        # ── Push callback (queue-based, no lost exceptions) ──────
+        push_queue: asyncio.Queue = asyncio.Queue()
 
-        async def push_fn(event: str, data: Any):
+        async def push_consumer():
+            """Drain push queue and send to WS. Exits when client disconnects."""
             try:
-                if isinstance(data, dict) and data.get("type") == "sync":
-                    await websocket.send_json(data)
-                else:
-                    await websocket.send_json({
-                        "type": "push",
-                        "event": event,
-                        "data": data,
-                    })
-            except Exception:
+                while True:
+                    msg = await push_queue.get()
+                    if msg is None:
+                        break
+                    try:
+                        await websocket.send_json(msg)
+                    except Exception:
+                        break
+            except asyncio.CancelledError:
                 pass
 
         def sync_push(event: str, data: Any):
-            asyncio.ensure_future(push_fn(event, data))
+            """Sync callback for notifier — enqueue, never blocks."""
+            if isinstance(data, dict) and data.get("type") == "sync":
+                push_queue.put_nowait(data)
+            else:
+                push_queue.put_nowait({
+                    "type": "push",
+                    "event": event,
+                    "data": data,
+                })
+
+        # Start push consumer task
+        consumer_task = asyncio.ensure_future(push_consumer())
 
         register_client(client_id, user_id, sync_push)
 
@@ -94,18 +110,12 @@ def create_ws_handler(
 
                 if msg_type == "request":
                     await _handle_request(websocket, store, user_id, msg)
-
                 elif msg_type == "subscribe":
-                    await _handle_subscribe(
-                        websocket, store, user_id, client_id, msg,
-                    )
-
+                    await _handle_subscribe(websocket, store, user_id, client_id, msg)
                 elif msg_type == "unsubscribe":
                     _handle_unsubscribe(client_id, msg)
-
                 elif msg_type == "ping":
                     await websocket.send_json({"type": "pong"})
-
                 else:
                     logger.debug("[WS] Unknown type: %s", msg_type)
 
@@ -115,11 +125,14 @@ def create_ws_handler(
             logger.error("[WS] Client %s error: %s", client_id[:8], e)
         finally:
             unregister_client(client_id)
+            # Stop push consumer
+            push_queue.put_nowait(None)
+            consumer_task.cancel()
 
     return ws_handler
 
 
-# ── Subscribe handler ────────────────────────────────────────────
+# ── Subscribe ────────────────────────────────────────────────────
 
 async def _handle_subscribe(
     ws: WebSocket,
@@ -128,9 +141,8 @@ async def _handle_subscribe(
     client_id: str,
     msg: dict,
 ) -> None:
-    """Handle subscribe: register + send initial sync."""
     entity = msg.get("entity", "")
-    params = msg.get("params") or {}
+    params = msg.get("params") or None  # Normalize
     client_version = msg.get("version")
     client_head = msg.get("head")
     depth = msg.get("depth")
@@ -145,34 +157,33 @@ async def _handle_subscribe(
         await ws.send_json({"type": "error", "error": f"Unknown entity: {entity}"})
         return
 
+    registry = get_sync_registry()
+
     # Register subscription
-    sync_registry.subscribe(client_id, entity, params or None)
+    registry.subscribe(client_id, entity, params)
 
     # Get sync state
-    state = sync_registry.get_state(entity, params or None)
-
-    # Determine sync type
-    sync_type = getattr(defn, 'sync_type', 'list')
+    state = registry.get_state(entity, params)
 
     # Fetch function for snapshot/head_n
     def fetch_data():
-        return store.list(entity, user_id, params=params)
+        return store.list(entity, user_id, params=params or {})
 
-    # Resolve sync strategy (git smart protocol)
+    # Resolve sync strategy
     sync_result = resolve_sync(
         state,
         client_version=client_version,
         client_head=client_head,
-        depth=depth or getattr(defn, 'sync_limit', None),
+        depth=depth or defn.sync_limit,
         fetch_data_fn=fetch_data,
-        sync_type=sync_type,
+        sync_type=defn.sync_type,
     )
 
-    # Build and send sync frame
+    # Send sync frame
     frame = {
         "type": "sync",
         "entity": entity,
-        "params": params if params else None,
+        "params": params,
         **sync_result,
     }
 
@@ -184,17 +195,18 @@ async def _handle_subscribe(
     )
 
 
-# ── Unsubscribe handler ─────────────────────────────────────────
+# ── Unsubscribe ──────────────────────────────────────────────────
 
 def _handle_unsubscribe(client_id: str, msg: dict) -> None:
     entity = msg.get("entity", "")
-    params = msg.get("params")
+    params = msg.get("params") or None
     if entity:
-        sync_registry.unsubscribe(client_id, entity, params)
+        registry = get_sync_registry()
+        registry.unsubscribe(client_id, entity, params)
         logger.debug("[WS] %s unsubscribed from %s", client_id[:8], entity)
 
 
-# ── Request handler (unchanged) ──────────────────────────────────
+# ── Request ──────────────────────────────────────────────────────
 
 async def _handle_request(ws: WebSocket, store: EntityStore, user_id: str, msg: dict) -> None:
     request_id = msg.get("request_id", "")
@@ -208,7 +220,7 @@ async def _handle_request(ws: WebSocket, store: EntityStore, user_id: str, msg: 
             "data": result,
         })
     except Exception as e:
-        logger.error("[WS] Request %s failed: %s", request_id, e)
+        logger.error("[WS] Request %s failed: %s\n%s", request_id, e, traceback.format_exc())
         await ws.send_json({
             "type": "response",
             "request_id": request_id,

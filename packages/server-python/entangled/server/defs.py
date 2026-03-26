@@ -2,7 +2,7 @@
 entangled/server/defs.py — Entity definitions.
 
 An EntityDef declares what an entity is: its name, key params, CRUD functions,
-custom actions, and relationships to other entities.
+custom actions, relationships, and sync strategy.
 
 This is the ONLY place business entities are defined. The engine (store, WS handler,
 push notifier, cascade) is fully generic.
@@ -47,12 +47,13 @@ class EntityDef:
     """Definition of an entity in the Entangled system.
 
     This is the single source of truth for an entity's schema, CRUD operations,
-    custom actions, and relationships.
+    custom actions, relationships, and sync strategy.
 
     Example:
         todos = EntityDef(
             name="todos",
             key_params=["project_id"],
+            sync_type="list",
             list_fn=lambda store, uid, params: db.query(...),
             create_fn=lambda store, uid, params, data: db.insert(...),
             relations=[
@@ -64,8 +65,12 @@ class EntityDef:
     name: str
 
     # ── Key params (scoping) ─────────────────────────────────────
-    # e.g. ["project_id"] means lists are scoped per project
     key_params: List[str] = field(default_factory=list)
+
+    # ── Sync strategy ────────────────────────────────────────────
+    sync_type: str = "list"             # "list" (mutable CRUD) | "stream" (append-only)
+    sync_limit: Optional[int] = None    # default depth for head_n mode (stream only)
+    op_log_size: int = 1000             # max op-log entries per (entity, params)
 
     # ── CRUD handlers ────────────────────────────────────────────
     list_fn: Optional[ListFn] = None
@@ -75,18 +80,16 @@ class EntityDef:
     delete_fn: Optional[DeleteFn] = None
 
     # ── Custom actions ───────────────────────────────────────────
-    # e.g. {"archive": archive_handler, "send": send_handler}
     actions: Dict[str, ActionFn] = field(default_factory=dict)
 
     # ── Relations (cascade invalidation pointers) ────────────────
+    # Server-side only — never pushed to clients
     relations: List[EntityRelation] = field(default_factory=list)
 
     # ── Push events ──────────────────────────────────────────────
-    # Auto-generated from name if not specified: ["entity_change:{name}"]
     push_events: Optional[List[str]] = None
 
     # ── Permissions ──────────────────────────────────────────────
-    # Optional hook: (user_id, op, entity_id, params) -> bool
     check_access: Optional[Callable] = None
 
     def __post_init__(self):
@@ -94,17 +97,14 @@ class EntityDef:
             self.push_events = [f"entity_change:{self.name}"]
 
     def to_schema_dict(self) -> dict:
-        """Serialize to schema format for pushing to clients."""
+        """Serialize to schema format for pushing to clients.
+
+        NOTE: relations are NOT included — cascade is server-side logic.
+        Clients only need name → push_events mapping.
+        """
         return {
             "name": self.name,
-            "key_params": self.key_params,
-            "push_events": self.push_events or [],
-            "relations": [
-                {
-                    "target": r.target,
-                    "param_map": r.param_map,
-                    "on_actions": r.on_actions,
-                }
-                for r in self.relations
-            ],
+            "keyParams": self.key_params,
+            "pushEvents": self.push_events or [],
+            "syncType": self.sync_type,
         }

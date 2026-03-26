@@ -37,17 +37,14 @@ class EntityStore:
         logger.info("[EntityStore] Registered entity: %s", defn.name)
 
     def get_def(self, entity: str) -> EntityDef:
-        """Get entity definition by name. Raises KeyError if not found."""
         if entity not in self._defs:
             raise KeyError(f"Unknown entity: {entity}")
         return self._defs[entity]
 
     def get_all_defs(self) -> List[EntityDef]:
-        """Get all registered entity definitions."""
         return list(self._defs.values())
 
     def get_schema(self) -> List[dict]:
-        """Get all entity schemas (for pushing to clients)."""
         return [d.to_schema_dict() for d in self._defs.values()]
 
     # ── CRUD operations ──────────────────────────────────────────
@@ -92,7 +89,12 @@ class EntityStore:
         if not defn.create_fn:
             raise NotImplementedError(f"{entity} does not support create")
         result = defn.create_fn(self, user_id, params or {}, data)
-        self._notify_change(entity, "created", user_id, params=params)
+        self._notify_change(
+            entity, "created", user_id,
+            entity_id=result.get("id") if isinstance(result, dict) else None,
+            params=params,
+            data=result,
+        )
         return result
 
     def update(
@@ -109,7 +111,12 @@ class EntityStore:
         if not defn.update_fn:
             raise NotImplementedError(f"{entity} does not support update")
         result = defn.update_fn(self, user_id, entity_id, data, params or {})
-        self._notify_change(entity, "updated", user_id, entity_id=entity_id, params=params)
+        self._notify_change(
+            entity, "updated", user_id,
+            entity_id=entity_id,
+            params=params,
+            data=result,
+        )
         return result
 
     def delete(
@@ -126,7 +133,11 @@ class EntityStore:
             raise NotImplementedError(f"{entity} does not support delete")
         ok = defn.delete_fn(self, user_id, entity_id, params or {})
         if ok:
-            self._notify_change(entity, "deleted", user_id, entity_id=entity_id, params=params)
+            self._notify_change(
+                entity, "deleted", user_id,
+                entity_id=entity_id,
+                params=params,
+            )
         return ok
 
     async def action(
@@ -168,9 +179,13 @@ class EntityStore:
         user_id: str,
         entity_id: Optional[str] = None,
         params: Optional[Dict[str, str]] = None,
+        data: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Notify connected clients of an entity change.
-        Override this or use the notifier module for push integration.
-        """
+        """Notify subscribed clients of an entity change with inline data."""
         from .notifier import notify_entity_change
-        notify_entity_change(user_id, entity, action, entity_id=entity_id, params=params)
+        notify_entity_change(
+            user_id, entity, action,
+            entity_id=entity_id,
+            params=params,
+            data=data,
+        )

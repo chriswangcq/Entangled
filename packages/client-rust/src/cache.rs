@@ -78,14 +78,17 @@ impl EntityData {
             return false; // Need full re-sync
         }
 
+        let mut has_invalidate = false;
+
         for op in ops {
             match op.op.as_str() {
                 "insert" => {
                     if let Some(ref data) = op.data {
-                        self.items.insert(op.id.clone(), data.clone());
-                        if !self.order.contains(&op.id) {
+                        // O(1) check via HashMap, not O(n) Vec scan
+                        if !self.items.contains_key(&op.id) {
                             self.order.push(op.id.clone());
                         }
+                        self.items.insert(op.id.clone(), data.clone());
                     }
                 }
                 "update" => {
@@ -109,8 +112,7 @@ impl EntityData {
                     self.order.retain(|id| id != &op.id);
                 }
                 "invalidate" => {
-                    // Mark all as stale — will be refreshed on next read
-                    self.synced_at = None;
+                    has_invalidate = true;
                 }
                 _ => {
                     tracing::debug!("[Cache] Unknown op: {}", op.op);
@@ -119,7 +121,12 @@ impl EntityData {
         }
 
         self.version = new_version;
-        self.synced_at = Some(Instant::now());
+        // Don't mark as fresh if invalidated — will trigger re-subscribe
+        if !has_invalidate {
+            self.synced_at = Some(Instant::now());
+        } else {
+            self.synced_at = None;
+        }
         true
     }
 
