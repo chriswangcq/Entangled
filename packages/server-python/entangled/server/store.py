@@ -83,6 +83,7 @@ class EntityStore:
         data: Dict[str, Any],
         *,
         params: Optional[Dict[str, str]] = None,
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         defn = self.get_def(entity)
         self._check_access(defn, user_id, "create", params=params)
@@ -94,6 +95,7 @@ class EntityStore:
             entity_id=result.get("id") if isinstance(result, dict) else None,
             params=params,
             data=result,
+            request_id=request_id,
         )
         return result
 
@@ -105,6 +107,7 @@ class EntityStore:
         data: Dict[str, Any],
         *,
         params: Optional[Dict[str, str]] = None,
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         defn = self.get_def(entity)
         self._check_access(defn, user_id, "update", entity_id=entity_id, params=params)
@@ -116,6 +119,7 @@ class EntityStore:
             entity_id=entity_id,
             params=params,
             data=result,
+            request_id=request_id,
         )
         return result
 
@@ -126,6 +130,7 @@ class EntityStore:
         entity_id: str,
         *,
         params: Optional[Dict[str, str]] = None,
+        request_id: Optional[str] = None,
     ) -> bool:
         defn = self.get_def(entity)
         self._check_access(defn, user_id, "delete", entity_id=entity_id, params=params)
@@ -137,6 +142,7 @@ class EntityStore:
                 entity, "deleted", user_id,
                 entity_id=entity_id,
                 params=params,
+                request_id=request_id,
             )
         return ok
 
@@ -180,6 +186,7 @@ class EntityStore:
         entity_id: Optional[str] = None,
         params: Optional[Dict[str, str]] = None,
         data: Optional[Dict[str, Any]] = None,
+        request_id: Optional[str] = None,
     ) -> None:
         """Notify subscribed clients of an entity change with inline data."""
         from .notifier import notify_entity_change
@@ -188,4 +195,5 @@ class EntityStore:
             entity_id=entity_id,
             params=params,
             data=data,
+            request_id=request_id,
         )

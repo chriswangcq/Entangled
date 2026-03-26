@@ -42,6 +42,8 @@ export interface SyncOp {
   data?: Record<string, unknown>;
   /** Timestamp */
   ts: number;
+  /** Correlation ID — traces back to the WS request that caused this op */
+  requestId?: string;
 }
 
 // ── Subscribe / Unsubscribe (Client → Server) ────────────────────────────
@@ -149,6 +151,23 @@ export interface SchemaPush {
 export interface EntitiesChangedEvent {
   changes: Array<{
     entity: string;
+    action: string;
     params?: Record<string, string>;
+    /** requestIds from ops in this delta — for optimistic confirmation */
+    requestIds?: string[];
   }>;
 }
+
+// ── Optimistic state types ────────────────────────────────────────────────
+
+/** Metadata attached to every item returned by Entangled hooks */
+export interface EntangledMeta {
+  _status: 'confirmed' | 'pending' | 'failed';
+  _op?: 'create' | 'update' | 'delete';
+  _tempId?: string;
+  _error?: string;
+  _retry?: () => void;
+}
+
+/** An item with Entangled status metadata */
+export type Entangled<T> = T & EntangledMeta;

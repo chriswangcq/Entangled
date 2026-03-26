@@ -1,32 +1,33 @@
 /**
  * @entangled/react — useList.ts
  *
- * Generic list hook with Entangled sync.
+ * Generic list hook with Entangled sync + optimistic state.
  *
- * Lifecycle:
- *   mount → subscribe(entity, params, version) → server sends sync frame
- *         → Rust applies to cache → emit entities_changed → React re-reads
- *   unmount → unsubscribe(entity, params) → server stops pushing
+ * Data flow:
+ *   1. Mount → subscribe(entity, params, version)
+ *   2. Server sends sync frame → Rust cache applies → entities_changed emitted
+ *   3. React reads from Rust cache (0 extra round-trip)
+ *   4. Mutations: optimistic via pendingOps (survives invalidation)
+ *   5. Delta push with requestId → confirms pendingOp
  *
- * The queryFn reads from Rust cache (0 network). If cache is stale,
- * it subscribes and waits for the sync frame, then re-reads.
- *
- * Usage:
- *   const todos = createListStore<Todo>({
- *     name: 'todos',
- *     keyParams: ['projectId'],
- *     getId: (t) => t.id,
- *   });
- *   // in component:
- *   const { items, create, update, remove } = todos.useList({ projectId: 'p1' });
+ * Optimistic state:
+ *   - pendingOps live in useRef, NOT in React Query cache
+ *   - Each mutation generates a requestId that travels:
+ *     WS request → Server → op_log → delta push → entities_changed → confirmByRequestIds
+ *   - Components receive Entangled<T>[] with _status: 'confirmed' | 'pending' | 'failed'
  */
 
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { subscribe, unsubscribe, cacheGetList, cacheGetVersion, entityClient } from './client';
-import type { ListHookResult } from './types';
+import {
+  mergeWithPending, confirmByRequestIds, cleanupStaleOps, genRequestId,
+  type PendingOp,
+} from './pendingOps';
+import type { Entangled } from '@entangled/protocol';
 
-// ── camelCase → snake_case helper ───────────────────────────────
+// ── camelCase → snake_case ──────────────────────────────────────
 
 function toSnakeParams(
   params: Record<string, string>,
@@ -54,18 +55,25 @@ export interface ListDef<T> {
   gcTime?: number;           // default: 5min
   refetchOnFocus?: boolean;  // default: true
 
-  optimisticCreate?: boolean;
-  optimisticUpdate?: boolean;  // default: true
-  optimisticDelete?: boolean;  // default: true
-
   enabled?: (params: Record<string, string>) => boolean;
 }
 
 export interface ListStore<T> {
   name: string;
   useList: (params?: Record<string, string>) => ListHookResult<T>;
-  invalidate: (params?: Record<string, string>) => void;
-  getData: (params?: Record<string, string>) => T[] | undefined;
+}
+
+export interface ListHookResult<T> {
+  items: Entangled<T>[];
+  isLoading: boolean;
+  error: Error | null;
+  refetch: () => void;
+  create: (data: any) => Promise<T>;
+  update: (id: string, data: any) => Promise<T>;
+  remove: (id: string) => Promise<void>;
+  isCreating: boolean;
+  isUpdating: boolean;
+  isRemoving: boolean;
 }
 
 // ── Factory ─────────────────────────────────────────────────────
@@ -80,17 +88,54 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
   function useList(params: Record<string, string> = {}): ListHookResult<T> {
     const qc = useQueryClient();
     const queryKey = useMemo(() => buildKey(params), [JSON.stringify(params)]);
-    const backendParams = useMemo(() => toSnakeParams(params, def.keyParams), [JSON.stringify(params)]);
+    const backendParams = useMemo(
+      () => toSnakeParams(params, def.keyParams),
+      [JSON.stringify(params)],
+    );
     const isEnabled = def.enabled ? def.enabled(params) : true;
 
-    // ── Subscribe on mount, unsubscribe on unmount ──────────────
+    // ── Pending ops (survives invalidation) ─────────────────────
+    const pendingOpsRef = useRef<PendingOp<T>[]>([]);
+    const [renderTick, setRenderTick] = useState(0);
+    const forceRender = useCallback(() => setRenderTick(n => n + 1), []);
+
+    // ── Listen for entities_changed with requestIds ─────────────
+    useEffect(() => {
+      if (!isEnabled) return;
+
+      let unlisten: UnlistenFn | null = null;
+
+      (async () => {
+        unlisten = await listen<{ changes: Array<{ entity: string; requestIds?: string[] }> }>(
+          'entities_changed',
+          (event) => {
+            for (const change of event.payload.changes) {
+              if (change.entity !== def.name) continue;
+              if (change.requestIds?.length) {
+                const before = pendingOpsRef.current.length;
+                pendingOpsRef.current = confirmByRequestIds(
+                  pendingOpsRef.current,
+                  change.requestIds,
+                );
+                if (pendingOpsRef.current.length !== before) {
+                  forceRender();
+                }
+              }
+            }
+          },
+        );
+      })();
+
+      return () => { unlisten?.(); };
+    }, [def.name, isEnabled]);
+
+    // ── Subscribe on mount ──────────────────────────────────────
     useEffect(() => {
       if (!isEnabled) return;
 
       let mounted = true;
 
       (async () => {
-        // Get local version for delta sync
         const version = await cacheGetVersion(def.name, backendParams);
         if (!mounted) return;
         await subscribe(def.name, backendParams, { version });
@@ -102,15 +147,22 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
       };
     }, [def.name, JSON.stringify(backendParams), isEnabled]);
 
+    // ── Timeout cleanup (30s safety net) ─────────────────────────
+    useEffect(() => {
+      const timer = setInterval(() => {
+        const before = pendingOpsRef.current.length;
+        pendingOpsRef.current = cleanupStaleOps(pendingOpsRef.current);
+        if (pendingOpsRef.current.length !== before) forceRender();
+      }, 5000);
+      return () => clearInterval(timer);
+    }, []);
+
     // ── Query: read from Rust cache ─────────────────────────────
     const query = useQuery<T[]>({
       queryKey,
       queryFn: async () => {
-        // Try Rust cache first (instant, 0 network)
         const cached = await cacheGetList<T>(def.name, backendParams);
         if (cached !== null) return cached;
-
-        // Cache miss — fall back to direct WS request
         return entityClient.list<T>(def.name, backendParams);
       },
       staleTime: def.staleTime ?? 30_000,
@@ -119,23 +171,60 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
       enabled: isEnabled,
     });
 
+    // ── Merge confirmed + pending ───────────────────────────────
+    const confirmedItems = query.data ?? [];
+    const items = useMemo(
+      () => mergeWithPending(confirmedItems, pendingOpsRef.current, def.getId),
+      [confirmedItems, renderTick],
+    );
+
     // ── Create mutation ─────────────────────────────────────────
     const createMut = useMutation({
-      mutationFn: (data: any) =>
-        entityClient.create<T>(def.name, data, backendParams),
-      onMutate: def.optimisticCreate
-        ? async (data: any) => {
-            await qc.cancelQueries({ queryKey });
-            const prev = qc.getQueryData<T[]>(queryKey);
-            qc.setQueryData<T[]>(queryKey, (old) => [...(old ?? []), data as T]);
-            return { prev };
-          }
-        : undefined,
-      onError: def.optimisticCreate
-        ? (_e: any, _v: any, ctx: any) => {
-            if (ctx?.prev) qc.setQueryData(queryKey, ctx.prev);
-          }
-        : undefined,
+      mutationFn: async (data: any) => {
+        const requestId = (data as any).__requestId;
+        // entityClient doesn't support requestId yet, but the WS layer
+        // will use the WS request frame's request_id
+        return entityClient.create<T>(def.name, data, backendParams);
+      },
+      onMutate: (data: any) => {
+        const requestId = genRequestId();
+        const tempId = `_tmp_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+        pendingOpsRef.current = [
+          ...pendingOpsRef.current,
+          {
+            id: tempId,
+            requestId,
+            op: 'create',
+            data: { ...data, id: tempId },
+            status: 'pending',
+            startedAt: Date.now(),
+          },
+        ];
+        forceRender();
+
+        // Pass requestId/tempId forward via context
+        return { requestId, tempId };
+      },
+      onSuccess: (_serverData, _vars, ctx) => {
+        // Remove pending op (delta may have already confirmed it via requestId)
+        if (ctx?.tempId) {
+          pendingOpsRef.current = pendingOpsRef.current.filter(
+            op => op.id !== ctx.tempId,
+          );
+          forceRender();
+        }
+      },
+      onError: (error, _vars, ctx) => {
+        if (ctx?.tempId) {
+          pendingOpsRef.current = pendingOpsRef.current.map(op =>
+            op.id === ctx.tempId
+              ? { ...op, status: 'failed' as const, error: error.message }
+              : op,
+          );
+          forceRender();
+        }
+      },
       onSettled: () => {
         qc.invalidateQueries({ queryKey });
       },
@@ -145,25 +234,42 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
     const updateMut = useMutation({
       mutationFn: ({ id, data }: { id: string; data: any }) =>
         entityClient.update<T>(def.name, id, data, backendParams),
-      onMutate:
-        def.optimisticUpdate !== false
-          ? async ({ id, data }: { id: string; data: any }) => {
-              await qc.cancelQueries({ queryKey });
-              const prev = qc.getQueryData<T[]>(queryKey);
-              qc.setQueryData<T[]>(queryKey, (old) =>
-                old?.map((item) =>
-                  def.getId(item) === id ? ({ ...item, ...data } as T) : item,
-                ) ?? [],
-              );
-              return { prev };
-            }
-          : undefined,
-      onError:
-        def.optimisticUpdate !== false
-          ? (_e: any, _v: any, ctx: any) => {
-              if (ctx?.prev) qc.setQueryData(queryKey, ctx.prev);
-            }
-          : undefined,
+      onMutate: ({ id, data }: { id: string; data: any }) => {
+        const requestId = genRequestId();
+
+        pendingOpsRef.current = [
+          ...pendingOpsRef.current,
+          {
+            id,
+            requestId,
+            op: 'update',
+            data,
+            status: 'pending',
+            startedAt: Date.now(),
+          },
+        ];
+        forceRender();
+
+        return { requestId, opId: id };
+      },
+      onSuccess: (_data, _vars, ctx) => {
+        if (ctx?.opId) {
+          pendingOpsRef.current = pendingOpsRef.current.filter(
+            op => !(op.id === ctx.opId && op.op === 'update'),
+          );
+          forceRender();
+        }
+      },
+      onError: (error, _vars, ctx) => {
+        if (ctx?.opId) {
+          pendingOpsRef.current = pendingOpsRef.current.map(op =>
+            op.id === ctx.opId && op.op === 'update'
+              ? { ...op, status: 'failed' as const, error: error.message }
+              : op,
+          );
+          forceRender();
+        }
+      },
       onSettled: () => {
         qc.invalidateQueries({ queryKey });
       },
@@ -173,28 +279,49 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
     const removeMut = useMutation({
       mutationFn: (id: string) =>
         entityClient.remove(def.name, id, backendParams),
-      onMutate: def.optimisticDelete !== false
-        ? async (id: string) => {
-            await qc.cancelQueries({ queryKey });
-            const prev = qc.getQueryData<T[]>(queryKey);
-            qc.setQueryData<T[]>(queryKey, (old) =>
-              old?.filter((item) => def.getId(item) !== id) ?? [],
-            );
-            return { prev };
-          }
-        : undefined,
-      onError: def.optimisticDelete !== false
-        ? (_e: any, _id: any, ctx: any) => {
-            if (ctx?.prev) qc.setQueryData(queryKey, ctx.prev);
-          }
-        : undefined,
+      onMutate: (id: string) => {
+        const requestId = genRequestId();
+
+        pendingOpsRef.current = [
+          ...pendingOpsRef.current,
+          {
+            id,
+            requestId,
+            op: 'delete',
+            data: {},
+            status: 'pending',
+            startedAt: Date.now(),
+          },
+        ];
+        forceRender();
+
+        return { requestId, opId: id };
+      },
+      onSuccess: (_data, _id, ctx) => {
+        if (ctx?.opId) {
+          pendingOpsRef.current = pendingOpsRef.current.filter(
+            op => !(op.id === ctx.opId && op.op === 'delete'),
+          );
+          forceRender();
+        }
+      },
+      onError: (error, _id, ctx) => {
+        if (ctx?.opId) {
+          pendingOpsRef.current = pendingOpsRef.current.map(op =>
+            op.id === ctx.opId && op.op === 'delete'
+              ? { ...op, status: 'failed' as const, error: error.message }
+              : op,
+          );
+          forceRender();
+        }
+      },
       onSettled: () => {
         qc.invalidateQueries({ queryKey });
       },
     });
 
     return {
-      items: query.data ?? [],
+      items,
       isLoading: query.isLoading,
       error: query.error,
       refetch: () => { query.refetch(); },
@@ -207,17 +334,5 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
     };
   }
 
-  // ── Imperative API ────────────────────────────────────────────
-
-  function invalidate(params: Record<string, string> = {}) {
-    const { QueryClient } = require('@tanstack/react-query');
-    // Note: imperative invalidate requires the QueryClient from context
-    // In practice, this uses the default query client if configured
-  }
-
-  function getData(params: Record<string, string> = {}): T[] | undefined {
-    return undefined; // Read from Rust cache via cacheGetList
-  }
-
-  return { name: def.name, useList, invalidate, getData };
+  return { name: def.name, useList };
 }
