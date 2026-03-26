@@ -9,10 +9,10 @@ description = "Server-side Entity Sync Engine — define entities, get real-time
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-dependencies = [
-    "fastapi>=0.100",
-    "starlette>=0.27",
-]
+# No hard dependencies — the host app provides starlette/fastapi
+dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx", "uvicorn"]
+starlette = ["starlette>=0.27"]
+fastapi = ["fastapi>=0.100"]
+dev = ["pytest", "httpx", "uvicorn", "starlette>=0.27"]

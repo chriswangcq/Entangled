@@ -11,6 +11,6 @@
     "@tauri-apps/api": ">=2"
   },
   "dependencies": {
-    "@entangled/protocol": "workspace:*"
+    "@entangled/protocol": "file:../protocol"
   }
 }
