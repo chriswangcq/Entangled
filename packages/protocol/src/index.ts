@@ -35,7 +35,7 @@ export interface SyncOp {
   /** Monotonic version number (commit index) */
   version: number;
   /** Operation type */
-  op: 'insert' | 'update' | 'delete';
+  op: 'insert' | 'update' | 'delete' | 'invalidate';
   /** Entity item ID */
   id: string;
   /** Item data (null for delete) */
