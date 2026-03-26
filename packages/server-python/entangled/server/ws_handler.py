@@ -213,7 +213,7 @@ async def _handle_request(ws: WebSocket, store: EntityStore, user_id: str, msg: 
     data = msg.get("data", {})
 
     try:
-        result = await _dispatch(store, user_id, data)
+        result = await _dispatch(store, user_id, data, request_id=request_id)
         await ws.send_json({
             "type": "response",
             "request_id": request_id,
@@ -228,7 +228,7 @@ async def _handle_request(ws: WebSocket, store: EntityStore, user_id: str, msg: 
         })
 
 
-async def _dispatch(store: EntityStore, user_id: str, data: dict) -> dict:
+async def _dispatch(store: EntityStore, user_id: str, data: dict, request_id: str = "") -> dict:
     op = data.get("op", "")
     entity = data.get("entity", "")
     entity_id = data.get("id")
@@ -254,17 +254,17 @@ async def _dispatch(store: EntityStore, user_id: str, data: dict) -> dict:
                 return {"success": False, "error": f"{entity} {entity_id} not found"}
             return {"success": True, "data": item}
         elif op == "create":
-            result = store.create(entity, user_id, payload, params=params)
+            result = store.create(entity, user_id, payload, params=params, request_id=request_id or None)
             return {"success": True, "data": result}
         elif op in ("update", "upsert"):
             if not entity_id:
                 return {"success": False, "error": "id is required for update"}
-            result = store.update(entity, user_id, entity_id, payload, params=params)
+            result = store.update(entity, user_id, entity_id, payload, params=params, request_id=request_id or None)
             return {"success": True, "data": result}
         elif op == "delete":
             if not entity_id:
                 return {"success": False, "error": "id is required for delete"}
-            ok = store.delete(entity, user_id, entity_id, params=params)
+            ok = store.delete(entity, user_id, entity_id, params=params, request_id=request_id or None)
             return {"success": True} if ok else {"success": False, "error": "not found"}
         elif op == "action":
             action_name = data.get("action_name", "")

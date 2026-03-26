@@ -74,6 +74,7 @@ def notify_entity_change(
     entity_id: Optional[str] = None,
     params: Optional[Dict[str, str]] = None,
     data: Optional[Dict[str, Any]] = None,
+    request_id: Optional[str] = None,
 ) -> None:
     """Record mutation + push delta to ALL subscribed clients + cascade.
 
@@ -84,9 +85,10 @@ def notify_entity_change(
     registry = _get_registry()
     op_type = _action_to_op(action)
 
-    # 1. Record in op_log
+    # 1. Record in op_log (with request_id for optimistic correlation)
     state, sync_op = registry.record_op(
         entity, op_type, entity_id or "", params=params, data=data,
+        request_id=request_id,
     )
 
     # 2. Push delta to ALL subscribed clients (not just triggering user)

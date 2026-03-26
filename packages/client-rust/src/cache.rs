@@ -13,6 +13,7 @@ use std::time::Instant;
 
 /// A single mutation operation, received from server delta sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyncOp {
     pub version: u64,
     pub op: String,   // "insert" | "update" | "delete" | "invalidate"
@@ -20,6 +21,9 @@ pub struct SyncOp {
     pub data: Option<Value>,
     #[serde(default)]
     pub ts: f64,
+    /// Correlation ID — traces back to the WS request that caused this op
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 // ── Per-(entity, params) cache ──────────────────────────────────

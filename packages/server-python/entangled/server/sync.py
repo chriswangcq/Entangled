@@ -28,11 +28,14 @@ class SyncOp:
     id: str          # entity item ID
     data: Optional[dict]  # item data (None for delete/invalidate)
     ts: float        # timestamp
+    request_id: Optional[str] = None  # correlation ID from WS request
 
     def to_dict(self) -> dict:
         d: dict = {"version": self.version, "op": self.op, "id": self.id, "ts": self.ts}
         if self.data is not None:
             d["data"] = self.data
+        if self.request_id:
+            d["requestId"] = self.request_id
         return d
 
 
@@ -53,7 +56,7 @@ class SyncState:
         state.op_log = deque(maxlen=maxlen)
         return state
 
-    def append_op(self, op: str, entity_id: str, data: Optional[dict] = None) -> SyncOp:
+    def append_op(self, op: str, entity_id: str, data: Optional[dict] = None, request_id: Optional[str] = None) -> SyncOp:
         self.current_version += 1
         entry = SyncOp(
             version=self.current_version,
@@ -61,6 +64,7 @@ class SyncState:
             id=entity_id,
             data=data,
             ts=time.time(),
+            request_id=request_id,
         )
         self.op_log.append(entry)
         return entry
@@ -149,10 +153,11 @@ class SyncRegistry:
         entity_id: str,
         params: Optional[Dict[str, str]] = None,
         data: Optional[dict] = None,
+        request_id: Optional[str] = None,
     ) -> Tuple[SyncState, SyncOp]:
         params = _normalize_params(params)
         state = self.get_state(entity, params)
-        entry = state.append_op(op, entity_id, data)
+        entry = state.append_op(op, entity_id, data, request_id=request_id)
         return state, entry
 
     def get_subscribed_clients(

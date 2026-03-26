@@ -13,9 +13,13 @@ use crate::cache::{Cache, CacheKey, EntityData, SyncOp};
 
 /// A change notification for the UI layer.
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EntityChanged {
     pub entity: String,
     pub action: String,  // "synced" | "delta" | "invalidated"
+    /// requestIds from ops — for optimistic state confirmation
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub request_ids: Vec<String>,
 }
 
 /// Incoming sync frame from server.
@@ -63,26 +67,33 @@ pub fn process_sync(
             Some(EntityChanged {
                 entity: frame.entity.clone(),
                 action: "synced".into(),
+                request_ids: Vec::new(),
             })
         }
 
         "delta" => {
             let ops = frame.ops.as_ref()?;
             let base = frame.base_version.unwrap_or(0);
+
+            // Collect requestIds from ops for optimistic confirmation
+            let request_ids: Vec<String> = ops.iter()
+                .filter_map(|op| op.request_id.clone())
+                .collect();
+
             let entry = cache.entry(key.clone());
 
             if entry.apply_delta(base, ops, frame.version) {
                 tracing::debug!(
-                    "[Sync] {} delta v{}→v{} ({} ops)",
-                    frame.entity, base, frame.version, ops.len()
+                    "[Sync] {} delta v{}→v{} ({} ops, {} requestIds)",
+                    frame.entity, base, frame.version, ops.len(), request_ids.len()
                 );
                 Some(EntityChanged {
                     entity: frame.entity.clone(),
                     action: "delta".into(),
+                    request_ids,
                 })
             } else {
                 // Version mismatch — need resync
-                // Mark as not fresh so next read triggers re-subscribe
                 let entry = cache.entry(key);
                 entry.synced_at = None;
 
@@ -93,6 +104,7 @@ pub fn process_sync(
                 Some(EntityChanged {
                     entity: frame.entity.clone(),
                     action: "invalidated".into(),
+                    request_ids: Vec::new(),
                 })
             }
         }
