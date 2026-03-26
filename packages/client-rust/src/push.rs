@@ -1,81 +1,110 @@
-//! Push event processing — update cache and notify UI.
+//! Sync frame processing — handle server sync responses.
 //!
-//! Cascade invalidation is handled server-side. The server pushes
-//! separate entity_change events for each affected entity.
-//! The client just receives them and marks cache entries stale.
+//! Processes the 4 sync modes:
+//! - snapshot: apply full data (git clone)
+//! - delta: apply ops in-place (git pull fast-forward)
+//! - head_n: apply partial data (git clone --depth)
+//! - up_to_date: no-op (already current)
 
-use serde::Serialize;
+use serde::Deserialize;
 use serde_json::Value;
 
-use crate::cache::Cache;
-use crate::schema::SchemaRegistry;
+use crate::cache::{Cache, CacheKey, EntityData, SyncOp};
 
-/// A change notification for the UI layer (emitted in a batch).
-#[derive(Debug, Clone, Serialize)]
+/// A change notification for the UI layer.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EntityChanged {
     pub entity: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    pub action: String,
+    pub action: String,  // "synced" | "delta" | "invalidated"
 }
 
-/// Process a single push event: update cache + return what changed.
-///
-/// The server sends one push per affected entity (including cascaded ones).
-/// This function just handles the cache side — no graph walking needed.
-pub fn process_push(
-    registry: &SchemaRegistry,
+/// Incoming sync frame from server.
+#[derive(Debug, Deserialize)]
+pub struct SyncFrame {
+    pub entity: String,
+    pub params: Option<serde_json::Map<String, Value>>,
+    pub mode: String,  // "snapshot" | "delta" | "head_n" | "up_to_date"
+    pub version: u64,
+
+    // snapshot / head_n
+    pub data: Option<Vec<Value>>,
+    #[serde(default)]
+    pub has_more: bool,
+
+    // delta
+    pub base_version: Option<u64>,
+    pub ops: Option<Vec<SyncOp>>,
+}
+
+/// Process a sync frame from the server.
+/// Returns what changed (for emitting to React).
+pub fn process_sync(
     cache: &mut Cache,
-    event: &str,
-    payload: &Value,
+    frame: &SyncFrame,
+    id_field: &str,
 ) -> Option<EntityChanged> {
-    // Find which entity this push belongs to
-    let entity_name = registry.entity_for_event(event)?.to_string();
+    let key = match &frame.params {
+        Some(p) => CacheKey::new(&frame.entity, p),
+        None => CacheKey::new_empty(&frame.entity),
+    };
 
-    let action = payload.get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("updated")
-        .to_string();
+    match frame.mode.as_str() {
+        "snapshot" | "head_n" => {
+            let data = frame.data.as_ref()?;
+            let entry = cache.entry(key);
+            entry.apply_snapshot(data.clone(), frame.version, id_field);
+            entry.subscribed = true;
 
-    let entity_id = payload.get("entity_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+            tracing::info!(
+                "[Sync] {} snapshot v{} ({} items)",
+                frame.entity, frame.version, data.len()
+            );
 
-    // Update cache based on action
-    match action.as_str() {
-        "deleted" => {
-            if let Some(ref id) = entity_id {
-                cache.remove(&entity_name, id);
+            Some(EntityChanged {
+                entity: frame.entity.clone(),
+                action: "synced".into(),
+            })
+        }
+
+        "delta" => {
+            let ops = frame.ops.as_ref()?;
+            let base = frame.base_version.unwrap_or(0);
+            let entry = cache.entry(key.clone());
+
+            if entry.apply_delta(base, ops, frame.version) {
+                tracing::debug!(
+                    "[Sync] {} delta v{}→v{} ({} ops)",
+                    frame.entity, base, frame.version, ops.len()
+                );
+                Some(EntityChanged {
+                    entity: frame.entity.clone(),
+                    action: "delta".into(),
+                })
             } else {
-                cache.mark_entity_stale(&entity_name);
+                // Version mismatch — need resync
+                // Mark as not fresh so next read triggers re-subscribe
+                let entry = cache.entry(key);
+                entry.synced_at = None;
+
+                tracing::warn!(
+                    "[Sync] {} delta version mismatch, marking stale",
+                    frame.entity
+                );
+                Some(EntityChanged {
+                    entity: frame.entity.clone(),
+                    action: "invalidated".into(),
+                })
             }
         }
+
+        "up_to_date" => {
+            tracing::debug!("[Sync] {} up_to_date v{}", frame.entity, frame.version);
+            None // No change needed
+        }
+
         _ => {
-            // If inline data provided, update cache directly (avoids re-fetch)
-            if let (Some(ref id), Some(data)) = (&entity_id, payload.get("data")) {
-                cache.put(&entity_name, id, data.clone());
-            } else if let Some(ref id) = entity_id {
-                cache.mark_stale(&entity_name, id);
-            } else {
-                cache.mark_entity_stale(&entity_name);
-            }
+            tracing::warn!("[Sync] Unknown sync mode: {}", frame.mode);
+            None
         }
     }
-
-    Some(EntityChanged {
-        entity: entity_name,
-        id: entity_id,
-        action,
-    })
-}
-
-/// Process multiple push events and return all changes (for batched emit).
-pub fn process_pushes(
-    registry: &SchemaRegistry,
-    cache: &mut Cache,
-    events: &[(String, Value)],
-) -> Vec<EntityChanged> {
-    events.iter()
-        .filter_map(|(event, payload)| process_push(registry, cache, event, payload))
-        .collect()
 }
