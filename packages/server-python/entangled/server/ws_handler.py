@@ -20,7 +20,7 @@ from typing import Any, Callable, Optional
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from .notifier import register_client, unregister_client
+from .notifier import register_client, unregister_client, set_store
 from .store import EntityStore
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,7 @@ def create_ws_handler(
     """
 
     async def ws_handler(websocket: WebSocket):
+        set_store(store)  # Enable cascade in notifier
         await websocket.accept()
 
         # ── Authentication ───────────────────────────────────────

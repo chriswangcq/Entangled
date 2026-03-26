@@ -1,22 +1,16 @@
 //! Dynamic entity schema — received from server, never hardcoded.
+//!
+//! The client only needs to know: entity name → push events.
+//! Relations and cascade logic are server-side business logic.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// A relation (pointer) from one entity to another.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EntityRelation {
-    /// Target entity name, e.g. "todo-items"
-    pub target: String,
-    /// Map source params to target params, e.g. {"id": "todo_id"}
-    #[serde(default)]
-    pub param_map: HashMap<String, String>,
-    /// Only cascade on specific actions. None = all actions.
-    #[serde(default)]
-    pub on_actions: Option<Vec<String>>,
-}
-
 /// Entity schema definition — pushed from server after WS connect.
+///
+/// The client only uses `name` and `push_events` to know which
+/// push events correspond to which entity. Relations, key_params,
+/// and other schema details are server-side concerns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntitySchema {
     /// Entity name, e.g. "todos"
@@ -27,12 +21,13 @@ pub struct EntitySchema {
     /// Push events this entity subscribes to
     #[serde(default)]
     pub push_events: Vec<String>,
-    /// Relations to other entities
-    #[serde(default)]
-    pub relations: Vec<EntityRelation>,
 }
 
-/// Schema registry — holds all entity schemas received from the server.
+/// Schema registry — maps push events to entity names.
+///
+/// Populated from the server's "schema" push on connect.
+/// The client doesn't need to know about relations — the server
+/// handles cascade and pushes separate events for each affected entity.
 #[derive(Debug, Default)]
 pub struct SchemaRegistry {
     schemas: HashMap<String, EntitySchema>,
@@ -51,8 +46,7 @@ impl SchemaRegistry {
             for event in &schema.push_events {
                 self.event_to_entity.insert(event.clone(), schema.name.clone());
             }
-            tracing::info!("[Entangled] Registered entity: {} (relations: {})",
-                schema.name, schema.relations.len());
+            tracing::info!("[Entangled] Registered entity: {}", schema.name);
             self.schemas.insert(schema.name.clone(), schema);
         }
     }
