@@ -1,16 +1,14 @@
-//! Tauri commands — expose entity engine to the JS webview.
-//!
-//! These commands are the IPC bridge between Rust cache and React hooks.
-//! Enable with the `tauri` feature flag.
+//! Tauri commands — expose entity engine to JS webview.
 
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::cache::{Cache, hash_params};
+use crate::cache::{Cache, CacheKey, hash_params};
+use crate::push::{process_sync, SyncFrame};
 use crate::schema::SchemaRegistry;
 
-/// Shared state for the entity engine, stored as Tauri managed state.
+/// Shared state for the entity engine.
 pub struct EntangledState {
     pub registry: Arc<RwLock<SchemaRegistry>>,
     pub cache: Arc<RwLock<Cache>>,
@@ -25,8 +23,7 @@ impl EntangledState {
     }
 }
 
-/// Get a list of entities from cache.
-/// If cache miss, returns null (JS side should then fetch from WS).
+/// Get list from cache. Returns null if not cached or stale.
 #[cfg(feature = "tauri")]
 #[tauri::command]
 pub async fn entity_list(
@@ -37,70 +34,80 @@ pub async fn entity_list(
     let params_map = params
         .and_then(|p| p.as_object().cloned())
         .unwrap_or_default();
-    let params_hash = hash_params(&params_map);
+    let key = if params_map.is_empty() {
+        CacheKey::new_empty(&entity)
+    } else {
+        CacheKey::new(&entity, &params_map)
+    };
 
     let cache = state.cache.read().await;
-    match cache.get_list(&entity, params_hash) {
-        Some(items) => Ok(Some(items.into_iter().cloned().collect())),
-        None => Ok(None), // Cache miss — JS should fetch from WS
+    match cache.get(&key) {
+        Some(data) if data.is_fresh() => {
+            Ok(Some(data.get_list().into_iter().cloned().collect()))
+        }
+        _ => Ok(None), // Cache miss or stale → JS should subscribe
     }
 }
 
-/// Get a single entity item from cache.
+/// Get single item from cache.
 #[cfg(feature = "tauri")]
 #[tauri::command]
 pub async fn entity_get(
     entity: String,
     id: String,
+    params: Option<Value>,
     state: tauri::State<'_, EntangledState>,
 ) -> Result<Option<Value>, String> {
-    let cache = state.cache.read().await;
-    Ok(cache.get(&entity, &id).cloned())
-}
-
-/// Store items in cache (called after WS fetch completes).
-#[cfg(feature = "tauri")]
-#[tauri::command]
-pub async fn entity_cache_put_list(
-    entity: String,
-    params: Option<Value>,
-    items: Vec<Value>,
-    id_field: Option<String>,
-    state: tauri::State<'_, EntangledState>,
-) -> Result<(), String> {
     let params_map = params
         .and_then(|p| p.as_object().cloned())
         .unwrap_or_default();
-    let params_hash = hash_params(&params_map);
-    let id_key = id_field.unwrap_or_else(|| "id".to_string());
+    let key = if params_map.is_empty() {
+        CacheKey::new_empty(&entity)
+    } else {
+        CacheKey::new(&entity, &params_map)
+    };
 
-    let entries: Vec<(String, Value)> = items.into_iter()
-        .filter_map(|item| {
-            let id = item.get(&id_key)?.as_str()?.to_string();
-            Some((id, item))
-        })
-        .collect();
-
-    let mut cache = state.cache.write().await;
-    cache.put_list(&entity, params_hash, entries);
-    Ok(())
+    let cache = state.cache.read().await;
+    Ok(cache.get(&key).and_then(|d| d.get(&id).cloned()))
 }
 
-/// Store a single item in cache.
+/// Get current version for an entity (for subscribe with since_version).
 #[cfg(feature = "tauri")]
 #[tauri::command]
-pub async fn entity_cache_put(
+pub async fn entity_version(
     entity: String,
-    id: String,
-    data: Value,
+    params: Option<Value>,
     state: tauri::State<'_, EntangledState>,
-) -> Result<(), String> {
-    let mut cache = state.cache.write().await;
-    cache.put(&entity, &id, data);
-    Ok(())
+) -> Result<Option<u64>, String> {
+    let params_map = params
+        .and_then(|p| p.as_object().cloned())
+        .unwrap_or_default();
+    let key = if params_map.is_empty() {
+        CacheKey::new_empty(&entity)
+    } else {
+        CacheKey::new(&entity, &params_map)
+    };
+
+    let cache = state.cache.read().await;
+    Ok(cache.get(&key).map(|d| d.version))
 }
 
-/// Clear all cached data (e.g. on logout or reconnect).
+/// Process a sync frame from the server.
+#[cfg(feature = "tauri")]
+#[tauri::command]
+pub async fn entity_apply_sync(
+    frame: Value,
+    state: tauri::State<'_, EntangledState>,
+) -> Result<Option<String>, String> {
+    let sync_frame: SyncFrame = serde_json::from_value(frame)
+        .map_err(|e| format!("Invalid sync frame: {}", e))?;
+
+    let mut cache = state.cache.write().await;
+    let changed = process_sync(&mut cache, &sync_frame, "id");
+    Ok(changed.map(|c| c.entity))
+}
+
+/// Clear all cache (on logout / reconnect).
 #[cfg(feature = "tauri")]
 #[tauri::command]
 pub async fn entity_cache_clear(

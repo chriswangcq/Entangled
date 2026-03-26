@@ -16,6 +16,7 @@ Usage:
 
 from .defs import EntityDef, EntityRelation
 from .store import EntityStore
+from .sync import SyncRegistry, sync_registry
 from .ws_handler import create_ws_handler
 from .notifier import notify_entity_change
 
@@ -23,6 +24,8 @@ __all__ = [
     "EntityDef",
     "EntityRelation",
     "EntityStore",
+    "SyncRegistry",
+    "sync_registry",
     "create_ws_handler",
     "notify_entity_change",
 ]
