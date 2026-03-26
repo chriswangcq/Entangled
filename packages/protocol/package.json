@@ -1,0 +1,15 @@
+{
+  "name": "@entangled/protocol",
+  "version": "0.1.0",
+  "description": "Shared WS protocol types for Entangled entity sync engine",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
