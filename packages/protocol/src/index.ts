@@ -7,17 +7,12 @@
 
 // ── Entity Schema (pushed from Server to Client on connect) ───────────────
 
-/** Relationship between two entities (foreign key / pointer). */
-export interface EntityRelation {
-  /** Target entity name, e.g. "todo-items" */
-  target: string;
-  /** Map source entity params to target params, e.g. { "id": "todo_id" } */
-  paramMap: Record<string, string>;
-  /** Only cascade on specific actions. null = all actions. */
-  onActions?: ('created' | 'updated' | 'deleted')[];
-}
-
-/** Server-side entity definition, pushed to client after WS connect. */
+/**
+ * Entity schema pushed to client after WS connect.
+ *
+ * The client only needs: name → push_events (to know which pushes map
+ * to which entity). Relations and cascade are server-side business logic.
+ */
 export interface EntitySchema {
   /** Entity name, e.g. "todos" */
   name: string;
@@ -25,8 +20,16 @@ export interface EntitySchema {
   keyParams: string[];
   /** Push events this entity subscribes to */
   pushEvents: string[];
-  /** Relations to other entities (for cascade invalidation) */
-  relations: EntityRelation[];
+}
+
+/**
+ * Entity relation — server-side only, not pushed to clients.
+ * Kept here for reference / server-side TypeScript implementations.
+ */
+export interface EntityRelation {
+  target: string;
+  paramMap: Record<string, string>;
+  onActions?: ('created' | 'updated' | 'deleted')[];
 }
 
 // ── WS Protocol Messages ──────────────────────────────────────────────────
