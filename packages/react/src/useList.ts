@@ -26,6 +26,7 @@ import {
   type PendingOp,
 } from './pendingOps';
 import type { Entangled } from '@entangled/protocol';
+import { globalQueryClient } from './syncListener';
 
 // ── camelCase → snake_case ──────────────────────────────────────
 
@@ -61,6 +62,7 @@ export interface ListDef<T> {
 export interface ListStore<T> {
   name: string;
   useList: (params?: Record<string, string>) => ListHookResult<T>;
+  invalidate: (params?: Record<string, string>) => void;
 }
 
 export interface ListHookResult<T> {
@@ -97,7 +99,7 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
     // ── Pending ops (survives invalidation) ─────────────────────
     const pendingOpsRef = useRef<PendingOp<T>[]>([]);
     const [renderTick, setRenderTick] = useState(0);
-    const forceRender = useCallback(() => setRenderTick(n => n + 1), []);
+    const forceRender = useCallback(() => setRenderTick((n: number) => n + 1), []);
 
     // ── Listen for entities_changed with requestIds ─────────────
     useEffect(() => {
@@ -181,7 +183,6 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
     // ── Create mutation ─────────────────────────────────────────
     const createMut = useMutation({
       mutationFn: async (data: any) => {
-        const requestId = (data as any).__requestId;
         // entityClient doesn't support requestId yet, but the WS layer
         // will use the WS request frame's request_id
         return entityClient.create<T>(def.name, data, backendParams);
@@ -210,14 +211,14 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
         // Remove pending op (delta may have already confirmed it via requestId)
         if (ctx?.tempId) {
           pendingOpsRef.current = pendingOpsRef.current.filter(
-            op => op.id !== ctx.tempId,
+            (op: PendingOp<T>) => op.id !== ctx.tempId,
           );
           forceRender();
         }
       },
       onError: (error, _vars, ctx) => {
         if (ctx?.tempId) {
-          pendingOpsRef.current = pendingOpsRef.current.map(op =>
+          pendingOpsRef.current = pendingOpsRef.current.map((op: PendingOp<T>) =>
             op.id === ctx.tempId
               ? { ...op, status: 'failed' as const, error: error.message }
               : op,
@@ -255,14 +256,14 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
       onSuccess: (_data, _vars, ctx) => {
         if (ctx?.opId) {
           pendingOpsRef.current = pendingOpsRef.current.filter(
-            op => !(op.id === ctx.opId && op.op === 'update'),
+            (op: PendingOp<T>) => !(op.id === ctx.opId && op.op === 'update'),
           );
           forceRender();
         }
       },
       onError: (error, _vars, ctx) => {
         if (ctx?.opId) {
-          pendingOpsRef.current = pendingOpsRef.current.map(op =>
+          pendingOpsRef.current = pendingOpsRef.current.map((op: PendingOp<T>) =>
             op.id === ctx.opId && op.op === 'update'
               ? { ...op, status: 'failed' as const, error: error.message }
               : op,
@@ -300,14 +301,14 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
       onSuccess: (_data, _id, ctx) => {
         if (ctx?.opId) {
           pendingOpsRef.current = pendingOpsRef.current.filter(
-            op => !(op.id === ctx.opId && op.op === 'delete'),
+            (op: PendingOp<T>) => !(op.id === ctx.opId && op.op === 'delete'),
           );
           forceRender();
         }
       },
       onError: (error, _id, ctx) => {
         if (ctx?.opId) {
-          pendingOpsRef.current = pendingOpsRef.current.map(op =>
+          pendingOpsRef.current = pendingOpsRef.current.map((op: PendingOp<T>) =>
             op.id === ctx.opId && op.op === 'delete'
               ? { ...op, status: 'failed' as const, error: error.message }
               : op,
@@ -334,5 +335,10 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
     };
   }
 
-  return { name: def.name, useList };
+  function invalidate(params: Record<string, string> = {}) {
+    const key = Object.keys(params).length > 0 ? buildKey(params) : [def.name];
+    globalQueryClient?.invalidateQueries({ queryKey: key });
+  }
+
+  return { name: def.name, useList, invalidate };
 }

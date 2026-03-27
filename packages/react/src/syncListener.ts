@@ -25,6 +25,8 @@ interface EntitiesChangedPayload {
   changes: EntityChange[];
 }
 
+export let globalQueryClient: QueryClient | null = null;
+
 let _unlisten: UnlistenFn | null = null;
 
 /**
@@ -32,6 +34,7 @@ let _unlisten: UnlistenFn | null = null;
  * Call once at app startup.
  */
 export async function startSyncListener(queryClient: QueryClient): Promise<void> {
+  globalQueryClient = queryClient;
   if (_unlisten) return;
 
   _unlisten = await listen<EntitiesChangedPayload>('entities_changed', (event) => {

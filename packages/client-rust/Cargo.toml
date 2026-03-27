@@ -1,19 +1,26 @@
 [package]
 name = "entangled-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Rust client engine for Entangled — entity cache, push processing, cascade invalidation"
+description = "Entangled — self-contained entity sync engine with persistent SQLite cache"
 license = "MIT"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["sync", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 tracing = "0.1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
 
-# Optional: Tauri integration
+# Transport (WS connection management)
+tokio-tungstenite = { version = "0.21", features = ["native-tls"], optional = true }
+futures-util = { version = "0.3", optional = true }
+
+# Optional: Tauri integration (thin adapter)
 tauri = { version = "2", optional = true }
 
 [features]
-default = []
+default = ["transport"]
+transport = ["dep:tokio-tungstenite", "dep:futures-util"]
 tauri = ["dep:tauri"]

@@ -3,18 +3,23 @@
  *
  * Generic stream (append-only) hook with Entangled sync.
  *
- * Subscribe uses head_n mode: initial sync gets latest N items,
- * then delta pushes append new items in real-time.
- * User can loadMore for backward pagination (older items).
+ * ALL data flows through the Rust entity cache:
+ *   - Live data: subscribe → server pushes delta → Rust cache updated → entities_changed → re-read
+ *   - History:   loadMore → cachePrependPage (fetches via WS, writes into Rust cache) → re-read
+ *
+ * The React Query layer is a thin read-through cache on top of the Rust cache.
+ * Pagination is lazy-triggered by the cache — when the UI calls loadMore(),
+ * the entity engine fetches a page from the server and prepends it into the cache.
  */
 
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  useInfiniteQuery, useMutation, useQueryClient,
-  type InfiniteData,
-} from '@tanstack/react-query';
-import { subscribe, unsubscribe, cacheGetVersion, entityClient } from './client';
+  subscribe, unsubscribe, cacheGetList, cacheGetVersion,
+  cacheHasMore, cachePrependPage, entityClient,
+} from './client';
 import type { StreamHookResult } from './types';
+import { globalQueryClient } from './syncListener';
 
 function toSnakeParams(
   params: Record<string, string>,
@@ -28,13 +33,6 @@ function toSnakeParams(
     }
   }
   return result;
-}
-
-// ── Page shape ──────────────────────────────────────────────────
-
-interface StreamPage<T> {
-  items: T[];
-  hasMore: boolean;
 }
 
 // ── Definition ──────────────────────────────────────────────────
@@ -76,6 +74,11 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
     const backendParams = useMemo(() => toSnakeParams(params, def.keyParams), [JSON.stringify(params)]);
     const isEnabled = def.enabled ? def.enabled(params) : true;
 
+    // ── State: hasMore from Rust cache ───────────────────────────
+    const [hasMore, setHasMore] = useState(false);
+    const [isLoadingMore, setIsLoadingMore] = useState(false);
+    const loadingMoreRef = useRef(false);
+
     // ── Subscribe with depth (head_n) ───────────────────────────
     useEffect(() => {
       if (!isEnabled) return;
@@ -89,6 +92,9 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
           version,
           depth: def.depth ?? pageSize,
         });
+        // After subscribe, check has_more from cache
+        const more = await cacheHasMore(def.name, backendParams);
+        if (mounted) setHasMore(more);
       })();
 
       return () => {
@@ -97,71 +103,63 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
       };
     }, [def.name, JSON.stringify(backendParams), isEnabled]);
 
-    // ── Infinite query ──────────────────────────────────────────
-    const query = useInfiniteQuery<StreamPage<T>>({
+    // ── Query: read ALL items from Rust cache ────────────────────
+    const query = useQuery<T[]>({
       queryKey,
-      queryFn: async ({ pageParam }) => {
-        if (!pageParam) {
-          // First page: latest items (from sync or direct fetch)
-          const items = await entityClient.list<T>(def.name, backendParams);
-          return { items, hasMore: items.length >= pageSize };
-        }
-        // Backward pagination: older items
-        const result = await entityClient.listStream<T>(def.name, {
-          params: backendParams,
-          id_lt: pageParam as string,
-          limit: pageSize,
-        });
-        return { items: result.entries, hasMore: result.has_more };
+      queryFn: async () => {
+        // Read from Rust cache (single source of truth)
+        const cached = await cacheGetList<T>(def.name, backendParams);
+        if (cached !== null) return cached;
+        // Fallback: direct fetch if cache miss (subscribe not yet done)
+        return entityClient.list<T>(def.name, backendParams);
       },
-      initialPageParam: undefined as string | undefined,
-      getNextPageParam: (lastPage) =>
-        lastPage.hasMore && lastPage.items.length > 0
-          ? def.getId(lastPage.items[0])
-          : undefined,
-      staleTime: Infinity,
+      staleTime: Infinity,   // Only invalidate via entities_changed
       gcTime: def.gcTime ?? 10 * 60_000,
       enabled: isEnabled,
     });
+
+    // ── Load more: fetch older page → prepend into Rust cache ────
+    const loadMore = useCallback(async () => {
+      if (loadingMoreRef.current || !hasMore) return;
+      const items = query.data;
+      if (!items || items.length === 0) return;
+
+      // Get the oldest item's ID as cursor
+      const oldestId = def.getId(items[0]);
+      loadingMoreRef.current = true;
+      setIsLoadingMore(true);
+
+      try {
+        const result = await cachePrependPage(
+          def.name, backendParams, oldestId, pageSize,
+        );
+        setHasMore(result.hasMore);
+        // Invalidate query so it re-reads from the now-updated Rust cache
+        qc.invalidateQueries({ queryKey });
+      } catch (e) {
+        console.error(`[useStream] loadMore failed for ${def.name}:`, e);
+      } finally {
+        loadingMoreRef.current = false;
+        setIsLoadingMore(false);
+      }
+    }, [hasMore, query.data, backendParams, queryKey]);
 
     // ── Send mutation ───────────────────────────────────────────
     const sendMut = useMutation({
       mutationFn: (data: any) =>
         entityClient.create(def.name, data, backendParams),
-      onMutate: def.optimisticSend
-        ? async (data: any) => {
-            const temp = def.optimisticSend!.createTemp(data, params);
-            qc.setQueryData<InfiniteData<StreamPage<T>>>(
-              queryKey,
-              (old) => {
-                if (!old?.pages?.length) return old;
-                const firstPage = old.pages[0];
-                return {
-                  ...old,
-                  pages: [
-                    { ...firstPage, items: [...firstPage.items, temp] },
-                    ...old.pages.slice(1),
-                  ],
-                };
-              },
-            );
-            return { tempId: def.getId(temp) };
-          }
-        : undefined,
       onSettled: () => {
         qc.invalidateQueries({ queryKey });
       },
     });
 
-    const allItems = query.data?.pages.flatMap((p) => p.items) ?? [];
-
     return {
-      items: allItems,
+      items: query.data ?? [],
       isLoading: query.isLoading,
       error: query.error,
-      hasMore: query.hasNextPage ?? false,
-      loadMore: () => { query.fetchNextPage(); },
-      isLoadingMore: query.isFetchingNextPage,
+      hasMore,
+      loadMore,
+      isLoadingMore,
       send: (data: any) => sendMut.mutateAsync(data),
       isSending: sendMut.isPending,
       refetch: () => { query.refetch(); },
@@ -169,7 +167,8 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
   }
 
   function invalidate(params: Record<string, string> = {}) {
-    // Imperative invalidation
+    const key = Object.keys(params).length > 0 ? buildKey(params) : [def.name];
+    globalQueryClient?.invalidateQueries({ queryKey: key });
   }
 
   return { name: def.name, useStream, invalidate };
