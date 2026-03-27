@@ -16,13 +16,42 @@ import type { EntityRequest, EntityResponse, EntangledMethodArgs } from '@entang
 const WS_CONNECT_RETRY_MS = 400;
 const WS_CONNECT_RETRY_MAX = 10;
 
+/**
+ * Substrings for transient AppBridge / WS failures — keep in sync with
+ * `novaic-app/src-tauri/src/core/app_bridge.rs` (`send_request`, `load_more_stream`) and
+ * `novaic-app/src/services/api.ts` (`devices.grouped` HTTP fallback).
+ */
 function isTransientBridgeDown(msg: string): boolean {
   return (
     msg.includes('WS not connected') ||
+    msg.includes('WS request timeout') ||
+    msg.includes('WS send failed') ||
+    msg.includes('WS request serialization failed') ||
+    msg.includes('Request cancelled') ||
+    msg.includes('sink not available') ||
+    msg.includes('load_more timeout') ||
     msg.includes('AppBridge not connected') ||
     msg.includes('AppBridge disconnected') ||
     msg.includes('pending WS request cancelled')
   );
+}
+
+/** Direct `invoke` paths (e.g. entangled_load_more) — same backoff as gateway_ws_request. */
+async function invokeWithBridgeRetry<T>(fn: () => Promise<T>): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (isTransientBridgeDown(msg) && attempt < WS_CONNECT_RETRY_MAX - 1) {
+        attempt++;
+        await new Promise((r) => setTimeout(r, WS_CONNECT_RETRY_MS));
+        continue;
+      }
+      throw e;
+    }
+  }
 }
 
 /** Mutations and stream fetch — retry while AppBridge is reconnecting. */
@@ -30,8 +59,8 @@ async function wsRequestWithRetry<T = any>(
   req: EntityRequest,
   requestId?: string,
 ): Promise<EntityResponse<T>> {
-  let lastMsg = '';
-  for (let attempt = 0; attempt < WS_CONNECT_RETRY_MAX; attempt++) {
+  let attempt = 0;
+  while (true) {
     try {
       return await invoke<EntityResponse<T>>('gateway_ws_request', {
         action: 'entity',
@@ -41,15 +70,14 @@ async function wsRequestWithRetry<T = any>(
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      lastMsg = msg;
       if (isTransientBridgeDown(msg) && attempt < WS_CONNECT_RETRY_MAX - 1) {
+        attempt++;
         await new Promise((r) => setTimeout(r, WS_CONNECT_RETRY_MS));
         continue;
       }
       return { success: false, error: msg };
     }
   }
-  return { success: false, error: lastMsg || 'gateway_ws_request failed' };
 }
 
 // ── Entangled Method — sole write surface (see CONSTITUTION.md) ───────
@@ -139,7 +167,10 @@ export async function entangledMethod<T = unknown>(
 
 // ── Subscribe / Unsubscribe ─────────────────────────────────────
 
-/** Send subscribe message to server. */
+/**
+ * Best-effort subscribe (no bridge-down retry here): `syncListener` listens for
+ * `app_bridge_connected` and `resubscribeAll` re-sends subscriptions after reconnect.
+ */
 export async function subscribe(
   entity: string,
   params?: Record<string, string>,
@@ -225,13 +256,14 @@ export async function cachePrependPage<T = any>(
   idLt: string,
   limit: number,
 ): Promise<{ count: number; hasMore: boolean }> {
-  const result = await invoke<{ count: number; hasMore: boolean }>('entangled_load_more', {
-    entity,
-    params,
-    beforeId: idLt,
-    limit,
-  });
-  return result;
+  return invokeWithBridgeRetry(() =>
+    invoke<{ count: number; hasMore: boolean }>('entangled_load_more', {
+      entity,
+      params,
+      beforeId: idLt,
+      limit,
+    }),
+  );
 }
 
 // ── entityClient: legacy facade — reads = cache; writes = entangledMethod ─
@@ -256,12 +288,14 @@ export const entityClient = {
       limit?: number;
     },
   ): Promise<{ entries: T[]; has_more: boolean }> {
-    const result = await invoke<{ count: number; hasMore: boolean }>('entangled_load_more', {
-      entity,
-      params: args.params,
-      beforeId: args.id_lt,
-      limit: args.limit ?? 50,
-    });
+    const result = await invokeWithBridgeRetry(() =>
+      invoke<{ count: number; hasMore: boolean }>('entangled_load_more', {
+        entity,
+        params: args.params,
+        beforeId: args.id_lt,
+        limit: args.limit ?? 50,
+      }),
+    );
     // After load_more, entries are already in cache — read them back
     const entries = await cacheGetList<T>(entity, args.params);
     return {
