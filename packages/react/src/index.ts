@@ -30,7 +30,7 @@ export { mergeWithPending, confirmByRequestIds, cleanupStaleOps, genRequestId } 
 export type { PendingOp } from './pendingOps';
 
 // Client (for advanced usage)
-export { entityClient, subscribe, unsubscribe, cacheGetList, cacheGetItem, cacheGetVersion } from './client';
+export { entityClient, subscribe, unsubscribe, cacheGetList, cacheGetItem, cacheGetVersion, cacheHasMore, cachePrependPage } from './client';
 
 // Types (re-export from protocol)
 export type { Entangled, EntangledMeta, EntitiesChangedEvent } from '@entangled/protocol';

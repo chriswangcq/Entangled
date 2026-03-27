@@ -11,6 +11,7 @@ import { useEffect, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { subscribe, unsubscribe, cacheGetItem, cacheGetVersion, entityClient } from './client';
 import type { FormHookResult } from './types';
+import { globalQueryClient } from './syncListener';
 
 function toSnakeParams(
   params: Record<string, string>,
@@ -145,7 +146,9 @@ export function createFormStore<T>(def: FormDef<T>): FormStore<T> {
   }
 
   function invalidate(params: Record<string, string> = {}) {
-    // Imperative invalidation — requires QueryClient from context
+    // Imperative invalidation uses globalQueryClient
+    const key = Object.keys(params).length > 0 ? buildKey(params) : [def.name];
+    globalQueryClient?.invalidateQueries({ queryKey: key });
   }
 
   return { name: def.name, useForm, invalidate };

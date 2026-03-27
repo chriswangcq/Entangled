@@ -9,7 +9,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::cache::{Cache, CacheKey, EntityData, SyncOp};
+use crate::cache::{Cache, CacheKey, SyncOp};
 
 /// A change notification for the UI layer.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -43,7 +43,7 @@ pub struct SyncFrame {
 /// Process a sync frame from the server.
 /// Returns what changed (for emitting to React).
 pub fn process_sync(
-    cache: &mut Cache,
+    cache: &Cache,
     frame: &SyncFrame,
     id_field: &str,
 ) -> Option<EntityChanged> {
@@ -53,15 +53,30 @@ pub fn process_sync(
     };
 
     match frame.mode.as_str() {
-        "snapshot" | "head_n" => {
+        "snapshot" => {
             let data = frame.data.as_ref()?;
-            let entry = cache.entry(key);
-            entry.apply_snapshot(data.clone(), frame.version, id_field);
-            entry.subscribed = true;
+            cache.apply_snapshot(&key, data, frame.version, id_field, false);
+            cache.set_subscribed(&key, true);
 
             tracing::info!(
                 "[Sync] {} snapshot v{} ({} items)",
                 frame.entity, frame.version, data.len()
+            );
+
+            Some(EntityChanged {
+                entity: frame.entity.clone(),
+                action: "synced".into(),
+                request_ids: Vec::new(),
+            })
+        }
+
+        "head_n" => {
+            let data = frame.data.as_ref()?;
+            cache.apply_snapshot(&key, data, frame.version, id_field, frame.has_more);
+
+            tracing::info!(
+                "[Sync] {} head_n v{} ({} items, has_more={})",
+                frame.entity, frame.version, data.len(), frame.has_more
             );
 
             Some(EntityChanged {
@@ -80,9 +95,7 @@ pub fn process_sync(
                 .filter_map(|op| op.request_id.clone())
                 .collect();
 
-            let entry = cache.entry(key.clone());
-
-            if entry.apply_delta(base, ops, frame.version) {
+            if cache.apply_delta(&key, base, ops, frame.version) {
                 tracing::debug!(
                     "[Sync] {} delta v{}→v{} ({} ops, {} requestIds)",
                     frame.entity, base, frame.version, ops.len(), request_ids.len()
@@ -94,9 +107,6 @@ pub fn process_sync(
                 })
             } else {
                 // Version mismatch — need resync
-                let entry = cache.entry(key);
-                entry.synced_at = None;
-
                 tracing::warn!(
                     "[Sync] {} delta version mismatch, marking stale",
                     frame.entity

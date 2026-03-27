@@ -36,14 +36,10 @@ export async function subscribe(
   options?: { version?: number | null; depth?: number },
 ): Promise<void> {
   try {
-    await invoke('gateway_ws_send', {
-      data: {
-        type: 'subscribe',
-        entity,
-        params: params || undefined,
-        version: options?.version ?? null,
-        depth: options?.depth,
-      },
+    await invoke('entangled_subscribe', {
+      entity,
+      params: params || undefined,
+      version: options?.version ?? null,
     });
   } catch (e) {
     console.warn('[Entangled] Subscribe failed:', entity, e);
@@ -56,12 +52,9 @@ export async function unsubscribe(
   params?: Record<string, string>,
 ): Promise<void> {
   try {
-    await invoke('gateway_ws_send', {
-      data: {
-        type: 'unsubscribe',
-        entity,
-        params: params || undefined,
-      },
+    await invoke('entangled_unsubscribe', {
+      entity,
+      params: params || undefined,
     });
   } catch (e) {
     console.warn('[Entangled] Unsubscribe failed:', entity, e);
@@ -95,6 +88,49 @@ export async function cacheGetVersion(
   return invoke<number | null>('entity_version', { entity, params });
 }
 
+/** Check if a stream entity has more older items (from Rust cache). */
+export async function cacheHasMore(
+  entity: string,
+  params?: Record<string, string>,
+): Promise<boolean> {
+  return invoke<boolean>('entity_has_more', { entity, params });
+}
+
+/**
+ * Stream backward pagination through entity engine:
+ * 1. Fetch older items from server via WS (listStream)
+ * 2. Prepend them into Rust cache
+ * 3. Return count of items prepended (caller triggers re-read from cache)
+ */
+export async function cachePrependPage<T = any>(
+  entity: string,
+  params: Record<string, string>,
+  idLt: string,
+  limit: number,
+): Promise<{ count: number; hasMore: boolean }> {
+  // Step 1: Fetch from server
+  const resp = await wsRequest<{ entries: T[]; has_more: boolean }>({
+    op: 'list_stream',
+    entity,
+    params,
+    id_lt: idLt,
+    limit,
+  } as any);
+  if (!resp.success) throw new Error(resp.error || `Failed to list_stream ${entity}`);
+  const entries = resp.entries ?? [];
+  const hasMore = resp.has_more ?? false;
+
+  // Step 2: Prepend into Rust cache
+  const count = await invoke<number>('entity_prepend_page', {
+    entity,
+    params,
+    items: entries,
+    hasMore,
+  });
+
+  return { count, hasMore };
+}
+
 // ── Entity CRUD client ──────────────────────────────────────────
 
 export const entityClient = {
@@ -102,6 +138,16 @@ export const entityClient = {
     const resp = await wsRequest<T>({ op: 'list', entity, params });
     if (!resp.success) throw new Error(resp.error || `Failed to list ${entity}`);
     return resp.entries ?? [];
+  },
+
+  async listStream<T = any>(entity: string, args: {
+    params?: Record<string, string>;
+    id_lt?: string;
+    limit?: number;
+  }): Promise<{ entries: T[]; has_more: boolean }> {
+    const resp = await wsRequest<{ entries: T[]; has_more: boolean }>({ op: 'list_stream', entity, ...args });
+    if (!resp.success) throw new Error(resp.error || `Failed to list_stream ${entity}`);
+    return { entries: resp.entries ?? [], has_more: resp.has_more ?? false };
   },
 
   async get<T = any>(entity: string, id: string, params?: Record<string, string>): Promise<T> {
