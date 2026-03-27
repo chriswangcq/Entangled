@@ -144,11 +144,12 @@ impl Cache {
             PRAGMA temp_store=MEMORY;
 
             CREATE TABLE IF NOT EXISTS entity_meta (
-                entity      TEXT NOT NULL,
-                params_hash INTEGER NOT NULL,
-                version     INTEGER NOT NULL DEFAULT 0,
-                subscribed  INTEGER NOT NULL DEFAULT 0,
-                has_more    INTEGER NOT NULL DEFAULT 0,
+                entity          TEXT NOT NULL,
+                params_hash     INTEGER NOT NULL,
+                version         INTEGER NOT NULL DEFAULT 0,
+                subscribed      INTEGER NOT NULL DEFAULT 0,
+                has_more        INTEGER NOT NULL DEFAULT 0,
+                last_accessed   INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (entity, params_hash)
             );
 
@@ -165,6 +166,12 @@ impl Cache {
                 ON entity_items (entity, params_hash, seq);
         ").expect("Failed to initialize entity cache schema");
 
+        // Migrate: add last_accessed column if missing (existing DBs)
+        let _ = self.conn.execute(
+            "ALTER TABLE entity_meta ADD COLUMN last_accessed INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+
         // Init seq counter from max existing seq
         let max_seq: i64 = self.conn.query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM entity_items",
@@ -172,6 +179,56 @@ impl Cache {
             |row| row.get(0),
         ).unwrap_or(0);
         SEQ_COUNTER.store(max_seq + 1, Ordering::Relaxed);
+    }
+
+    /// Touch last_accessed timestamp for a cache key.
+    fn touch(&self, key: &CacheKey) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn.execute(
+            "UPDATE entity_meta SET last_accessed = ?3 WHERE entity = ?1 AND params_hash = ?2",
+            params![key.entity, key.params_hash as i64, now],
+        ).ok();
+    }
+
+    /// Evict cache entries not accessed in the last `max_age_secs` seconds.
+    /// Returns number of entries evicted.
+    pub fn gc_stale(&self, max_age_secs: u64) -> usize {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cutoff = now - max_age_secs as i64;
+
+        // Find stale keys
+        let mut stmt = self.conn.prepare(
+            "SELECT entity, params_hash FROM entity_meta WHERE last_accessed < ?1 AND last_accessed > 0"
+        ).unwrap();
+        let keys: Vec<(String, i64)> = stmt.query_map(
+            params![cutoff],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        ).unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+
+        let count = keys.len();
+        for (entity, ph) in &keys {
+            self.conn.execute(
+                "DELETE FROM entity_items WHERE entity = ?1 AND params_hash = ?2",
+                params![entity, ph],
+            ).ok();
+            self.conn.execute(
+                "DELETE FROM entity_meta WHERE entity = ?1 AND params_hash = ?2",
+                params![entity, ph],
+            ).ok();
+        }
+
+        if count > 0 {
+            tracing::info!("[Cache] GC: evicted {} stale entries (older than {}s)", count, max_age_secs);
+        }
+        count
     }
 
     // ── Meta operations ─────────────────────────────────────────
@@ -214,9 +271,15 @@ impl Cache {
     }
 
     /// Get version (for subscribe with since_version).
+    /// Returns `Some` after at least one successful sync (`subscribed`) or when version > 0.
+    /// Server may report `version == 0` before any op-log bump; that is still a valid synced state.
     pub fn get_version(&self, key: &CacheKey) -> Option<u64> {
         let meta = self.get_meta(key);
-        if meta.version > 0 { Some(meta.version) } else { None }
+        if meta.subscribed || meta.version > 0 {
+            Some(meta.version)
+        } else {
+            None
+        }
     }
 
     /// Whether data is fresh (version > 0, not invalidated).
@@ -231,8 +294,9 @@ impl Cache {
 
     // ── Item operations ─────────────────────────────────────────
 
-    /// Get all items in order.
+    /// Get all items in order. Also touches last_accessed for TTL.
     pub fn get_list(&self, key: &CacheKey) -> Vec<Value> {
+        self.touch(key);
         let mut stmt = self.conn.prepare_cached(
             "SELECT data FROM entity_items WHERE entity = ?1 AND params_hash = ?2 ORDER BY seq ASC"
         ).unwrap();

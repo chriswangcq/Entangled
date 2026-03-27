@@ -4,6 +4,10 @@ entangled/server/notifier.py — Subscription-based push with cascade.
 Only pushes to clients that have active subscriptions (entanglements).
 Pushes to ALL subscribed clients regardless of who triggered the change
 (multi-user collaboration).
+
+NOTE: Uses module-level state bound via set_store(). This is intentional
+for backwards compatibility — a single process serves one store instance.
+For multi-process deployments, use a process-local store per worker.
 """
 
 from __future__ import annotations
@@ -11,53 +15,77 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, List, Optional, Set
 
-from .sync import SyncOp
+from .sync import SyncOp, SyncRegistry
 
 logger = logging.getLogger(__name__)
 
-# ── Client registry ──────────────────────────────────────────────
+# ── Runtime state (bound per-process via set_store) ──────────────
+#
+# These are module-level for simplicity. In production, each worker process
+# gets its own copy. For testing, call reset_state() between tests.
 
 _clients: Dict[str, tuple[str, Callable]] = {}  # client_id → (user_id, push_fn)
 _store = None
-_sync_registry = None
+_sync_registry: Optional[SyncRegistry] = None
 
 
 def set_store(store) -> None:
+    """Bind the entity store and initialize sync registry.
+
+    Must be called once at startup before any WS connections.
+    """
     global _store, _sync_registry
     _store = store
-    # Bind sync_registry from store if available, else use default
+    # Bind sync_registry from store if available, else create fresh
     if hasattr(store, '_sync_registry'):
         _sync_registry = store._sync_registry
     else:
-        from .sync import SyncRegistry
         _sync_registry = SyncRegistry()
     # Configure op_log sizes from EntityDefs
     for defn in store.get_all_defs():
         _sync_registry.set_op_log_size(defn.name, defn.op_log_size)
 
 
-def _get_registry():
+def _get_registry() -> SyncRegistry:
+    """Get the active sync registry (never creates a new one silently)."""
     if _sync_registry is not None:
         return _sync_registry
-    from .sync import SyncRegistry
-    return SyncRegistry()
+    # This should only happen if set_store() was never called — log loudly
+    logger.error("[Notifier] SyncRegistry not initialized! Call set_store() first.")
+    sr = SyncRegistry()
+    return sr
 
 
 def register_client(client_id: str, user_id: str, push_fn: Callable) -> None:
     _clients[client_id] = (user_id, push_fn)
-    logger.debug("[Notifier] Client %s registered (user=%s)", client_id, user_id)
+    logger.debug("[Notifier] Client %s registered (user=%s, total=%d)", client_id, user_id, len(_clients))
 
 
 def unregister_client(client_id: str) -> None:
     _clients.pop(client_id, None)
     registry = _get_registry()
     registry.unsubscribe_all(client_id)
-    logger.debug("[Notifier] Client %s unregistered", client_id)
+    logger.debug("[Notifier] Client %s unregistered (remaining=%d)", client_id, len(_clients))
 
 
-def get_sync_registry():
+def get_sync_registry() -> SyncRegistry:
     """Get the active sync registry (for ws_handler to use)."""
     return _get_registry()
+
+
+def get_connected_count() -> int:
+    """Return number of connected clients (for diagnostics)."""
+    return len(_clients)
+
+
+def reset_state() -> None:
+    """Clear all runtime state (for testing)."""
+    global _store, _sync_registry
+    _clients.clear()
+    _store = None
+    if _sync_registry:
+        _sync_registry.reset()
+    _sync_registry = None
 
 
 # ── Entity change notification ───────────────────────────────────

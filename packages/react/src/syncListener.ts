@@ -10,11 +10,13 @@
  * 3. This listener picks it up and invalidates React Query
  * 4. The hook's own listener uses requestIds to confirm pendingOps
  *
- * WS reconnect replay is handled in Rust (`resubscribe_all_entangled_wire`).
+ * Also listens for "app_bridge_connected" to re-subscribe all active
+ * subscriptions after WS reconnect.
  */
 
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { QueryClient } from '@tanstack/react-query';
+import { resubscribeAll, resubscribeEntity } from './subscriptionSchema';
 
 interface EntityChange {
   entity: string;
@@ -30,6 +32,7 @@ interface EntitiesChangedPayload {
 export let globalQueryClient: QueryClient | null = null;
 
 let _unlisten: UnlistenFn | null = null;
+let _unlistenReconnect: UnlistenFn | null = null;
 
 /**
  * Start listening for sync updates from Rust engine.
@@ -52,8 +55,14 @@ export async function startSyncListener(queryClient: QueryClient): Promise<void>
       }
 
       if (change.action === 'invalidated') {
-        // Rust already sent subscribe(version=null). Refresh React Query from SQLite.
-        queryClient.invalidateQueries({ queryKey });
+        // Delta version mismatch — Rust cache is stale. Force re-subscribe
+        // to get a fresh snapshot/head_n, then invalidate queries to re-read.
+        resubscribeEntity(change.entity, change.params).then(() => {
+          queryClient.invalidateQueries({ queryKey });
+        }).catch((e) => {
+          console.warn('[Entangled] resubscribeEntity failed:', change.entity, e);
+          queryClient.invalidateQueries({ queryKey });
+        });
       } else {
         // synced or delta — data already in Rust cache, just re-read
         queryClient.invalidateQueries({ queryKey, refetchType: 'active' });
@@ -61,6 +70,14 @@ export async function startSyncListener(queryClient: QueryClient): Promise<void>
     }
   });
 
+  // After WS reconnect, the server has lost all subscription state.
+  // Re-subscribe all active subscriptions so delta pushes resume.
+  _unlistenReconnect = await listen('app_bridge_connected', () => {
+    console.info('[Entangled] WS reconnected, re-subscribing all active subscriptions');
+    resubscribeAll().catch((e) => {
+      console.warn('[Entangled] resubscribeAll failed:', e);
+    });
+  });
 }
 
 /**
@@ -70,5 +87,9 @@ export function stopSyncListener(): void {
   if (_unlisten) {
     _unlisten();
     _unlisten = null;
+  }
+  if (_unlistenReconnect) {
+    _unlistenReconnect();
+    _unlistenReconnect = null;
   }
 }

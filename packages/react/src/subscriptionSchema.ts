@@ -1,10 +1,10 @@
 /**
  * Gateway-driven subscription policy (GET /api/entangled/schema).
  * - subscriptionMode lazy | eager: eager names are also subscribed at app startup.
- * - subscriptionCascade: ref-counted in Rust (`entangled_subscribe_cascade`); TS keeps a copy for eager names / introspection.
+ * - subscriptionCascade: after subscribing to this entity, subscribe same params for these entities.
  */
 
-import { invoke } from '@tauri-apps/api/core';
+import { subscribe, unsubscribe, cacheGetVersion } from './client';
 
 export type SubscriptionMode = 'lazy' | 'eager';
 
@@ -28,14 +28,6 @@ export function setSubscriptionSchema(rows: EntitySubscriptionSchema[]): void {
   }
 }
 
-async function pushSchemaToRust(rows: unknown): Promise<void> {
-  try {
-    await invoke('entangled_set_subscription_schema', { rows });
-  } catch {
-    /* non-Tauri / tests */
-  }
-}
-
 /** Fetch JSON (e.g. gateway_get → array) and register. Swallows errors → empty registry. */
 export async function loadSubscriptionSchema(
   fetchSchema: () => Promise<unknown>,
@@ -44,7 +36,6 @@ export async function loadSubscriptionSchema(
     const data = await fetchSchema();
     const rows = Array.isArray(data) ? (data as EntitySubscriptionSchema[]) : [];
     setSubscriptionSchema(rows);
-    await pushSchemaToRust(data);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     const is404 = /\b404\b/i.test(msg) || msg.includes('Not Found');
@@ -54,7 +45,6 @@ export async function loadSubscriptionSchema(
       console.warn('[Entangled] loadSubscriptionSchema failed:', e);
     }
     setSubscriptionSchema([]);
-    await pushSchemaToRust([]);
   }
 }
 
@@ -77,28 +67,80 @@ export function getSubscriptionCascade(entity: string): string[] {
   return Array.isArray(c) ? c.filter((x) => typeof x === 'string' && x.length > 0) : [];
 }
 
-function paramsForInvoke(backendParams: Record<string, string>): Record<string, string> | null {
-  return Object.keys(backendParams).length > 0 ? backendParams : null;
+/** Ordered list: primary entity, then cascade targets (deduped). */
+function cascadeTargets(entity: string): string[] {
+  const out: string[] = [entity];
+  for (const t of getSubscriptionCascade(entity)) {
+    if (t !== entity && !out.includes(t)) out.push(t);
+  }
+  return out;
+}
+
+/** Ref-count per (entity, params key) — multiple hooks may share cascade targets. */
+const subscribeRefCounts = new Map<string, number>();
+/** Track subscription depth per key (for resubscription after reconnect). */
+const subscribeDepths = new Map<string, number | undefined>();
+/** Track backendParams per key (for resubscription after reconnect). */
+const subscribeParams = new Map<string, { entity: string; params: Record<string, string> }>();
+
+function subscriptionKey(entity: string, backendParams: Record<string, string>): string {
+  const keys = Object.keys(backendParams).sort();
+  const parts = keys.map((k) => `${k}=${backendParams[k]}`);
+  return `${entity}\0${parts.join('&')}`;
+}
+
+async function acquireSubscribe(
+  target: string,
+  backendParams: Record<string, string>,
+  opts: { depth?: number },
+): Promise<void> {
+  const k = subscriptionKey(target, backendParams);
+  const prev = subscribeRefCounts.get(k) ?? 0;
+  if (prev > 0) {
+    subscribeRefCounts.set(k, prev + 1);
+    return;
+  }
+
+  const version = await cacheGetVersion(target, backendParams);
+  await subscribe(target, backendParams, { version, depth: opts.depth });
+  subscribeRefCounts.set(k, 1);
+  subscribeDepths.set(k, opts.depth);
+  subscribeParams.set(k, { entity: target, params: backendParams });
+}
+
+async function releaseUnsubscribe(target: string, backendParams: Record<string, string>): Promise<void> {
+  const k = subscriptionKey(target, backendParams);
+  const prev = subscribeRefCounts.get(k) ?? 0;
+  if (prev <= 0) return;
+  const n = prev - 1;
+  if (n <= 0) {
+    subscribeRefCounts.delete(k);
+    subscribeDepths.delete(k);
+    subscribeParams.delete(k);
+    await unsubscribe(target, backendParams);
+  } else {
+    subscribeRefCounts.set(k, n);
+  }
 }
 
 /**
  * subscribe(entity) then subscribe each cascade target with the same params.
- * Ref-counted in Rust; paired with `unsubscribeWithCascade`.
+ * Ref-counted: paired with `unsubscribeWithCascade` so shared targets stay subscribed.
+ * List entities omit depth; streams pass depth for head_n.
  */
 export async function subscribeWithCascade(
   entity: string,
   backendParams: Record<string, string>,
   opts: { depth?: number },
 ): Promise<void> {
-  await invoke('entangled_subscribe_cascade', {
-    entity,
-    params: paramsForInvoke(backendParams),
-    depth: opts.depth ?? null,
-  });
+  for (const t of cascadeTargets(entity)) {
+    await acquireSubscribe(t, backendParams, opts);
+  }
 }
 
 /**
  * Decrement refs for `entity` and its cascade targets; unsubscribe when ref hits zero.
+ * Call with the same `entity` / `backendParams` as the matching `subscribeWithCascade`.
  */
 export async function unsubscribeWithCascade(
   entity: string,
@@ -106,25 +148,57 @@ export async function unsubscribeWithCascade(
   _opts: { depth?: number },
 ): Promise<void> {
   void _opts;
-  await invoke('entangled_unsubscribe_cascade', {
-    entity,
-    params: paramsForInvoke(backendParams),
-  });
-}
-
-/**
- * Re-subscribe all active subscriptions after WS reconnect (Rust ledger).
- * Prefer letting `app_bridge_connected` replay automatically; kept for callers that need an explicit refresh.
- */
-export async function resubscribeAll(): Promise<void> {
-  try {
-    await invoke('entangled_resubscribe_all_active');
-  } catch {
-    /* non-Tauri */
+  const targets = cascadeTargets(entity);
+  for (let i = targets.length - 1; i >= 0; i--) {
+    await releaseUnsubscribe(targets[i], backendParams);
   }
 }
 
 /**
- * @deprecated Rust replays subscribe(version=null) on `invalidated` when the key is still active.
+ * Re-subscribe all active subscriptions (ref > 0) after WS reconnect.
+ *
+ * When the WS disconnects and reconnects, the server has lost all subscription state.
+ * React hooks still have ref > 0, so `acquireSubscribe` would skip re-sending.
+ * This function bypasses ref-counting and forces re-subscribe with the latest
+ * cached version, enabling delta sync from where the client left off.
  */
-export async function resubscribeEntity(_entity: string, _params?: Record<string, string>): Promise<void> {}
+export async function resubscribeAll(): Promise<void> {
+  const entries = Array.from(subscribeParams.entries());
+  let count = 0;
+
+  for (const [k, { entity, params }] of entries) {
+    const ref = subscribeRefCounts.get(k) ?? 0;
+    if (ref <= 0) continue;
+
+    const depth = subscribeDepths.get(k);
+    const version = await cacheGetVersion(entity, params);
+    await subscribe(entity, params, { version, depth });
+    count++;
+  }
+
+  if (count > 0) {
+    console.info(`[Entangled] Resubscribed ${count} active subscription(s) after reconnect`);
+  }
+}
+
+/**
+ * Force re-subscribe for a specific entity after delta version mismatch.
+ *
+ * When the Rust cache receives a delta with a version mismatch, it emits
+ * "invalidated" and sets local version to 0. This function forces a re-subscribe
+ * with version=null to request a fresh snapshot/head_n from the server.
+ */
+export async function resubscribeEntity(
+  entity: string,
+  params?: Record<string, string>,
+): Promise<void> {
+  const bp = params ?? {};
+  const k = subscriptionKey(entity, bp);
+  const ref = subscribeRefCounts.get(k) ?? 0;
+  if (ref <= 0) return; // Not actively subscribed
+
+  const depth = subscribeDepths.get(k);
+  // Send version=null to force full re-sync (not delta from stale version)
+  await subscribe(entity, bp, { version: null, depth });
+  console.debug(`[Entangled] Forced re-subscribe for ${entity} (invalidated)`);
+}

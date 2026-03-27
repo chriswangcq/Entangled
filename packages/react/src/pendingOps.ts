@@ -12,7 +12,7 @@
  * - Safety net: 30s timeout auto-clears stale ops
  */
 
-import type { Entangled, EntangledMeta } from '@entangled/protocol';
+import type { Entangled } from '@entangled/protocol';
 
 // ── Internal pending operation ──────────────────────────────────
 

@@ -9,9 +9,11 @@
 
 import { useEffect, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { subscribe, unsubscribe, cacheGetItem, cacheGetVersion, entityClient } from './client';
+import { cacheGetItem, entangledMethod } from './client';
+import { subscribeWithCascade, unsubscribeWithCascade } from './subscriptionSchema';
 import type { FormHookResult } from './types';
 import { globalQueryClient } from './syncListener';
+import { genRequestId } from './pendingOps';
 
 function toSnakeParams(
   params: Record<string, string>,
@@ -80,14 +82,13 @@ export function createFormStore<T>(def: FormDef<T>): FormStore<T> {
       let mounted = true;
 
       (async () => {
-        const version = await cacheGetVersion(def.name, backendParams);
         if (!mounted) return;
-        await subscribe(def.name, backendParams, { version });
+        await subscribeWithCascade(def.name, backendParams, {});
       })();
 
       return () => {
         mounted = false;
-        unsubscribe(def.name, backendParams);
+        void unsubscribeWithCascade(def.name, backendParams, {});
       };
     }, [def.name, JSON.stringify(backendParams), isEnabled]);
 
@@ -96,7 +97,14 @@ export function createFormStore<T>(def: FormDef<T>): FormStore<T> {
       queryKey,
       queryFn: async () => {
         const id = resolveEntityId(def, params);
-        return entityClient.get<T>(def.name, id, backendParams);
+        const row = await cacheGetItem<T>(def.name, id, backendParams);
+        if (row != null) return row;
+        if (def.defaultValue != null) {
+          return typeof def.defaultValue === 'function'
+            ? (def.defaultValue as () => T)()
+            : def.defaultValue;
+        }
+        throw new Error(`${def.name} not in local cache yet`);
       },
       staleTime: def.staleTime ?? 30_000,
       gcTime: def.gcTime ?? 5 * 60_000,
@@ -107,7 +115,12 @@ export function createFormStore<T>(def: FormDef<T>): FormStore<T> {
     const submitMut = useMutation({
       mutationFn: async (data: Partial<T>) => {
         const id = resolveEntityId(def, params);
-        return entityClient.upsert<T>(def.name, id, data as Record<string, unknown>, backendParams);
+        const requestId = genRequestId();
+        return entangledMethod<T>(def.name, 'upsert', {
+          id,
+          data: data as Record<string, unknown>,
+          requestId,
+        }, backendParams);
       },
       onMutate: def.optimistic
         ? async (newData: Partial<T>) => {

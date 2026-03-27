@@ -14,10 +14,12 @@
 
 import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { genRequestId } from './pendingOps';
 import {
-  subscribe, unsubscribe, cacheGetList, cacheGetVersion,
-  cacheHasMore, cachePrependPage, entityClient,
+  cacheGetList,
+  cacheHasMore, cachePrependPage, entangledMethod,
 } from './client';
+import { subscribeWithCascade, unsubscribeWithCascade } from './subscriptionSchema';
 import type { StreamHookResult } from './types';
 import { globalQueryClient } from './syncListener';
 
@@ -70,8 +72,12 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
 
   function useStream(params: Record<string, string>): StreamHookResult<T> {
     const qc = useQueryClient();
-    const queryKey = useMemo(() => buildKey(params), [JSON.stringify(params)]);
-    const backendParams = useMemo(() => toSnakeParams(params, def.keyParams), [JSON.stringify(params)]);
+    // Stable serialized key — avoids re-running JSON.stringify on every render
+    const paramsKey = useMemo(() => JSON.stringify(params), [
+      ...def.keyParams.map((k) => params[k]),
+    ]);
+    const queryKey = useMemo(() => buildKey(params), [paramsKey]);
+    const backendParams = useMemo(() => toSnakeParams(params, def.keyParams), [paramsKey]);
     const isEnabled = def.enabled ? def.enabled(params) : true;
 
     // ── State: hasMore from Rust cache ───────────────────────────
@@ -86,10 +92,8 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
       let mounted = true;
 
       (async () => {
-        const version = await cacheGetVersion(def.name, backendParams);
         if (!mounted) return;
-        await subscribe(def.name, backendParams, {
-          version,
+        await subscribeWithCascade(def.name, backendParams, {
           depth: def.depth ?? pageSize,
         });
         // After subscribe, check has_more from cache
@@ -99,20 +103,16 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
 
       return () => {
         mounted = false;
-        unsubscribe(def.name, backendParams);
+        void unsubscribeWithCascade(def.name, backendParams, {
+          depth: def.depth ?? pageSize,
+        });
       };
-    }, [def.name, JSON.stringify(backendParams), isEnabled]);
+    }, [def.name, paramsKey, isEnabled]);
 
     // ── Query: read ALL items from Rust cache ────────────────────
     const query = useQuery<T[]>({
       queryKey,
-      queryFn: async () => {
-        // Read from Rust cache (single source of truth)
-        const cached = await cacheGetList<T>(def.name, backendParams);
-        if (cached !== null) return cached;
-        // Fallback: direct fetch if cache miss (subscribe not yet done)
-        return entityClient.list<T>(def.name, backendParams);
-      },
+      queryFn: async () => cacheGetList<T>(def.name, backendParams),
       staleTime: Infinity,   // Only invalidate via entities_changed
       gcTime: def.gcTime ?? 10 * 60_000,
       enabled: isEnabled,
@@ -146,8 +146,10 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
 
     // ── Send mutation ───────────────────────────────────────────
     const sendMut = useMutation({
-      mutationFn: (data: any) =>
-        entityClient.create(def.name, data, backendParams),
+      mutationFn: async (data: any) => {
+        const requestId = genRequestId();
+        await entangledMethod(def.name, 'create', { data, requestId }, backendParams);
+      },
       onSettled: () => {
         qc.invalidateQueries({ queryKey });
       },

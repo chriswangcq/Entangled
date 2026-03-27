@@ -120,6 +120,18 @@ export interface EntityResponse<T = unknown> {
   error?: string;
 }
 
+// ── Entangled Method (constitutional write surface) ────────────────────────
+
+/** Arguments for `entangledMethod` — standard ops use `data` / `id`; custom methods use `payload`. */
+export interface EntangledMethodArgs {
+  id?: string;
+  data?: Record<string, unknown>;
+  /** Custom method body (or omit for empty action payload). */
+  payload?: Record<string, unknown>;
+  /** Correlates with server delta `requestIds` / store.notify (optional). */
+  requestId?: string;
+}
+
 // ── WS Frame Types ────────────────────────────────────────────────────────
 
 export interface RequestFrame {

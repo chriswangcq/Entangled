@@ -52,8 +52,6 @@ export {
   getSubscriptionCascade,
   subscribeWithCascade,
   unsubscribeWithCascade,
-  resubscribeAll,
-  resubscribeEntity,
 } from './subscriptionSchema';
 export type { EntitySubscriptionSchema, SubscriptionMode } from './subscriptionSchema';
 

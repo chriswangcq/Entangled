@@ -1,29 +1,139 @@
 /**
  * @entangled/react — client.ts
  *
- * Entangled WS client — subscribes, receives sync frames,
- * and forwards CRUD requests through Tauri IPC.
+ * **Entangled Method（宪法）**：一切写操作均为 Method 调用（标准 create/update/delete/upsert
+ * 与自定义 action 同一语义）；见仓库根目录 `Entangled/CONSTITUTION.md`。
  *
- * Key difference from NovAIC's entityClient:
- * - subscribe/unsubscribe lifecycle (mount→subscribe, unmount→unsubscribe)
- * - Sync frames (snapshot/delta) applied to Rust cache, not re-fetch
+ * - **Reads** (`cacheGetList` / `cacheGetItem` / `entityClient.list` / `entityClient.get`):
+ *   Rust SQLite only — populated by subscribe + sync frames (or prepend for streams).
+ * - **Writes** (`create` / `update` / `delete` / `action` / …):
+ *   AppBridge `gateway_ws_request` → Gateway; server applies changes → sync back to SQLite.
  */
 
 import { invoke } from '@tauri-apps/api/core';
-import type { EntityRequest, EntityResponse, SyncFrame } from '@entangled/protocol';
+import type { EntityRequest, EntityResponse, EntangledMethodArgs } from '@entangled/protocol';
 
-// ── WS Request (through Rust AppBridge) ─────────────────────────
+const WS_CONNECT_RETRY_MS = 400;
+const WS_CONNECT_RETRY_MAX = 10;
 
-async function wsRequest<T = any>(req: EntityRequest): Promise<EntityResponse<T>> {
-  try {
-    return await invoke<EntityResponse<T>>('gateway_ws_request', {
-      action: 'entity',
-      path: null,
-      data: req,
-    });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return { success: false, error: msg };
+function isTransientBridgeDown(msg: string): boolean {
+  return (
+    msg.includes('WS not connected') ||
+    msg.includes('AppBridge not connected') ||
+    msg.includes('AppBridge disconnected') ||
+    msg.includes('pending WS request cancelled')
+  );
+}
+
+/** Mutations and stream fetch — retry while AppBridge is reconnecting. */
+async function wsRequestWithRetry<T = any>(
+  req: EntityRequest,
+  requestId?: string,
+): Promise<EntityResponse<T>> {
+  let lastMsg = '';
+  for (let attempt = 0; attempt < WS_CONNECT_RETRY_MAX; attempt++) {
+    try {
+      return await invoke<EntityResponse<T>>('gateway_ws_request', {
+        action: 'entity',
+        path: null,
+        data: req,
+        request_id: requestId ?? null,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      lastMsg = msg;
+      if (isTransientBridgeDown(msg) && attempt < WS_CONNECT_RETRY_MAX - 1) {
+        await new Promise((r) => setTimeout(r, WS_CONNECT_RETRY_MS));
+        continue;
+      }
+      return { success: false, error: msg };
+    }
+  }
+  return { success: false, error: lastMsg || 'gateway_ws_request failed' };
+}
+
+// ── Entangled Method — sole write surface (see CONSTITUTION.md) ───────
+
+/**
+ * Invoke a single **Entangled Method** on `entity` (standard: `create` | `update` | `delete` | `upsert`;
+ * any other `method` string is a custom action registered on `EntityDef.actions`).
+ *
+ * - `create` → `{ data }`
+ * - `update` | `upsert` → `{ id, data }`
+ * - `delete` → `{ id }`
+ * - Custom → `{ payload }` (optional; also accepts `data` as alias for payload)
+ */
+export async function entangledMethod<T = unknown>(
+  entity: string,
+  method: string,
+  args: EntangledMethodArgs = {},
+  params?: Record<string, string>,
+): Promise<T> {
+  const rid = args.requestId;
+  switch (method) {
+    case 'create': {
+      if (args.data === undefined) throw new Error('entangledMethod(create): `data` required');
+      const resp = await wsRequestWithRetry<T>(
+        { op: 'create', entity, data: args.data, params },
+        rid,
+      );
+      if (!resp.success) throw new Error(resp.error || `Failed to create ${entity}`);
+      return resp.data as T;
+    }
+    case 'update': {
+      if (!args.id || args.data === undefined) throw new Error('entangledMethod(update): `id` and `data` required');
+      const resp = await wsRequestWithRetry<T>(
+        {
+          op: 'update',
+          entity,
+          id: args.id,
+          data: args.data,
+          params,
+        },
+        rid,
+      );
+      if (!resp.success) throw new Error(resp.error || `Failed to update ${entity}/${args.id}`);
+      return resp.data as T;
+    }
+    case 'delete': {
+      if (!args.id) throw new Error('entangledMethod(delete): `id` required');
+      const resp = await wsRequestWithRetry(
+        { op: 'delete', entity, id: args.id, params },
+        rid,
+      );
+      if (!resp.success) throw new Error(resp.error || `Failed to delete ${entity}/${args.id}`);
+      return undefined as T;
+    }
+    case 'upsert': {
+      if (!args.id || args.data === undefined) throw new Error('entangledMethod(upsert): `id` and `data` required');
+      const resp = await wsRequestWithRetry<T>(
+        {
+          op: 'upsert',
+          entity,
+          id: args.id,
+          data: args.data,
+          params,
+        },
+        rid,
+      );
+      if (!resp.success) throw new Error(resp.error || `Failed to upsert ${entity}/${args.id}`);
+      return resp.data as T;
+    }
+    default: {
+      const body = args.payload ?? args.data;
+      const resp = await wsRequestWithRetry<T>(
+        {
+          op: 'action',
+          entity,
+          action_name: method,
+          data: body,
+          params,
+        },
+        rid,
+      );
+      if (!resp.success) throw new Error(resp.error || `Failed to invoke ${entity}.${method}`);
+      return resp.data as T;
+    }
   }
 }
 
@@ -40,6 +150,7 @@ export async function subscribe(
       entity,
       params: params || undefined,
       version: options?.version ?? null,
+      depth: options?.depth ?? null,
     });
   } catch (e) {
     console.warn('[Entangled] Subscribe failed:', entity, e);
@@ -61,14 +172,19 @@ export async function unsubscribe(
   }
 }
 
-// ── Cache access (through Rust) ─────────────────────────────────
+// ── Cache access (through Rust) — sole read path for UI data ────
 
-/** Read list from Rust cache. Returns null if stale/missing. */
+/** Read list from Rust SQLite (only source for UI reads; populate via subscribe + sync). */
 export async function cacheGetList<T>(
   entity: string,
   params?: Record<string, string>,
-): Promise<T[] | null> {
-  return invoke<T[] | null>('entity_list', { entity, params });
+): Promise<T[]> {
+  try {
+    const r = await invoke<T[] | null>('entity_list', { entity, params });
+    return Array.isArray(r) ? r : [];
+  } catch {
+    return [];
+  }
 }
 
 /** Read single item from Rust cache. */
@@ -97,10 +213,11 @@ export async function cacheHasMore(
 }
 
 /**
- * Stream backward pagination through entity engine:
- * 1. Fetch older items from server via WS (listStream)
- * 2. Prepend them into Rust cache
- * 3. Return count of items prepended (caller triggers re-read from cache)
+ * Stream backward pagination — fully encapsulated in Entangled protocol.
+ *
+ * The entire flow (WS load_more → server fetch → Rust cache prepend → emit event)
+ * is handled by the `entangled_load_more` Tauri command. The React layer only
+ * provides the cursor (oldest item ID) and receives { count, hasMore }.
  */
 export async function cachePrependPage<T = any>(
   entity: string,
@@ -108,80 +225,98 @@ export async function cachePrependPage<T = any>(
   idLt: string,
   limit: number,
 ): Promise<{ count: number; hasMore: boolean }> {
-  // Step 1: Fetch from server
-  const resp = await wsRequest<{ entries: T[]; has_more: boolean }>({
-    op: 'list_stream',
+  const result = await invoke<{ count: number; hasMore: boolean }>('entangled_load_more', {
     entity,
     params,
-    id_lt: idLt,
+    beforeId: idLt,
     limit,
-  } as any);
-  if (!resp.success) throw new Error(resp.error || `Failed to list_stream ${entity}`);
-  const entries = resp.entries ?? [];
-  const hasMore = resp.has_more ?? false;
-
-  // Step 2: Prepend into Rust cache
-  const count = await invoke<number>('entity_prepend_page', {
-    entity,
-    params,
-    items: entries,
-    hasMore,
   });
-
-  return { count, hasMore };
+  return result;
 }
 
-// ── Entity CRUD client ──────────────────────────────────────────
+// ── entityClient: legacy facade — reads = cache; writes = entangledMethod ─
 
 export const entityClient = {
+  /**
+   * List — **Rust cache only** (same as `cacheGetList`). Does not hit the network.
+   */
   async list<T = any>(entity: string, params?: Record<string, string>): Promise<T[]> {
-    const resp = await wsRequest<T>({ op: 'list', entity, params });
-    if (!resp.success) throw new Error(resp.error || `Failed to list ${entity}`);
-    return resp.entries ?? [];
+    return cacheGetList<T>(entity, params);
   },
 
-  async listStream<T = any>(entity: string, args: {
-    params?: Record<string, string>;
-    id_lt?: string;
-    limit?: number;
-  }): Promise<{ entries: T[]; has_more: boolean }> {
-    const resp = await wsRequest<{ entries: T[]; has_more: boolean }>({ op: 'list_stream', entity, ...args });
-    if (!resp.success) throw new Error(resp.error || `Failed to list_stream ${entity}`);
-    return { entries: resp.entries ?? [], has_more: resp.has_more ?? false };
+  /**
+   * Stream fetch — goes through Entangled load_more protocol.
+   * Fills cache via `cachePrependPage` in hooks; rarely call directly.
+   */
+  async listStream<T = any>(
+    entity: string,
+    args: {
+      params?: Record<string, string>;
+      id_lt?: string;
+      limit?: number;
+    },
+  ): Promise<{ entries: T[]; has_more: boolean }> {
+    const result = await invoke<{ count: number; hasMore: boolean }>('entangled_load_more', {
+      entity,
+      params: args.params,
+      beforeId: args.id_lt,
+      limit: args.limit ?? 50,
+    });
+    // After load_more, entries are already in cache — read them back
+    const entries = await cacheGetList<T>(entity, args.params);
+    return {
+      entries,
+      has_more: result.hasMore,
+    };
   },
 
+  /**
+   * Get — **Rust cache only**. Throws if the row is not in SQLite (subscribe first).
+   */
   async get<T = any>(entity: string, id: string, params?: Record<string, string>): Promise<T> {
-    const resp = await wsRequest<T>({ op: 'get', entity, id, params });
-    if (!resp.success) throw new Error(resp.error || `Failed to get ${entity}/${id}`);
-    return resp.data!;
+    const row = await cacheGetItem<T>(entity, id, params);
+    if (row == null) {
+      throw new Error(`Not in local cache: ${entity}/${id}`);
+    }
+    return row;
   },
 
-  async create<T = any>(entity: string, data: Record<string, unknown>, params?: Record<string, string>): Promise<T> {
-    const resp = await wsRequest<T>({ op: 'create', entity, data, params });
-    if (!resp.success) throw new Error(resp.error || `Failed to create ${entity}`);
-    return resp.data!;
+  async create<T = any>(
+    entity: string,
+    data: Record<string, unknown>,
+    params?: Record<string, string>,
+  ): Promise<T> {
+    return entangledMethod<T>(entity, 'create', { data }, params);
   },
 
-  async update<T = any>(entity: string, id: string, data: Record<string, unknown>, params?: Record<string, string>): Promise<T> {
-    const resp = await wsRequest<T>({ op: 'update', entity, id, data, params });
-    if (!resp.success) throw new Error(resp.error || `Failed to update ${entity}/${id}`);
-    return resp.data!;
+  async update<T = any>(
+    entity: string,
+    id: string,
+    data: Record<string, unknown>,
+    params?: Record<string, string>,
+  ): Promise<T> {
+    return entangledMethod<T>(entity, 'update', { id, data }, params);
   },
 
-  async upsert<T = any>(entity: string, id: string, data: Record<string, unknown>, params?: Record<string, string>): Promise<T> {
-    const resp = await wsRequest<T>({ op: 'upsert', entity, id, data, params });
-    if (!resp.success) throw new Error(resp.error || `Failed to upsert ${entity}/${id}`);
-    return resp.data!;
+  async upsert<T = any>(
+    entity: string,
+    id: string,
+    data: Record<string, unknown>,
+    params?: Record<string, string>,
+  ): Promise<T> {
+    return entangledMethod<T>(entity, 'upsert', { id, data }, params);
   },
 
   async remove(entity: string, id: string, params?: Record<string, string>): Promise<void> {
-    const resp = await wsRequest({ op: 'delete', entity, id, params });
-    if (!resp.success) throw new Error(resp.error || `Failed to delete ${entity}/${id}`);
+    return entangledMethod(entity, 'delete', { id }, params);
   },
 
-  async action<T = any>(entity: string, actionName: string, data?: Record<string, unknown>, params?: Record<string, string>): Promise<T> {
-    const resp = await wsRequest<T>({ op: 'action', entity, action_name: actionName, data, params });
-    if (!resp.success) throw new Error(resp.error || `Failed to action ${entity}.${actionName}`);
-    return resp.data!;
+  async action<T = any>(
+    entity: string,
+    actionName: string,
+    data?: Record<string, unknown>,
+    params?: Record<string, string>,
+  ): Promise<T> {
+    return entangledMethod<T>(entity, actionName, { payload: data }, params);
   },
 };
