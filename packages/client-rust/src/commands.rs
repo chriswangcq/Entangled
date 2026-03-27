@@ -11,11 +11,14 @@ use std::path::PathBuf;
 use crate::cache::{Cache, CacheKey};
 use crate::push::{process_sync, SyncFrame};
 use crate::schema::SchemaRegistry;
+use crate::subscription::{SubscriptionLedger, SubscriptionSchemaStore};
 
 /// Shared state for Tauri — wraps cache in std::sync::Mutex (rusqlite is !Sync).
 pub struct EntangledState {
     pub registry: Arc<StdMutex<SchemaRegistry>>,
     pub cache: Arc<StdMutex<Cache>>,
+    pub subscription_schema: Arc<StdMutex<SubscriptionSchemaStore>>,
+    pub subscription_ledger: Arc<StdMutex<SubscriptionLedger>>,
 }
 
 // Safety: StdMutex<Cache> is Send+Sync even though Cache contains rusqlite::Connection (!Sync).
@@ -29,6 +32,8 @@ impl EntangledState {
         Self {
             registry: Arc::new(StdMutex::new(SchemaRegistry::new())),
             cache: Arc::new(StdMutex::new(Cache::new_in_memory())),
+            subscription_schema: Arc::new(StdMutex::new(SubscriptionSchemaStore::new())),
+            subscription_ledger: Arc::new(StdMutex::new(SubscriptionLedger::new())),
         }
     }
 
@@ -38,6 +43,8 @@ impl EntangledState {
         Self {
             registry: Arc::new(StdMutex::new(SchemaRegistry::new())),
             cache: Arc::new(StdMutex::new(Cache::new(&db_path))),
+            subscription_schema: Arc::new(StdMutex::new(SubscriptionSchemaStore::new())),
+            subscription_ledger: Arc::new(StdMutex::new(SubscriptionLedger::new())),
         }
     }
 
@@ -49,6 +56,8 @@ impl EntangledState {
         Self {
             registry: Arc::new(StdMutex::new(SchemaRegistry::new())),
             cache: Arc::new(StdMutex::new(Cache::new(&db_path))),
+            subscription_schema: Arc::new(StdMutex::new(SubscriptionSchemaStore::new())),
+            subscription_ledger: Arc::new(StdMutex::new(SubscriptionLedger::new())),
         }
     }
 }
@@ -66,21 +75,18 @@ fn make_key(entity: &str, params: Option<Value>) -> CacheKey {
     }
 }
 
-/// Get list from cache. Returns null if not cached or stale.
+/// Get list from SQLite cache (read path — always local, never hits Gateway).
+/// Empty vec means no rows for this key (cold or legitimately empty after sync).
 #[cfg(feature = "tauri")]
 #[tauri::command]
 pub async fn entity_list(
     entity: String,
     params: Option<Value>,
     state: tauri::State<'_, EntangledState>,
-) -> Result<Option<Vec<Value>>, String> {
+) -> Result<Vec<Value>, String> {
     let key = make_key(&entity, params);
     let cache = state.cache.lock().unwrap();
-    if cache.is_fresh(&key) {
-        Ok(Some(cache.get_list(&key)))
-    } else {
-        Ok(None)
-    }
+    Ok(cache.get_list(&key))
 }
 
 /// Get single item from cache.
@@ -147,6 +153,20 @@ pub async fn entity_has_more(
     let key = make_key(&entity, params);
     let cache = state.cache.lock().unwrap();
     Ok(cache.has_more_before(&key))
+}
+
+/// Load subscription schema (`subscriptionCascade`, etc.) from Gateway — keeps Rust cascade in sync with TS registry.
+#[cfg(feature = "tauri")]
+#[tauri::command]
+pub async fn entangled_set_subscription_schema(
+    rows: Value,
+    state: tauri::State<'_, EntangledState>,
+) -> Result<(), String> {
+    let arr = rows
+        .as_array()
+        .ok_or_else(|| "entangled_set_subscription_schema: expected JSON array".to_string())?;
+    let mut schema = state.subscription_schema.lock().unwrap();
+    schema.set_from_json_array(arr)
 }
 
 /// Prepend older items into cache (called after JS fetches a page via WS).

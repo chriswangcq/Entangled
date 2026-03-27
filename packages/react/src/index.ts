@@ -29,8 +29,33 @@ export { startSyncListener, stopSyncListener } from './syncListener';
 export { mergeWithPending, confirmByRequestIds, cleanupStaleOps, genRequestId } from './pendingOps';
 export type { PendingOp } from './pendingOps';
 
-// Client (for advanced usage)
-export { entityClient, subscribe, unsubscribe, cacheGetList, cacheGetItem, cacheGetVersion, cacheHasMore, cachePrependPage } from './client';
+// Client — constitutional write surface + cache reads
+export {
+  entangledMethod,
+  entityClient,
+  subscribe,
+  unsubscribe,
+  cacheGetList,
+  cacheGetItem,
+  cacheGetVersion,
+  cacheHasMore,
+  cachePrependPage,
+} from './client';
+export type { EntangledMethodArgs } from '@entangled/protocol';
+
+// Gateway schema (subscriptionMode / subscriptionCascade)
+export {
+  loadSubscriptionSchema,
+  setSubscriptionSchema,
+  getSubscriptionSchema,
+  getEagerEntityNames,
+  getSubscriptionCascade,
+  subscribeWithCascade,
+  unsubscribeWithCascade,
+  resubscribeAll,
+  resubscribeEntity,
+} from './subscriptionSchema';
+export type { EntitySubscriptionSchema, SubscriptionMode } from './subscriptionSchema';
 
 // Types (re-export from protocol)
 export type { Entangled, EntangledMeta, EntitiesChangedEvent } from '@entangled/protocol';
