@@ -189,18 +189,20 @@ def resolve_sync(
 
     # Case 1: First subscribe (git clone)
     if client_version is None and client_head is None:
-        data = fetch_data_fn()
-
         if sync_type == "stream" and depth:
-            items = data[-depth:] if len(data) > depth else data
+            # Fetch only depth+1 items from DB to check hasMore,
+            # instead of loading ALL rows into memory.
+            data = fetch_data_fn(limit=depth + 1)
+            has_more = len(data) > depth
+            items = data[-depth:] if has_more else data
             return {
                 "mode": "head_n",
                 "version": state.current_version,
                 "data": items,
-                "hasMore": len(data) > depth,
-                "total": len(data),
+                "hasMore": has_more,
             }
         else:
+            data = fetch_data_fn()
             return {
                 "mode": "snapshot",
                 "version": state.current_version,

@@ -55,11 +55,20 @@ class EntityStore:
         user_id: str,
         *,
         params: Optional[Dict[str, str]] = None,
+        limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         defn = self.get_def(entity)
         self._check_access(defn, user_id, "list", params=params)
         if not defn.list_fn:
             raise NotImplementedError(f"{entity} does not support list")
+        # Try to pass limit if the list_fn supports it
+        if limit is not None:
+            try:
+                return defn.list_fn(self, user_id, params or {}, limit=limit)
+            except TypeError:
+                # list_fn doesn't accept limit — fallback to full list + slice
+                data = defn.list_fn(self, user_id, params or {})
+                return data[:limit] if len(data) > limit else data
         return defn.list_fn(self, user_id, params or {})
 
     def get(
