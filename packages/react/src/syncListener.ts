@@ -9,6 +9,8 @@
  * 2. Emits an "entities_changed" event with { entity, action, requestIds }
  * 3. This listener picks it up and invalidates React Query
  * 4. The hook's own listener uses requestIds to confirm pendingOps
+ *
+ * WS reconnect replay is handled in Rust (`resubscribe_all_entangled_wire`).
  */
 
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -50,6 +52,7 @@ export async function startSyncListener(queryClient: QueryClient): Promise<void>
       }
 
       if (change.action === 'invalidated') {
+        // Rust already sent subscribe(version=null). Refresh React Query from SQLite.
         queryClient.invalidateQueries({ queryKey });
       } else {
         // synced or delta — data already in Rust cache, just re-read
@@ -57,6 +60,7 @@ export async function startSyncListener(queryClient: QueryClient): Promise<void>
       }
     }
   });
+
 }
 
 /**
