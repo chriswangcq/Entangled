@@ -3,7 +3,12 @@ entangled/server/sync.py — Git-like sync engine.
 
 Manages per-(entity, params) version tracking, op-log, and sync decisions.
 This is the "smart protocol" that decides whether to send a snapshot,
-delta pack, or just confirm "up_to_date".
+delta pack, head_n (bounded stream window), or up_to_date.
+
+Stream entities (`sync_type == "stream"`): every path that materializes rows uses
+head_n only (`fetch_data_fn(limit=depth+1)`), including op-log gap recovery.
+Hosts should pass ``default_stream_depth`` from ``EntityDef.sync_limit``; if both
+client ``depth`` and that default are absent, ``DEFAULT_STREAM_HEAD_DEPTH`` applies.
 """
 
 from __future__ import annotations
@@ -16,6 +21,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Fallback when client and EntityDef both omit a stream window (keep in sync with typical sync_limit).
+DEFAULT_STREAM_HEAD_DEPTH: int = 50
+# Hard cap to avoid accidental huge LIMIT from bad client input.
+MAX_STREAM_HEAD_DEPTH: int = 10_000
 
 
 # ── Op-log entry ─────────────────────────────────────────────────
@@ -76,7 +86,12 @@ class SyncState:
 
         ops = [e for e in self.op_log if e.version > since_version]
 
-        if ops and ops[0].version != since_version + 1:
+        if not ops:
+            # Client is behind persisted current_version but op_log is empty
+            # (Gateway restart, deque maxlen GC, etc.) — must not return a bogus delta.
+            return None
+
+        if ops[0].version != since_version + 1:
             return None  # Gap — op_log gc'd
 
         return ops
@@ -108,10 +123,30 @@ def _state_key(entity: str, params: Optional[Dict[str, str]] = None) -> str:
 class SyncRegistry:
     """Registry of sync states. Bind to an EntityStore, not a global singleton."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        on_version_bump: Optional[Callable[[str, int], None]] = None,
+    ):
         self._states: Dict[str, SyncState] = {}
         self._client_subs: Dict[str, Set[str]] = {}
         self._op_log_sizes: Dict[str, int] = {}  # entity → maxlen
+        # Optional: persist (state_key, current_version) after each mutation (e.g. Gateway SQLite).
+        self._on_version_bump = on_version_bump
+
+    def hydrate_versions(self, versions: Dict[str, int]) -> None:
+        """Restore current_version from persisted storage after process restart.
+
+        Call after set_op_log_size for all entities so deque maxlen is correct.
+        """
+        for key, ver in versions.items():
+            if ver < 0:
+                continue
+            entity = key.split(":", 1)[0] if ":" in key else key
+            maxlen = self._op_log_sizes.get(entity, 1000)
+            if key not in self._states:
+                self._states[key] = SyncState.with_maxlen(maxlen)
+            st = self._states[key]
+            st.current_version = max(st.current_version, ver)
 
     def set_op_log_size(self, entity: str, size: int) -> None:
         """Configure op_log size for an entity."""
@@ -158,6 +193,17 @@ class SyncRegistry:
         params = _normalize_params(params)
         state = self.get_state(entity, params)
         entry = state.append_op(op, entity_id, data, request_id=request_id)
+        if self._on_version_bump is not None:
+            key = _state_key(entity, params)
+            try:
+                self._on_version_bump(key, state.current_version)
+            except Exception as e:
+                logger.warning(
+                    "[Entangled] on_version_bump failed for %s v=%s: %s",
+                    key,
+                    state.current_version,
+                    e,
+                )
         return state, entry
 
     def get_subscribed_clients(
@@ -177,6 +223,77 @@ class SyncRegistry:
 
 # ── Sync decision logic ─────────────────────────────────────────
 
+def _effective_stream_depth(
+    depth: Optional[int],
+    default_stream_depth: Optional[int],
+) -> int:
+    """
+    Resolve head_n window: prefer client ``depth``, then ``default_stream_depth``
+    (EntityDef.sync_limit), then ``DEFAULT_STREAM_HEAD_DEPTH``. Clamp to ``MAX_STREAM_HEAD_DEPTH``.
+    """
+    for candidate in (depth, default_stream_depth):
+        if candidate is None:
+            continue
+        try:
+            d = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if d <= 0:
+            continue
+        return min(d, MAX_STREAM_HEAD_DEPTH)
+    return DEFAULT_STREAM_HEAD_DEPTH
+
+
+def _stream_head_n_sync(
+    state: SyncState,
+    fetch_data_fn: Callable,
+    depth: Optional[int],
+    default_stream_depth: Optional[int],
+    *,
+    reason: str = "subscribe",
+    exists_before_fn: Optional[Callable[[str], bool]] = None,
+) -> dict:
+    """
+    Bounded sync for stream entities.
+
+    If ``exists_before_fn`` is provided, fetches exactly ``d`` rows and uses
+    cursor-based ``SELECT EXISTS(...)`` to determine ``hasMore`` precisely.
+    Otherwise falls back to N+1 detection (fetch d+1, compare count).
+    """
+    d = _effective_stream_depth(depth, default_stream_depth)
+
+    if exists_before_fn:
+        # Cursor-based: fetch exactly d items, then EXISTS check on oldest
+        data = fetch_data_fn(limit=d)
+        if len(data) < d:
+            has_more = False
+        else:
+            # data is ASC-ordered (oldest first after reverse); oldest = data[0]
+            oldest = data[0] if data else None
+            oldest_id = oldest.get("id") if oldest else None
+            has_more = exists_before_fn(oldest_id) if oldest_id else False
+        items = data
+    else:
+        # Fallback: N+1 (for generic Entangled hosts without exists_before_fn)
+        data = fetch_data_fn(limit=d + 1)
+        has_more = len(data) > d
+        items = data[-d:] if has_more else data
+
+    logger.debug(
+        "[Entangled] head_n (%s): depth=%d rows=%d hasMore=%s",
+        reason,
+        d,
+        len(items),
+        has_more,
+    )
+    return {
+        "mode": "head_n",
+        "version": state.current_version,
+        "data": items,
+        "hasMore": has_more,
+    }
+
+
 def resolve_sync(
     state: SyncState,
     client_version: Optional[int],
@@ -184,30 +301,47 @@ def resolve_sync(
     depth: Optional[int],
     fetch_data_fn: Callable,
     sync_type: str = "list",
+    *,
+    default_stream_depth: Optional[int] = None,
+    exists_before_fn: Optional[Callable[[str], bool]] = None,
 ) -> dict:
-    """Decide sync mode (like git smart protocol)."""
+    """Decide sync mode (like git smart protocol).
+
+    Args:
+        state: Per-(entity, params) version and op-log.
+        client_version: Client's last known server version (None = first subscribe).
+        client_head: Reserved for stream cursors; None uses version-based sync.
+        depth: Client-requested head_n window (WS ``depth``); may be None.
+        fetch_data_fn: Host callback; MUST support ``limit`` kw/arg for bounded reads.
+        sync_type: ``"list"`` or ``"stream"``.
+        default_stream_depth: Entity schema default (``EntityDef.sync_limit``) when
+            ``depth`` is omitted or invalid; None uses ``DEFAULT_STREAM_HEAD_DEPTH``.
+        exists_before_fn: Optional host callback ``(oldest_id: str) -> bool`` for
+            cursor-based ``hasMore`` detection. When provided, stream sync fetches
+            exactly ``depth`` rows and uses ``SELECT EXISTS(...)`` to check for older
+            rows — precise and efficient. Without it, falls back to N+1 detection.
+
+    Returns:
+        Dict with ``mode``, ``version``, and optional ``data`` / ``ops`` / ``hasMore``.
+    """
 
     # Case 1: First subscribe (git clone)
     if client_version is None and client_head is None:
-        if sync_type == "stream" and depth:
-            # Fetch only depth+1 items from DB to check hasMore,
-            # instead of loading ALL rows into memory.
-            data = fetch_data_fn(limit=depth + 1)
-            has_more = len(data) > depth
-            items = data[-depth:] if has_more else data
-            return {
-                "mode": "head_n",
-                "version": state.current_version,
-                "data": items,
-                "hasMore": has_more,
-            }
-        else:
-            data = fetch_data_fn()
-            return {
-                "mode": "snapshot",
-                "version": state.current_version,
-                "data": data,
-            }
+        if sync_type == "stream":
+            return _stream_head_n_sync(
+                state,
+                fetch_data_fn,
+                depth,
+                default_stream_depth,
+                reason="first_subscribe",
+                exists_before_fn=exists_before_fn,
+            )
+        data = fetch_data_fn()
+        return {
+            "mode": "snapshot",
+            "version": state.current_version,
+            "data": data,
+        }
 
     # Case 2: Reconnect with version (git pull)
     since = client_version or 0
@@ -227,10 +361,27 @@ def resolve_sync(
             "baseVersion": since,
             "ops": [op.to_dict() for op in ops],
         }
-    else:
-        data = fetch_data_fn()
-        return {
-            "mode": "snapshot",
-            "version": state.current_version,
-            "data": data,
-        }
+
+    # Op-log gap: list entities need a full snapshot; stream must stay bounded.
+    if sync_type == "stream":
+        logger.warning(
+            "[Entangled] stream op-log gap — head_n resync (no unbounded snapshot), "
+            "since_client_version=%s current_version=%s",
+            since,
+            state.current_version,
+        )
+        return _stream_head_n_sync(
+            state,
+            fetch_data_fn,
+            depth,
+            default_stream_depth,
+            reason="op_log_gap",
+            exists_before_fn=exists_before_fn,
+        )
+
+    data = fetch_data_fn()
+    return {
+        "mode": "snapshot",
+        "version": state.current_version,
+        "data": data,
+    }

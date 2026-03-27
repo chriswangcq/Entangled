@@ -69,8 +69,17 @@ class EntityDef:
 
     # ── Sync strategy ────────────────────────────────────────────
     sync_type: str = "list"             # "list" (mutable CRUD) | "stream" (append-only)
-    sync_limit: Optional[int] = None    # default depth for head_n mode (stream only)
+    # Default head_n window when the client omits ``depth``; passed to ``resolve_sync(..., default_stream_depth=...)``.
+    sync_limit: Optional[int] = None    # stream only; host should set (e.g. 50)
     op_log_size: int = 1000             # max op-log entries per (entity, params)
+
+    # ── Client subscription (declared on Gateway, exposed via get_schema()) ───
+    # lazy: subscribe only when a hook mounts (default).
+    # eager: also subscribe at app startup (before any hook), for global entities.
+    # subscription_cascade: after subscribing to this entity, client also subscribes
+    #   to these names with the same params (same keyParams scope).
+    subscription_mode: str = "lazy"  # "lazy" | "eager"
+    subscription_cascade: List[str] = field(default_factory=list)
 
     # ── CRUD handlers ────────────────────────────────────────────
     list_fn: Optional[ListFn] = None
@@ -107,4 +116,7 @@ class EntityDef:
             "keyParams": self.key_params,
             "pushEvents": self.push_events or [],
             "syncType": self.sync_type,
+            "syncLimit": self.sync_limit,
+            "subscriptionMode": self.subscription_mode,
+            "subscriptionCascade": list(self.subscription_cascade),
         }

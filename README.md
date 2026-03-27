@@ -2,6 +2,8 @@
 
 **Real-time entity sync engine — like Git for your app state.**
 
+> **宪法（不可违背的契约）**：见 **[CONSTITUTION.md](./CONSTITUTION.md)** — *Entangled Method*（唯一写路径）、*Rust 缓存唯一读*、*订阅策略由 Gateway 声明*。
+
 Entangled 是一个全栈实时数据同步中间件。它用类似 Git 的版本化协议，让服务端和客户端之间保持「纠缠态」：一端变化，另一端自动同步。
 
 ```

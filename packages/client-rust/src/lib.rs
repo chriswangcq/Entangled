@@ -39,7 +39,6 @@ pub mod auth;
 pub mod cache;
 pub mod push;
 pub mod schema;
-pub mod subscription;
 pub mod client;
 
 #[cfg(feature = "transport")]
@@ -53,4 +52,3 @@ pub use auth::AuthProvider;
 pub use client::{EntangledClient, EntangledConfig};
 pub use push::{EntityChanged, SyncFrame};
 pub use cache::{Cache, CacheKey};
-pub use subscription::{subscription_cache_key, SubscriptionLedger, SubscriptionSchemaStore};

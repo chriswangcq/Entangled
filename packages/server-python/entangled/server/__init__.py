@@ -16,16 +16,26 @@ Usage:
 
 from .defs import EntityDef, EntityRelation
 from .store import EntityStore
-from .sync import SyncRegistry
+from .sync import (
+    DEFAULT_STREAM_HEAD_DEPTH,
+    MAX_STREAM_HEAD_DEPTH,
+    SyncRegistry,
+    resolve_sync,
+)
 from .ws_handler import create_ws_handler
-from .notifier import notify_entity_change
+from .notifier import notify_entity_change, reset_state, get_connected_count
 
 __all__ = [
+    "DEFAULT_STREAM_HEAD_DEPTH",
+    "MAX_STREAM_HEAD_DEPTH",
     "EntityDef",
     "EntityRelation",
     "EntityStore",
     "SyncRegistry",
+    "resolve_sync",
     "create_ws_handler",
     "notify_entity_change",
+    "reset_state",
+    "get_connected_count",
 ]
 

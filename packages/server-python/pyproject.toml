@@ -16,3 +16,7 @@ dependencies = []
 starlette = ["starlette>=0.27"]
 fastapi = ["fastapi>=0.100"]
 dev = ["pytest", "httpx", "uvicorn", "starlette>=0.27"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

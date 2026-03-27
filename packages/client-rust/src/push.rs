@@ -6,10 +6,39 @@
 //! - head_n: apply partial data (git clone --depth)
 //! - up_to_date: no-op (already current)
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::cache::{Cache, CacheKey, SyncOp};
+
+fn params_json_to_strings(p: &serde_json::Map<String, Value>) -> HashMap<String, String> {
+    p.iter()
+        .map(|(k, v)| {
+            let s = match v {
+                Value::String(s) => s.clone(),
+                Value::Null => String::new(),
+                _ => v.to_string(),
+            };
+            (k.clone(), s)
+        })
+        .collect()
+}
+
+fn entity_changed(
+    entity: &str,
+    action: &str,
+    request_ids: Vec<String>,
+    frame_params: &Option<serde_json::Map<String, Value>>,
+) -> EntityChanged {
+    EntityChanged {
+        entity: entity.to_string(),
+        action: action.to_string(),
+        params: frame_params.as_ref().map(params_json_to_strings),
+        request_ids,
+    }
+}
 
 /// A change notification for the UI layer.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -17,13 +46,17 @@ use crate::cache::{Cache, CacheKey, SyncOp};
 pub struct EntityChanged {
     pub entity: String,
     pub action: String,  // "synced" | "delta" | "invalidated"
+    /// Subscription key params (React Query invalidation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<HashMap<String, String>>,
     /// requestIds from ops — for optimistic state confirmation
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub request_ids: Vec<String>,
 }
 
-/// Incoming sync frame from server.
+/// Incoming sync frame from server (Gateway uses camelCase for several fields).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyncFrame {
     pub entity: String,
     pub params: Option<serde_json::Map<String, Value>>,
@@ -63,11 +96,12 @@ pub fn process_sync(
                 frame.entity, frame.version, data.len()
             );
 
-            Some(EntityChanged {
-                entity: frame.entity.clone(),
-                action: "synced".into(),
-                request_ids: Vec::new(),
-            })
+            Some(entity_changed(
+                &frame.entity,
+                "synced",
+                Vec::new(),
+                &frame.params,
+            ))
         }
 
         "head_n" => {
@@ -79,11 +113,12 @@ pub fn process_sync(
                 frame.entity, frame.version, data.len(), frame.has_more
             );
 
-            Some(EntityChanged {
-                entity: frame.entity.clone(),
-                action: "synced".into(),
-                request_ids: Vec::new(),
-            })
+            Some(entity_changed(
+                &frame.entity,
+                "synced",
+                Vec::new(),
+                &frame.params,
+            ))
         }
 
         "delta" => {
@@ -100,22 +135,24 @@ pub fn process_sync(
                     "[Sync] {} delta v{}→v{} ({} ops, {} requestIds)",
                     frame.entity, base, frame.version, ops.len(), request_ids.len()
                 );
-                Some(EntityChanged {
-                    entity: frame.entity.clone(),
-                    action: "delta".into(),
+                Some(entity_changed(
+                    &frame.entity,
+                    "delta",
                     request_ids,
-                })
+                    &frame.params,
+                ))
             } else {
                 // Version mismatch — need resync
                 tracing::warn!(
                     "[Sync] {} delta version mismatch, marking stale",
                     frame.entity
                 );
-                Some(EntityChanged {
-                    entity: frame.entity.clone(),
-                    action: "invalidated".into(),
-                    request_ids: Vec::new(),
-                })
+                Some(entity_changed(
+                    &frame.entity,
+                    "invalidated",
+                    Vec::new(),
+                    &frame.params,
+                ))
             }
         }
 
