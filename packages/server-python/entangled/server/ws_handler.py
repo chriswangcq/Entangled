@@ -166,8 +166,8 @@ async def _handle_subscribe(
     state = registry.get_state(entity, params)
 
     # Fetch function for snapshot/head_n
-    def fetch_data():
-        return store.list(entity, user_id, params=params or {})
+    def fetch_data(limit=None):
+        return store.list(entity, user_id, params=params or {}, limit=limit)
 
     # Resolve sync strategy
     sync_result = resolve_sync(
