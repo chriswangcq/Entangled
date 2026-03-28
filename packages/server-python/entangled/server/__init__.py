@@ -22,7 +22,15 @@ from .sync import (
     SyncRegistry,
     resolve_sync,
 )
-from .ws_handler import create_ws_handler
+from .ws_handler import (
+    create_ws_handler,
+    WsSender,
+    cascade_targets,
+    handle_subscribe,
+    handle_unsubscribe,
+    handle_load_more,
+    handle_request,
+)
 from .notifier import notify_entity_change, reset_state, get_connected_count
 
 __all__ = [
@@ -34,6 +42,12 @@ __all__ = [
     "SyncRegistry",
     "resolve_sync",
     "create_ws_handler",
+    "WsSender",
+    "cascade_targets",
+    "handle_subscribe",
+    "handle_unsubscribe",
+    "handle_load_more",
+    "handle_request",
     "notify_entity_change",
     "reset_state",
     "get_connected_count",

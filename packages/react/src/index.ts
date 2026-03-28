@@ -43,13 +43,12 @@ export {
 } from './client';
 export type { EntangledMethodArgs } from '@entangled/protocol';
 
-// Gateway schema (subscriptionMode / subscriptionCascade)
+// Gateway schema (subscriptionMode; cascade is server-side)
 export {
   loadSubscriptionSchema,
   setSubscriptionSchema,
   getSubscriptionSchema,
   getEagerEntityNames,
-  getSubscriptionCascade,
   subscribeWithCascade,
   unsubscribeWithCascade,
 } from './subscriptionSchema';

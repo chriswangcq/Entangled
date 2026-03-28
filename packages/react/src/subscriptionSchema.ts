@@ -1,7 +1,8 @@
 /**
  * Gateway-driven subscription policy (GET /api/entangled/schema).
  * - subscriptionMode lazy | eager: eager names are also subscribed at app startup.
- * - subscriptionCascade: after subscribing to this entity, subscribe same params for these entities.
+ * - Cascade is handled entirely server-side (ws_handler._cascade_targets).
+ *   Client sends ONE subscribe; server fans out to cascade targets automatically.
  */
 
 import { subscribe, unsubscribe, cacheGetVersion } from './client';
@@ -16,7 +17,6 @@ export interface EntitySubscriptionSchema {
   syncType: string;
   syncLimit?: number | null;
   subscriptionMode?: SubscriptionMode;
-  subscriptionCascade?: string[];
 }
 
 const byName = new Map<string, EntitySubscriptionSchema>();
@@ -60,23 +60,9 @@ export function getEagerEntityNames(): string[] {
   return out;
 }
 
-/** Targets to subscribe after `entity` (same params as parent). */
-export function getSubscriptionCascade(entity: string): string[] {
-  const d = byName.get(entity);
-  const c = d?.subscriptionCascade;
-  return Array.isArray(c) ? c.filter((x) => typeof x === 'string' && x.length > 0) : [];
-}
+// ── Ref-counted subscribe / unsubscribe ─────────────────────────
 
-/** Ordered list: primary entity, then cascade targets (deduped). */
-function cascadeTargets(entity: string): string[] {
-  const out: string[] = [entity];
-  for (const t of getSubscriptionCascade(entity)) {
-    if (t !== entity && !out.includes(t)) out.push(t);
-  }
-  return out;
-}
-
-/** Ref-count per (entity, params key) — multiple hooks may share cascade targets. */
+/** Ref-count per (entity, params key) — multiple hooks may share the same entity. */
 const subscribeRefCounts = new Map<string, number>();
 /** Track subscription depth per key (for resubscription after reconnect). */
 const subscribeDepths = new Map<string, number | undefined>();
@@ -90,26 +76,26 @@ function subscriptionKey(entity: string, backendParams: Record<string, string>):
 }
 
 async function acquireSubscribe(
-  target: string,
+  entity: string,
   backendParams: Record<string, string>,
   opts: { depth?: number },
 ): Promise<void> {
-  const k = subscriptionKey(target, backendParams);
+  const k = subscriptionKey(entity, backendParams);
   const prev = subscribeRefCounts.get(k) ?? 0;
   if (prev > 0) {
     subscribeRefCounts.set(k, prev + 1);
     return;
   }
 
-  const version = await cacheGetVersion(target, backendParams);
-  await subscribe(target, backendParams, { version, depth: opts.depth });
+  const version = await cacheGetVersion(entity, backendParams);
+  await subscribe(entity, backendParams, { version, depth: opts.depth });
   subscribeRefCounts.set(k, 1);
   subscribeDepths.set(k, opts.depth);
-  subscribeParams.set(k, { entity: target, params: backendParams });
+  subscribeParams.set(k, { entity, params: backendParams });
 }
 
-async function releaseUnsubscribe(target: string, backendParams: Record<string, string>): Promise<void> {
-  const k = subscriptionKey(target, backendParams);
+async function releaseUnsubscribe(entity: string, backendParams: Record<string, string>): Promise<void> {
+  const k = subscriptionKey(entity, backendParams);
   const prev = subscribeRefCounts.get(k) ?? 0;
   if (prev <= 0) return;
   const n = prev - 1;
@@ -117,30 +103,28 @@ async function releaseUnsubscribe(target: string, backendParams: Record<string, 
     subscribeRefCounts.delete(k);
     subscribeDepths.delete(k);
     subscribeParams.delete(k);
-    await unsubscribe(target, backendParams);
+    await unsubscribe(entity, backendParams);
   } else {
     subscribeRefCounts.set(k, n);
   }
 }
 
 /**
- * subscribe(entity) then subscribe each cascade target with the same params.
- * Ref-counted: paired with `unsubscribeWithCascade` so shared targets stay subscribed.
- * List entities omit depth; streams pass depth for head_n.
+ * Subscribe to entity.  Server-side cascade: the server automatically expands
+ * cascade targets and sends back one sync frame per target.
+ * Ref-counted: paired with `unsubscribeWithCascade`.
  */
 export async function subscribeWithCascade(
   entity: string,
   backendParams: Record<string, string>,
   opts: { depth?: number },
 ): Promise<void> {
-  for (const t of cascadeTargets(entity)) {
-    await acquireSubscribe(t, backendParams, opts);
-  }
+  await acquireSubscribe(entity, backendParams, opts);
 }
 
 /**
- * Decrement refs for `entity` and its cascade targets; unsubscribe when ref hits zero.
- * Call with the same `entity` / `backendParams` as the matching `subscribeWithCascade`.
+ * Decrement ref for entity; unsubscribe when ref hits zero.
+ * Server will auto-unsubscribe cascade targets.
  */
 export async function unsubscribeWithCascade(
   entity: string,
@@ -148,10 +132,7 @@ export async function unsubscribeWithCascade(
   _opts: { depth?: number },
 ): Promise<void> {
   void _opts;
-  const targets = cascadeTargets(entity);
-  for (let i = targets.length - 1; i >= 0; i--) {
-    await releaseUnsubscribe(targets[i], backendParams);
-  }
+  await releaseUnsubscribe(entity, backendParams);
 }
 
 /**

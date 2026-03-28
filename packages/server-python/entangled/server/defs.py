@@ -118,5 +118,7 @@ class EntityDef:
             "syncType": self.sync_type,
             "syncLimit": self.sync_limit,
             "subscriptionMode": self.subscription_mode,
-            "subscriptionCascade": list(self.subscription_cascade),
+            # NOTE: subscriptionCascade intentionally omitted — cascade is now
+            # handled server-side in ws_handler._handle_subscribe; clients never
+            # need to expand cascade targets themselves.
         }
