@@ -20,9 +20,20 @@ import logging
 import time
 import traceback
 import uuid
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
+
+
+# ── WsSender Protocol ────────────────────────────────────────────
+# Any object with an async send_json(data) method can be used as a
+# WsSender.  This decouples Entangled handlers from Starlette's
+# WebSocket class, allowing hosts to multiplex Entangled messages
+# over their own transport (e.g. AppBridge WS).
+
+@runtime_checkable
+class WsSender(Protocol):
+    async def send_json(self, data: Any) -> None: ...
 
 from .notifier import register_client, unregister_client, set_store, get_sync_registry
 from .store import EntityStore
@@ -167,17 +178,17 @@ def create_ws_handler(
                 msg_type = msg.get("type")
 
                 if msg_type == "request":
-                    await _handle_request(websocket, store, user_id, msg)
+                    await handle_request(websocket, store, user_id, msg)
                 elif msg_type == "subscribe":
-                    await _handle_subscribe(
+                    await handle_subscribe(
                         websocket, store, user_id, client_id, msg,
                         exists_before_fn_factory=exists_before_fn_factory,
                     )
                 elif msg_type == "unsubscribe":
-                    _handle_unsubscribe(client_id, msg)
+                    handle_unsubscribe(client_id, msg, store=store)
                 elif msg_type == "load_more":
-                    await _handle_load_more(websocket, store, user_id, msg,
-                                            exists_before_fn_factory=exists_before_fn_factory)
+                    await handle_load_more(websocket, store, user_id, msg,
+                                           exists_before_fn_factory=exists_before_fn_factory)
                 elif msg_type in ("ping", "pong", "heartbeat"):
                     if msg_type == "ping":
                         await websocket.send_json({"type": "pong"})
@@ -200,8 +211,78 @@ def create_ws_handler(
 
 # ── Subscribe ────────────────────────────────────────────────────
 
-async def _handle_subscribe(
-    ws: WebSocket,
+def cascade_targets(store: EntityStore, entity: str) -> list:
+    """Return [entity] + its subscription_cascade targets (deduped, ordered)."""
+    targets = [entity]
+    try:
+        defn = store.get_def(entity)
+    except KeyError:
+        return targets
+    for t in defn.subscription_cascade:
+        if t and t not in targets:
+            targets.append(t)
+    return targets
+
+
+async def _subscribe_one(
+    ws: WsSender,
+    store: EntityStore,
+    user_id: str,
+    client_id: str,
+    entity: str,
+    params,
+    client_version,
+    client_head,
+    depth,
+    *,
+    exists_before_fn_factory: Optional[Callable] = None,
+) -> None:
+    """Subscribe + resolve_sync + send frame for a single entity."""
+    try:
+        defn = store.get_def(entity)
+    except KeyError:
+        logger.debug("[WS] Cascade target %s unknown, skipping", entity)
+        return
+
+    registry = get_sync_registry()
+    registry.subscribe(client_id, entity, params)
+
+    state = registry.get_state(entity, params)
+
+    def fetch_data(limit=None):
+        return store.list(entity, user_id, params=params or {}, limit=limit)
+
+    eb_fn = None
+    if exists_before_fn_factory and defn.sync_type == "stream":
+        eb_fn = exists_before_fn_factory(entity, user_id, params)
+
+    sync_result = resolve_sync(
+        state,
+        client_version=client_version,
+        client_head=client_head,
+        depth=depth,
+        fetch_data_fn=fetch_data,
+        sync_type=defn.sync_type,
+        default_stream_depth=defn.sync_limit,
+        exists_before_fn=eb_fn,
+    )
+
+    frame = {
+        "type": "sync",
+        "entity": entity,
+        "params": params,
+        **sync_result,
+    }
+    await ws.send_json(frame)
+
+    logger.info(
+        "[WS] %s subscribed to %s (mode=%s, v%d)",
+        client_id[:8], entity, sync_result["mode"], sync_result["version"],
+    )
+
+
+async def handle_subscribe(
+    ws: WsSender,
     store: EntityStore,
     user_id: str,
     client_id: str,
@@ -220,71 +301,54 @@ async def _handle_subscribe(
         return
 
     try:
-        defn = store.get_def(entity)
+        store.get_def(entity)
     except KeyError:
         await ws.send_json({"type": "error", "error": f"Unknown entity: {entity}"})
         return
 
-    registry = get_sync_registry()
+    # Server-side cascade expansion: subscribe to entity + all its cascade targets.
+    # Client sends ONE subscribe; server fans out and sends one sync frame per target.
+    targets = cascade_targets(store, entity)
+    for target in targets:
+        await _subscribe_one(
+            ws, store, user_id, client_id, target, params,
+            client_version, client_head, depth,
+            exists_before_fn_factory=exists_before_fn_factory,
+        )
 
-    # Register subscription
-    registry.subscribe(client_id, entity, params)
-
-    # Get sync state
-    state = registry.get_state(entity, params)
-
-    # Fetch function for snapshot/head_n
-    def fetch_data(limit=None):
-        return store.list(entity, user_id, params=params or {}, limit=limit)
-
-    # Build exists_before_fn for cursor-based hasMore (if host provides factory)
-    eb_fn = None
-    if exists_before_fn_factory and defn.sync_type == "stream":
-        eb_fn = exists_before_fn_factory(entity, user_id, params)
-
-    # Resolve sync strategy
-    sync_result = resolve_sync(
-        state,
-        client_version=client_version,
-        client_head=client_head,
-        depth=depth,
-        fetch_data_fn=fetch_data,
-        sync_type=defn.sync_type,
-        default_stream_depth=defn.sync_limit,
-        exists_before_fn=eb_fn,
-    )
-
-    # Send sync frame
-    frame = {
-        "type": "sync",
-        "entity": entity,
-        "params": params,
-        **sync_result,
-    }
-
-    await ws.send_json(frame)
-
-    logger.info(
-        "[WS] %s subscribed to %s (mode=%s, v%d)",
-        client_id[:8], entity, sync_result["mode"], sync_result["version"],
-    )
+    if len(targets) > 1:
+        logger.debug(
+            "[WS] %s subscribe %s cascaded to %s",
+            client_id[:8], entity, targets[1:],
+        )
 
 
 # ── Unsubscribe ──────────────────────────────────────────────────
 
-def _handle_unsubscribe(client_id: str, msg: dict) -> None:
+def handle_unsubscribe(client_id: str, msg: dict, store: Optional[EntityStore] = None) -> None:
     entity = msg.get("entity", "")
     params = msg.get("params") or None
-    if entity:
-        registry = get_sync_registry()
-        registry.unsubscribe(client_id, entity, params)
-        logger.debug("[WS] %s unsubscribed from %s", client_id[:8], entity)
+    if not entity:
+        return
+
+    registry = get_sync_registry()
+
+    # Server-side cascade: unsubscribe entity + cascade targets
+    if store:
+        targets = cascade_targets(store, entity)
+    else:
+        targets = [entity]
+
+    for target in targets:
+        registry.unsubscribe(client_id, target, params)
+
+    logger.debug("[WS] %s unsubscribed from %s", client_id[:8], targets)
 
 
 # ── Load More (backward pagination, first-class protocol) ────────
 
-async def _handle_load_more(
-    ws: WebSocket,
+async def handle_load_more(
+    ws: WsSender,
     store: EntityStore,
     user_id: str,
     msg: dict,
@@ -301,7 +365,7 @@ async def _handle_load_more(
     entity = msg.get("entity", "")
     params = msg.get("params") or {}
     before_id = msg.get("before_id")
-    limit = msg.get("limit", 50)
+    limit = min(int(msg.get("limit", 50)), 500)  # Cap at 500
 
     if not entity:
         await ws.send_json({
@@ -327,7 +391,7 @@ async def _handle_load_more(
         # Cursor-based hasMore (if host provides factory)
         if not entries:
             has_more = False
-        elif exists_before_fn_factory and defn.sync_type == "stream":
+        elif exists_before_fn_factory and getattr(defn, 'sync_type', 'stream') == "stream":
             eb_fn = exists_before_fn_factory(entity, user_id, params)
             oldest_id = entries[-1].get("id") if entries else None
             has_more = eb_fn(oldest_id) if oldest_id and eb_fn else False
@@ -355,7 +419,7 @@ async def _handle_load_more(
 
 # ── Request ──────────────────────────────────────────────────────
 
-async def _handle_request(ws: WebSocket, store: EntityStore, user_id: str, msg: dict) -> None:
+async def handle_request(ws: WsSender, store: EntityStore, user_id: str, msg: dict) -> None:
     request_id = msg.get("request_id", "")
     data = msg.get("data", {})
 
