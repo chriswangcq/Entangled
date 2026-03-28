@@ -44,7 +44,7 @@ ExistsBeforeFn = Callable  # (store, user_id, entity_id, params) -> bool
 ActionFn = Callable        # (store, user_id, params, payload) -> dict
 
 
-@dataclass
+@dataclass(kw_only=True)
 class EntityDef:
     """Definition of an entity in the Entangled system.
 
