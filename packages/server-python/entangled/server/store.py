@@ -6,7 +6,6 @@ Fully generic — no business logic, just routes to the handlers
 defined in each EntityDef.
 """
 
-from __future__ import annotations
 
 import inspect
 import logging
@@ -70,6 +69,52 @@ class EntityStore:
                 data = defn.list_fn(self, user_id, params or {})
                 return data[:limit] if len(data) > limit else data
         return defn.list_fn(self, user_id, params or {})
+
+    def list_stream(
+        self,
+        entity: str,
+        user_id: str,
+        *,
+        params: Optional[Dict[str, str]] = None,
+        before_id: Optional[str] = None,
+        after_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Cursor-based backward pagination for stream entities.
+
+        If the EntityDef provides a list_stream_fn, delegates to it.
+        Otherwise falls back to list() with limit (no cursor support).
+        """
+        defn = self.get_def(entity)
+        self._check_access(defn, user_id, "list_stream", params=params)
+        if defn.list_stream_fn:
+            return defn.list_stream_fn(
+                self, user_id, params or {},
+                before_id=before_id,
+                after_id=after_id,
+                limit=limit,
+            )
+        # Fallback: no cursor, just list with limit
+        return self.list(entity, user_id, params=params, limit=limit)
+
+    def exists_before(
+        self,
+        entity: str,
+        user_id: str,
+        oldest_id: str,
+        *,
+        params: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        """Check if older items exist before the given cursor ID (for hasMore).
+
+        If the EntityDef provides exists_before_fn, delegates to it.
+        Otherwise returns False (unknown — caller falls back to len-based heuristic).
+        """
+        defn = self.get_def(entity)
+        if defn.exists_before_fn:
+            return defn.exists_before_fn(self, user_id, oldest_id, params or {})
+        return False
+
 
     def get(
         self,
@@ -154,6 +199,34 @@ class EntityStore:
                 request_id=request_id,
             )
         return ok
+
+    def upsert(
+        self,
+        entity: str,
+        user_id: str,
+        entity_id: str,
+        data: Dict[str, Any],
+        *,
+        params: Optional[Dict[str, str]] = None,
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Insert-or-update. Falls back to update() if no upsert_fn defined."""
+        defn = self.get_def(entity)
+        self._check_access(defn, user_id, "upsert", entity_id=entity_id, params=params)
+        if defn.upsert_fn:
+            result = defn.upsert_fn(self, user_id, entity_id, data, params or {})
+        elif defn.update_fn:
+            result = defn.update_fn(self, user_id, entity_id, data, params or {})
+        else:
+            raise NotImplementedError(f"{entity} does not support upsert or update")
+        self._notify_change(
+            entity, "updated", user_id,
+            entity_id=entity_id,
+            params=params,
+            data=result,
+            request_id=request_id,
+        )
+        return result
 
     async def action(
         self,

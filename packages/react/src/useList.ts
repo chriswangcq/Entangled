@@ -28,23 +28,7 @@ import {
 } from './pendingOps';
 import type { Entangled } from '@entangled/protocol';
 import { globalQueryClient } from './syncListener';
-
-// ── camelCase → snake_case ──────────────────────────────────────
-
-function toSnakeParams(
-  params: Record<string, string>,
-  keyParams?: string[],
-): Record<string, string> {
-  if (!keyParams) return params;
-  const result: Record<string, string> = {};
-  for (const k of keyParams) {
-    if (params[k] !== undefined) {
-      const snake = k.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`);
-      result[snake] = params[k];
-    }
-  }
-  return result;
-}
+import { toSnakeParams } from './utils';
 
 // ── Definition ──────────────────────────────────────────────────
 
@@ -97,7 +81,7 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
     );
     const queryKey = useMemo(() => buildKey(params), [paramsKey]);
     const backendParams = useMemo(
-      () => toSnakeParams(params, def.keyParams),
+      () => toSnakeParams(params, def.keyParams ?? []),
       [paramsKey],
     );
     const isEnabled = def.enabled ? def.enabled(params) : true;

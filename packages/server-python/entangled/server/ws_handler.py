@@ -10,8 +10,6 @@ Handles:
   6. Disconnect: cleanup subscriptions
 """
 
-from __future__ import annotations
-
 import asyncio
 import hashlib
 import inspect
@@ -20,9 +18,15 @@ import logging
 import time
 import traceback
 import uuid
-from typing import Any, Callable, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
-from starlette.websockets import WebSocket, WebSocketDisconnect
+# Starlette is an optional dependency — only needed for create_ws_handler().
+# Hosts that use the public handler APIs (handle_subscribe, etc.) don't need it.
+try:
+    from starlette.websockets import WebSocket, WebSocketDisconnect
+except ImportError:  # pragma: no cover
+    WebSocket = None  # type: ignore[assignment, misc]
+    WebSocketDisconnect = Exception  # type: ignore[assignment, misc]
 
 
 # ── WsSender Protocol ────────────────────────────────────────────
@@ -52,16 +56,12 @@ def create_ws_handler(
     store: EntityStore,
     *,
     auth_fn: Optional[Callable[[WebSocket], Optional[str]]] = None,
-    exists_before_fn_factory: Optional[Callable] = None,
 ):
     """Create a Starlette WebSocket handler for the Entangled protocol.
 
     Args:
         store: Entity store with all registered EntityDefs.
         auth_fn: Optional ``(ws) -> user_id`` authentication callback.
-        exists_before_fn_factory: Optional ``(entity, user_id, params) -> (oldest_id -> bool)``
-            factory for cursor-based hasMore detection. When provided, subscribe
-            uses precise ``SELECT EXISTS(...)`` instead of N+1.
     """
 
     # One-time setup — not per-connection
@@ -182,13 +182,11 @@ def create_ws_handler(
                 elif msg_type == "subscribe":
                     await handle_subscribe(
                         websocket, store, user_id, client_id, msg,
-                        exists_before_fn_factory=exists_before_fn_factory,
                     )
                 elif msg_type == "unsubscribe":
                     handle_unsubscribe(client_id, msg, store=store)
                 elif msg_type == "load_more":
-                    await handle_load_more(websocket, store, user_id, msg,
-                                           exists_before_fn_factory=exists_before_fn_factory)
+                    await handle_load_more(websocket, store, user_id, msg)
                 elif msg_type in ("ping", "pong", "heartbeat"):
                     if msg_type == "ping":
                         await websocket.send_json({"type": "pong"})
@@ -234,8 +232,6 @@ async def _subscribe_one(
     client_version,
     client_head,
     depth,
-    *,
-    exists_before_fn_factory: Optional[Callable] = None,
 ) -> None:
     """Subscribe + resolve_sync + send frame for a single entity."""
     try:
@@ -252,9 +248,15 @@ async def _subscribe_one(
     def fetch_data(limit=None):
         return store.list(entity, user_id, params=params or {}, limit=limit)
 
+    # Build exists_before from EntityDef or store's native method
     eb_fn = None
-    if exists_before_fn_factory and defn.sync_type == "stream":
-        eb_fn = exists_before_fn_factory(entity, user_id, params)
+    if defn.sync_type == "stream":
+        if defn.exists_before_fn:
+            def eb_fn(oldest_id: str) -> bool:
+                return store.exists_before(entity, user_id, oldest_id, params=params or {})
+        elif hasattr(store, 'exists_before'):
+            def eb_fn(oldest_id: str) -> bool:
+                return store.exists_before(entity, user_id, oldest_id, params=params or {})
 
     sync_result = resolve_sync(
         state,
@@ -287,8 +289,6 @@ async def handle_subscribe(
     user_id: str,
     client_id: str,
     msg: dict,
-    *,
-    exists_before_fn_factory: Optional[Callable] = None,
 ) -> None:
     entity = msg.get("entity", "")
     params = msg.get("params") or None  # Normalize
@@ -313,7 +313,6 @@ async def handle_subscribe(
         await _subscribe_one(
             ws, store, user_id, client_id, target, params,
             client_version, client_head, depth,
-            exists_before_fn_factory=exists_before_fn_factory,
         )
 
     if len(targets) > 1:
@@ -352,8 +351,6 @@ async def handle_load_more(
     store: EntityStore,
     user_id: str,
     msg: dict,
-    *,
-    exists_before_fn_factory: Optional[Callable] = None,
 ) -> None:
     """Handle backward pagination as a first-class Entangled protocol message.
 
@@ -377,24 +374,20 @@ async def handle_load_more(
     try:
         defn = store.get_def(entity)
 
-        # Fetch via store's list_stream if available, otherwise list with limit
-        if hasattr(store, 'list_stream'):
-            entries = store.list_stream(
-                entity, user_id,
-                before_id=before_id,
-                limit=limit,
-                params=params,
-            )
-        else:
-            entries = store.list(entity, user_id, params=params, limit=limit)
+        # Fetch via store.list_stream (cursor-based)
+        entries = store.list_stream(
+            entity, user_id,
+            before_id=before_id,
+            limit=limit,
+            params=params,
+        )
 
-        # Cursor-based hasMore (if host provides factory)
+        # Cursor-based hasMore: prefer defn.exists_before_fn, then store.exists_before
         if not entries:
             has_more = False
-        elif exists_before_fn_factory and getattr(defn, 'sync_type', 'stream') == "stream":
-            eb_fn = exists_before_fn_factory(entity, user_id, params)
+        elif defn.sync_type == "stream" and (defn.exists_before_fn or hasattr(store, 'exists_before')):
             oldest_id = entries[-1].get("id") if entries else None
-            has_more = eb_fn(oldest_id) if oldest_id and eb_fn else False
+            has_more = store.exists_before(entity, user_id, oldest_id, params=params) if oldest_id else False
         else:
             # Fallback: if we got exactly `limit` items, assume more exist
             has_more = len(entries) >= limit
@@ -454,8 +447,33 @@ async def _dispatch(store: EntityStore, user_id: str, data: dict, request_id: st
     try:
         store.get_def(entity)
 
+        _MAX_LIST_ENTRIES = 5000
+
         if op == "list":
             entries = store.list(entity, user_id, params=params)
+            if len(entries) > _MAX_LIST_ENTRIES:
+                entries = entries[:_MAX_LIST_ENTRIES]
+            return {"success": True, "entries": entries}
+        elif op == "list_stream":
+            before_id = data.get("before_id") or data.get("id_lt")
+            after_id = data.get("after_id") or data.get("id_gt")
+            limit = min(int(data.get("limit", 50)), 500)
+            entries = store.list_stream(
+                entity, user_id,
+                params=params,
+                before_id=before_id,
+                after_id=after_id,
+                limit=limit + 1,
+            )
+            has_more = len(entries) > limit
+            if has_more:
+                entries = entries[:limit]
+            return {"success": True, "entries": entries, "has_more": has_more}
+        elif op == "list_all":
+            # list_all: no scope limit (host must implement via list_fn or list_stream_fn)
+            entries = store.list(entity, user_id, params=params)
+            if len(entries) > _MAX_LIST_ENTRIES:
+                entries = entries[:_MAX_LIST_ENTRIES]
             return {"success": True, "entries": entries}
         elif op == "get":
             if not entity_id:
@@ -467,10 +485,15 @@ async def _dispatch(store: EntityStore, user_id: str, data: dict, request_id: st
         elif op == "create":
             result = store.create(entity, user_id, payload, params=params, request_id=request_id or None)
             return {"success": True, "data": result}
-        elif op in ("update", "upsert"):
+        elif op == "update":
             if not entity_id:
                 return {"success": False, "error": "id is required for update"}
             result = store.update(entity, user_id, entity_id, payload, params=params, request_id=request_id or None)
+            return {"success": True, "data": result}
+        elif op == "upsert":
+            if not entity_id:
+                return {"success": False, "error": "id is required for upsert"}
+            result = store.upsert(entity, user_id, entity_id, payload, params=params, request_id=request_id or None)
             return {"success": True, "data": result}
         elif op == "delete":
             if not entity_id:

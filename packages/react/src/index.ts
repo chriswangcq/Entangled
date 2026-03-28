@@ -57,3 +57,6 @@ export type { EntitySubscriptionSchema, SubscriptionMode } from './subscriptionS
 // Types (re-export from protocol)
 export type { Entangled, EntangledMeta, EntitiesChangedEvent } from '@entangled/protocol';
 export type { FormHookResult, StreamHookResult } from './types';
+
+// Utilities
+export { toSnakeParams } from './utils';
