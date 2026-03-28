@@ -17,6 +17,12 @@ export interface EntitySubscriptionSchema {
   syncType: string;
   syncLimit?: number | null;
   subscriptionMode?: SubscriptionMode;
+  capabilities?: {
+    listStream: boolean;
+    existsBefore: boolean;
+    upsert: boolean;
+    actions: string[];
+  };
 }
 
 const byName = new Map<string, EntitySubscriptionSchema>();
