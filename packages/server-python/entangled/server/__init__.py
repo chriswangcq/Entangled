@@ -14,7 +14,19 @@ Usage:
     app.add_websocket_route("/ws", create_ws_handler(store))
 """
 
-from .defs import EntityDef, EntityRelation
+from .defs import (
+    EntityDef,
+    EntityRelation,
+    ListFn,
+    ListStreamFn,
+    GetFn,
+    CreateFn,
+    UpdateFn,
+    DeleteFn,
+    UpsertFn,
+    ExistsBeforeFn,
+    ActionFn,
+)
 from .store import EntityStore
 from .sync import (
     DEFAULT_STREAM_HEAD_DEPTH,
@@ -34,6 +46,17 @@ from .ws_handler import (
 from .notifier import notify_entity_change, reset_state, get_connected_count
 
 __all__ = [
+    # Types
+    "ListFn",
+    "ListStreamFn",
+    "GetFn",
+    "CreateFn",
+    "UpdateFn",
+    "DeleteFn",
+    "UpsertFn",
+    "ExistsBeforeFn",
+    "ActionFn",
+    # Core
     "DEFAULT_STREAM_HEAD_DEPTH",
     "MAX_STREAM_HEAD_DEPTH",
     "EntityDef",
@@ -41,6 +64,7 @@ __all__ = [
     "EntityStore",
     "SyncRegistry",
     "resolve_sync",
+    # WS handler
     "create_ws_handler",
     "WsSender",
     "cascade_targets",
@@ -48,6 +72,7 @@ __all__ = [
     "handle_unsubscribe",
     "handle_load_more",
     "handle_request",
+    # Notifier
     "notify_entity_change",
     "reset_state",
     "get_connected_count",

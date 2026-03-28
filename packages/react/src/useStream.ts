@@ -22,20 +22,7 @@ import {
 import { subscribeWithCascade, unsubscribeWithCascade } from './subscriptionSchema';
 import type { StreamHookResult } from './types';
 import { globalQueryClient } from './syncListener';
-
-function toSnakeParams(
-  params: Record<string, string>,
-  keyParams: string[],
-): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const k of keyParams) {
-    if (params[k] !== undefined) {
-      const snake = k.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`);
-      result[snake] = params[k];
-    }
-  }
-  return result;
-}
+import { toSnakeParams } from './utils';
 
 // ── Definition ──────────────────────────────────────────────────
 

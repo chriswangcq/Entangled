@@ -8,7 +8,6 @@ This is the ONLY place business entities are defined. The engine (store, WS hand
 push notifier, cascade) is fully generic.
 """
 
-from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
@@ -34,12 +33,15 @@ class EntityRelation:
 
 
 # Type aliases for handler signatures
-ListFn = Callable  # (store, user_id, params) -> list[dict]
-GetFn = Callable   # (store, user_id, entity_id, params) -> dict | None
-CreateFn = Callable  # (store, user_id, params, data) -> dict
-UpdateFn = Callable  # (store, user_id, entity_id, data, params) -> dict
-DeleteFn = Callable  # (store, user_id, entity_id, params) -> bool
-ActionFn = Callable  # (store, user_id, params, payload) -> dict
+ListFn = Callable          # (store, user_id, params, **kw) -> list[dict]
+ListStreamFn = Callable    # (store, user_id, params, *, before_id, limit) -> list[dict]
+GetFn = Callable           # (store, user_id, entity_id, params) -> dict | None
+CreateFn = Callable        # (store, user_id, params, data) -> dict
+UpdateFn = Callable        # (store, user_id, entity_id, data, params) -> dict
+DeleteFn = Callable        # (store, user_id, entity_id, params) -> bool
+UpsertFn = Callable        # (store, user_id, entity_id, data, params) -> dict
+ExistsBeforeFn = Callable  # (store, user_id, entity_id, params) -> bool
+ActionFn = Callable        # (store, user_id, params, payload) -> dict
 
 
 @dataclass
@@ -87,6 +89,9 @@ class EntityDef:
     create_fn: Optional[CreateFn] = None
     update_fn: Optional[UpdateFn] = None
     delete_fn: Optional[DeleteFn] = None
+    upsert_fn: Optional[Callable] = None  # (store, user_id, entity_id, data, params) -> dict
+    list_stream_fn: Optional[ListStreamFn] = None  # cursor-based backward pagination
+    exists_before_fn: Optional[ExistsBeforeFn] = None  # (store, user_id, oldest_id, params) -> bool
 
     # ── Custom actions ───────────────────────────────────────────
     actions: Dict[str, ActionFn] = field(default_factory=dict)
@@ -118,6 +123,13 @@ class EntityDef:
             "syncType": self.sync_type,
             "syncLimit": self.sync_limit,
             "subscriptionMode": self.subscription_mode,
+            # Capability flags — lets clients know what ops are available
+            "capabilities": {
+                "listStream": self.list_stream_fn is not None,
+                "existsBefore": self.exists_before_fn is not None,
+                "upsert": self.upsert_fn is not None,
+                "actions": list(self.actions.keys()) if self.actions else [],
+            },
             # NOTE: subscriptionCascade intentionally omitted — cascade is now
             # handled server-side in ws_handler._handle_subscribe; clients never
             # need to expand cascade targets themselves.

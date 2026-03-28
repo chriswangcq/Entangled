@@ -11,7 +11,6 @@ Hosts should pass ``default_stream_depth`` from ``EntityDef.sync_limit``; if bot
 client ``depth`` and that default are absent, ``DEFAULT_STREAM_HEAD_DEPTH`` applies.
 """
 
-from __future__ import annotations
 
 import json
 import logging

@@ -10,7 +10,6 @@ for backwards compatibility — a single process serves one store instance.
 For multi-process deployments, use a process-local store per worker.
 """
 
-from __future__ import annotations
 
 import logging
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -29,18 +28,20 @@ _store = None
 _sync_registry: Optional[SyncRegistry] = None
 
 
-def set_store(store) -> None:
-    """Bind the entity store and initialize sync registry.
+def set_store(store, *, sync_registry: Optional[SyncRegistry] = None) -> None:
+    """Bind the entity store and sync registry.
 
     Must be called once at startup before any WS connections.
+
+    Args:
+        store: The entity store (with get_all_defs()).
+        sync_registry: Explicitly provided SyncRegistry. If None, a fresh
+            one is created. Hosts should pass the registry they configured
+            (e.g. with persistence callbacks).
     """
     global _store, _sync_registry
     _store = store
-    # Bind sync_registry from store if available, else create fresh
-    if hasattr(store, '_sync_registry'):
-        _sync_registry = store._sync_registry
-    else:
-        _sync_registry = SyncRegistry()
+    _sync_registry = sync_registry if sync_registry is not None else SyncRegistry()
     # Configure op_log sizes from EntityDefs
     for defn in store.get_all_defs():
         _sync_registry.set_op_log_size(defn.name, defn.op_log_size)
