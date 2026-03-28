@@ -21,7 +21,7 @@ import {
 } from './client';
 import { getSubscriptionSchema, subscribeWithCascade, unsubscribeWithCascade } from './subscriptionSchema';
 import type { StreamHookResult } from './types';
-import { globalQueryClient } from './syncListener';
+import type { QueryClient } from '@tanstack/react-query';
 import { toSnakeParams } from './utils';
 
 // ── Definition ──────────────────────────────────────────────────
@@ -45,7 +45,8 @@ export interface StreamDef<T> {
 export interface StreamStore<T> {
   name: string;
   useStream: (params: Record<string, string>) => StreamHookResult<T>;
-  invalidate: (params?: Record<string, string>) => void;
+  invalidate: (client: QueryClient, params?: Record<string, string>) => void;
+  buildKey: (params?: Record<string, string>) => string[];
 }
 
 // ── Factory ─────────────────────────────────────────────────────
@@ -53,7 +54,7 @@ export interface StreamStore<T> {
 export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
   const pageSize = def.pageSize ?? 50;
 
-  function buildKey(params: Record<string, string>): string[] {
+  function buildKey(params: Record<string, string> = {}): string[] {
     return [def.name, ...def.keyParams.map((k) => params[k]).filter(Boolean)];
   }
 
@@ -167,10 +168,10 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
     };
   }
 
-  function invalidate(params: Record<string, string> = {}) {
+  function invalidate(client: QueryClient, params: Record<string, string> = {}) {
     const key = Object.keys(params).length > 0 ? buildKey(params) : [def.name];
-    globalQueryClient?.invalidateQueries({ queryKey: key });
+    client.invalidateQueries({ queryKey: key });
   }
 
-  return { name: def.name, useStream, invalidate };
+  return { name: def.name, useStream, invalidate, buildKey };
 }
