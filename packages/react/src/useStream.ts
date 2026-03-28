@@ -19,7 +19,7 @@ import {
   cacheGetList,
   cacheHasMore, cachePrependPage, entangledMethod,
 } from './client';
-import { subscribeWithCascade, unsubscribeWithCascade } from './subscriptionSchema';
+import { getSubscriptionSchema, subscribeWithCascade, unsubscribeWithCascade } from './subscriptionSchema';
 import type { StreamHookResult } from './types';
 import { globalQueryClient } from './syncListener';
 import { toSnakeParams } from './utils';
@@ -67,6 +67,10 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
     const backendParams = useMemo(() => toSnakeParams(params, def.keyParams), [paramsKey]);
     const isEnabled = def.enabled ? def.enabled(params) : true;
 
+    // ── Check Server Capability ────────────────────────────────────
+    const schema = getSubscriptionSchema(def.name);
+    const supportsListStream = schema?.capabilities?.listStream ?? true; // assume true if schema not loaded yet
+
     // ── State: hasMore from Rust cache ───────────────────────────
     const [hasMore, setHasMore] = useState(false);
     const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -83,9 +87,13 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
         await subscribeWithCascade(def.name, backendParams, {
           depth: def.depth ?? pageSize,
         });
-        // After subscribe, check has_more from cache
-        const more = await cacheHasMore(def.name, backendParams);
-        if (mounted) setHasMore(more);
+        // After subscribe, check has_more from cache, but only if server supports it
+        if (supportsListStream) {
+          const more = await cacheHasMore(def.name, backendParams);
+          if (mounted) setHasMore(more);
+        } else {
+          if (mounted) setHasMore(false);
+        }
       })();
 
       return () => {
@@ -107,6 +115,10 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
 
     // ── Load more: fetch older page → prepend into Rust cache ────
     const loadMore = useCallback(async () => {
+      if (!supportsListStream) {
+        console.warn(`[useStream] loadMore ignored: Entity '${def.name}' capabilities.listStream=false`);
+        return;
+      }
       if (loadingMoreRef.current || !hasMore) return;
       const items = query.data;
       if (!items || items.length === 0) return;
