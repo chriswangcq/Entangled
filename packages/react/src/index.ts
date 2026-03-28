@@ -24,6 +24,7 @@ export type { StreamDef, StreamStore } from './useStream';
 
 // Sync listener
 export { startSyncListener, stopSyncListener } from './syncListener';
+export { EntangledProvider, type EntangledProviderProps } from './EntangledProvider';
 
 // Pending ops engine
 export { mergeWithPending, confirmByRequestIds, cleanupStaleOps, genRequestId } from './pendingOps';

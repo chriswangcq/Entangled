@@ -27,7 +27,7 @@ import {
   type PendingOp,
 } from './pendingOps';
 import type { Entangled } from '@entangled/protocol';
-import { globalQueryClient } from './syncListener';
+import type { QueryClient } from '@tanstack/react-query';
 import { toSnakeParams } from './utils';
 
 // ── Definition ──────────────────────────────────────────────────
@@ -47,7 +47,8 @@ export interface ListDef<T> {
 export interface ListStore<T> {
   name: string;
   useList: (params?: Record<string, string>) => ListHookResult<T>;
-  invalidate: (params?: Record<string, string>) => void;
+  invalidate: (client: QueryClient, params?: Record<string, string>) => void;
+  buildKey: (params?: Record<string, string>) => string[];
 }
 
 export interface ListHookResult<T> {
@@ -310,10 +311,10 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
     };
   }
 
-  function invalidate(params: Record<string, string> = {}) {
+  function invalidate(client: QueryClient, params: Record<string, string> = {}) {
     const key = Object.keys(params).length > 0 ? buildKey(params) : [def.name];
-    globalQueryClient?.invalidateQueries({ queryKey: key });
+    client.invalidateQueries({ queryKey: key });
   }
 
-  return { name: def.name, useList, invalidate };
+  return { name: def.name, useList, invalidate, buildKey };
 }

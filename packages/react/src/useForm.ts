@@ -12,7 +12,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { cacheGetItem, entangledMethod } from './client';
 import { subscribeWithCascade, unsubscribeWithCascade } from './subscriptionSchema';
 import type { FormHookResult } from './types';
-import { globalQueryClient } from './syncListener';
+import type { QueryClient } from '@tanstack/react-query';
 import { genRequestId } from './pendingOps';
 
 function toSnakeParams(
@@ -50,7 +50,8 @@ export interface FormDef<T> {
 export interface FormStore<T> {
   name: string;
   useForm: (params?: Record<string, string>) => FormHookResult<T>;
-  invalidate: (params?: Record<string, string>) => void;
+  invalidate: (client: QueryClient, params?: Record<string, string>) => void;
+  buildKey: (params?: Record<string, string>) => string[];
 }
 
 function resolveEntityId(def: FormDef<any>, params: Record<string, string>): string {
@@ -65,8 +66,7 @@ function resolveEntityId(def: FormDef<any>, params: Record<string, string>): str
 export function createFormStore<T>(def: FormDef<T>): FormStore<T> {
 
   function buildKey(params: Record<string, string> = {}): string[] {
-    const suffix = def.keyParams?.map((k) => params[k]).filter(Boolean) ?? [];
-    return suffix.length > 0 ? [def.name, ...suffix] : [def.name];
+    return [def.name, ...def.keyParams?.map((k) => params[k]).filter(Boolean) || []];
   }
 
   function useForm(params: Record<string, string> = {}): FormHookResult<T> {
@@ -158,11 +158,10 @@ export function createFormStore<T>(def: FormDef<T>): FormStore<T> {
     };
   }
 
-  function invalidate(params: Record<string, string> = {}) {
-    // Imperative invalidation uses globalQueryClient
+  function invalidate(client: QueryClient, params: Record<string, string> = {}) {
     const key = Object.keys(params).length > 0 ? buildKey(params) : [def.name];
-    globalQueryClient?.invalidateQueries({ queryKey: key });
+    client.invalidateQueries({ queryKey: key });
   }
 
-  return { name: def.name, useForm, invalidate };
+  return { name: def.name, useForm, invalidate, buildKey };
 }
