@@ -26,9 +26,12 @@ export type { StreamDef, StreamStore } from './useStream';
 export { startSyncListener, stopSyncListener } from './syncListener';
 export { EntangledProvider, type EntangledProviderProps } from './EntangledProvider';
 
-// Pending ops engine
-export { mergeWithPending, confirmByRequestIds, cleanupStaleOps, genRequestId } from './pendingOps';
-export type { PendingOp } from './pendingOps';
+// Unified optimistic engine
+export { useOptimisticOps, mergeWithPending, mergeStreamPending, genRequestId } from './useOptimistic';
+export type { PendingOp, OptimisticOps, UseOptimisticConfig } from './useOptimistic';
+
+// Pending ops (backward-compatible re-exports)
+export { confirmByRequestIds, cleanupStaleOps } from './pendingOps';
 
 // Client — constitutional write surface + cache reads
 export {

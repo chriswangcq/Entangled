@@ -267,6 +267,7 @@ async def _subscribe_one(
         sync_type=defn.sync_type,
         default_stream_depth=defn.sync_limit,
         exists_before_fn=eb_fn,
+        data_order=getattr(defn, 'data_order', 'desc'),
     )
 
     frame = {
@@ -374,13 +375,19 @@ async def handle_load_more(
     try:
         defn = store.get_def(entity)
 
-        # Fetch via store.list_stream (cursor-based)
+        # Fetch via store.list_stream (cursor-based, returns DESC by default)
         entries = store.list_stream(
             entity, user_id,
             before_id=before_id,
             limit=limit,
             params=params,
         )
+        # DATA ORDER CONTRACT:
+        # entries are in default_order (DESC for messages, ASC for execution-logs).
+        # Rust client prepend_older() expects DESC and reverses internally.
+        # For ASC entities, prepend_older still works because the data is
+        # already chronological — it just needs to be inserted before the
+        # oldest cached item.
 
         # Cursor-based hasMore: prefer defn.exists_before_fn, then store.exists_before
         if not entries:

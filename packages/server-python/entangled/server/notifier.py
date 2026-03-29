@@ -92,7 +92,13 @@ def reset_state() -> None:
 # ── Entity change notification ───────────────────────────────────
 
 def _action_to_op(action: str) -> str:
-    return {"created": "insert", "updated": "update", "deleted": "delete"}.get(action, "update")
+    return {
+        "created": "insert", 
+        "stream_append": "insert",
+        "updated": "update", 
+        "deleted": "delete",
+        "clear": "invalidate"
+    }.get(action, "update")
 
 
 def notify_entity_change(

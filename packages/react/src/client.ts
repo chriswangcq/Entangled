@@ -268,6 +268,10 @@ export async function cachePrependPage<T = any>(
 
 // ── entityClient: legacy facade — reads = cache; writes = entangledMethod ─
 
+/**
+ * @deprecated Use `entangledMethod()` directly for writes and `cacheGetList()`/`cacheGetItem()` for reads.
+ * This facade adds no value over the underlying functions and will be removed in a future version.
+ */
 export const entityClient = {
   /**
    * List — **Rust cache only** (same as `cacheGetList`). Does not hit the network.

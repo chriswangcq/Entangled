@@ -19,6 +19,8 @@ futures-util = { version = "0.3", optional = true }
 
 # Optional: Tauri integration (thin adapter)
 tauri = { version = "2", optional = true }
+r2d2_sqlite = "=0.24.0"
+r2d2 = "0.8.10"
 
 [features]
 default = ["transport"]

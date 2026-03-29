@@ -14,12 +14,12 @@ use crate::schema::SchemaRegistry;
 
 /// Shared state for Tauri — wraps cache in std::sync::Mutex (rusqlite is !Sync).
 pub struct EntangledState {
-    pub registry: Arc<StdMutex<SchemaRegistry>>,
-    pub cache: Arc<StdMutex<Cache>>,
+    pub registry: Arc<std::sync::RwLock<SchemaRegistry>>,
+    pub cache: Arc<Cache>,
 }
 
-// Safety: StdMutex<Cache> is Send+Sync even though Cache contains rusqlite::Connection (!Sync).
-// StdMutex provides exclusive access, so no concurrent borrows are possible.
+// Safety: Cache is strictly Send+Sync thanks to r2d2::Pool.
+// RwLock<SchemaRegistry> handles concurrent reads.
 unsafe impl Send for EntangledState {}
 unsafe impl Sync for EntangledState {}
 
@@ -27,8 +27,8 @@ impl EntangledState {
     /// Create with in-memory cache (fallback).
     pub fn new() -> Self {
         Self {
-            registry: Arc::new(StdMutex::new(SchemaRegistry::new())),
-            cache: Arc::new(StdMutex::new(Cache::new_in_memory())),
+            registry: Arc::new(std::sync::RwLock::new(SchemaRegistry::new())),
+            cache: Arc::new(Cache::new_in_memory()),
         }
     }
 
@@ -36,8 +36,8 @@ impl EntangledState {
     pub fn with_db_dir(dir: &PathBuf) -> Self {
         let db_path = dir.join("entangled_cache.db");
         Self {
-            registry: Arc::new(StdMutex::new(SchemaRegistry::new())),
-            cache: Arc::new(StdMutex::new(Cache::new(&db_path))),
+            registry: Arc::new(std::sync::RwLock::new(SchemaRegistry::new())),
+            cache: Arc::new(Cache::new(&db_path)),
         }
     }
 
@@ -47,8 +47,8 @@ impl EntangledState {
         std::fs::create_dir_all(&user_dir).ok();
         let db_path = user_dir.join("entangled.db");
         Self {
-            registry: Arc::new(StdMutex::new(SchemaRegistry::new())),
-            cache: Arc::new(StdMutex::new(Cache::new(&db_path))),
+            registry: Arc::new(std::sync::RwLock::new(SchemaRegistry::new())),
+            cache: Arc::new(Cache::new(&db_path)),
         }
     }
 }
@@ -76,7 +76,7 @@ pub async fn entity_list(
     state: tauri::State<'_, EntangledState>,
 ) -> Result<Vec<Value>, String> {
     let key = make_key(&entity, params);
-    let cache = state.cache.lock().unwrap();
+    let cache = &state.cache;
     Ok(cache.get_list(&key))
 }
 
@@ -90,7 +90,7 @@ pub async fn entity_get(
     state: tauri::State<'_, EntangledState>,
 ) -> Result<Option<Value>, String> {
     let key = make_key(&entity, params);
-    let cache = state.cache.lock().unwrap();
+    let cache = &state.cache;
     Ok(cache.get_item(&key, &id))
 }
 
@@ -103,7 +103,7 @@ pub async fn entity_version(
     state: tauri::State<'_, EntangledState>,
 ) -> Result<Option<u64>, String> {
     let key = make_key(&entity, params);
-    let cache = state.cache.lock().unwrap();
+    let cache = &state.cache;
     Ok(cache.get_version(&key))
 }
 
@@ -117,7 +117,7 @@ pub async fn entity_apply_sync(
     let sync_frame: SyncFrame = serde_json::from_value(frame)
         .map_err(|e| format!("Invalid sync frame: {}", e))?;
 
-    let cache = state.cache.lock().unwrap();
+    let cache = &state.cache;
     let changed = process_sync(&cache, &sync_frame, "id");
     Ok(changed.map(|c| c.entity))
 }
@@ -128,7 +128,7 @@ pub async fn entity_apply_sync(
 pub async fn entity_cache_clear(
     state: tauri::State<'_, EntangledState>,
 ) -> Result<(), String> {
-    let cache = state.cache.lock().unwrap();
+    let cache = &state.cache;
     cache.clear_all();
     Ok(())
 }
@@ -142,7 +142,7 @@ pub async fn entity_has_more(
     state: tauri::State<'_, EntangledState>,
 ) -> Result<bool, String> {
     let key = make_key(&entity, params);
-    let cache = state.cache.lock().unwrap();
+    let cache = &state.cache;
     Ok(cache.has_more_before(&key))
 }
 
@@ -158,7 +158,7 @@ pub async fn entity_prepend_page(
     state: tauri::State<'_, EntangledState>,
 ) -> Result<usize, String> {
     let key = make_key(&entity, params);
-    let cache = state.cache.lock().unwrap();
+    let cache = &state.cache;
     let count = cache.prepend_older(&key, &items, has_more, "id");
 
     tracing::info!(
