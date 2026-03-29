@@ -4,18 +4,119 @@
 //! Generic apps should use `EntangledClient` directly.
 
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::path::PathBuf;
 
 use crate::cache::{Cache, CacheKey};
 use crate::push::{process_sync, SyncFrame};
 use crate::schema::SchemaRegistry;
 
+// ── Subscription Registry (ref-counted, Rust-owned) ─────────────────────
+
+/// One active subscription tracked by the registry.
+#[derive(Debug, Clone)]
+pub struct SubscriptionEntry {
+    pub entity: String,
+    pub params: Option<Value>,
+    pub depth: Option<u64>,
+    pub ref_count: u32,
+}
+
+/// Ref-counted subscription registry.
+///
+/// Multiple React hooks (or eager bootstrap) may subscribe to the same
+/// (entity, params) key.  The registry ensures only **one** WS subscribe
+/// is sent when the first consumer acquires, and one unsubscribe when the
+/// last consumer releases.
+///
+/// On reconnect, `active_entries()` provides the full set of subscriptions
+/// to re-send — no React involvement required.
+pub struct SubscriptionRegistry {
+    entries: HashMap<String, SubscriptionEntry>,
+}
+
+impl SubscriptionRegistry {
+    pub fn new() -> Self {
+        Self { entries: HashMap::new() }
+    }
+
+    /// Acquire a subscription.  Returns `true` if this is the **first**
+    /// subscriber (ref went 0 → 1) — the caller should send WS subscribe.
+    pub fn acquire(
+        &mut self,
+        entity: &str,
+        params: Option<Value>,
+        depth: Option<u64>,
+    ) -> bool {
+        let key = subscription_key(entity, &params);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.ref_count += 1;
+            // update depth if provided (stream may override)
+            if depth.is_some() {
+                entry.depth = depth;
+            }
+            false // already subscribed
+        } else {
+            self.entries.insert(key, SubscriptionEntry {
+                entity: entity.to_string(),
+                params,
+                depth,
+                ref_count: 1,
+            });
+            true // first subscriber
+        }
+    }
+
+    /// Release a subscription.  Returns `true` if ref hit zero — the
+    /// caller should send WS unsubscribe.
+    pub fn release(&mut self, entity: &str, params: &Option<Value>) -> bool {
+        let key = subscription_key(entity, params);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            if entry.ref_count <= 1 {
+                self.entries.remove(&key);
+                return true; // last subscriber gone
+            }
+            entry.ref_count -= 1;
+        }
+        false
+    }
+
+    /// All active entries (ref > 0) — used for reconnect resubscribe.
+    pub fn active_entries(&self) -> Vec<&SubscriptionEntry> {
+        self.entries.values().filter(|e| e.ref_count > 0).collect()
+    }
+
+    /// Clear all subscriptions (e.g. on logout / user switch).
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Build a deterministic subscription key from (entity, params).
+/// Mirrors the TypeScript `subscriptionKey()` for consistency.
+fn subscription_key(entity: &str, params: &Option<Value>) -> String {
+    match params {
+        Some(Value::Object(map)) if !map.is_empty() => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys.iter().map(|k| {
+                let v = map.get(*k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                format!("{}={}", k, v)
+            }).collect();
+            format!("{}\0{}", entity, parts.join("&"))
+        }
+        _ => entity.to_string(),
+    }
+}
+
 /// Shared state for Tauri — wraps cache in std::sync::Mutex (rusqlite is !Sync).
 pub struct EntangledState {
     pub registry: Arc<std::sync::RwLock<SchemaRegistry>>,
     pub cache: Arc<Cache>,
+    pub subscriptions: Arc<std::sync::RwLock<SubscriptionRegistry>>,
 }
 
 // Safety: Cache is strictly Send+Sync thanks to r2d2::Pool.
@@ -29,6 +130,7 @@ impl EntangledState {
         Self {
             registry: Arc::new(std::sync::RwLock::new(SchemaRegistry::new())),
             cache: Arc::new(Cache::new_in_memory()),
+            subscriptions: Arc::new(std::sync::RwLock::new(SubscriptionRegistry::new())),
         }
     }
 
@@ -38,6 +140,7 @@ impl EntangledState {
         Self {
             registry: Arc::new(std::sync::RwLock::new(SchemaRegistry::new())),
             cache: Arc::new(Cache::new(&db_path)),
+            subscriptions: Arc::new(std::sync::RwLock::new(SubscriptionRegistry::new())),
         }
     }
 
@@ -49,6 +152,7 @@ impl EntangledState {
         Self {
             registry: Arc::new(std::sync::RwLock::new(SchemaRegistry::new())),
             cache: Arc::new(Cache::new(&db_path)),
+            subscriptions: Arc::new(std::sync::RwLock::new(SubscriptionRegistry::new())),
         }
     }
 }
@@ -167,4 +271,65 @@ pub async fn entity_prepend_page(
     );
 
     Ok(count)
+}
+
+// ── Optimistic Operations (Rust-native) ─────────────────────────────
+
+/// Write a pending op into SQLite for immediate optimistic UI.
+/// The UI calls `entity_list_merged` to read confirmed + pending data.
+#[cfg(feature = "tauri")]
+#[tauri::command]
+pub async fn entity_optimistic_add(
+    entity: String,
+    params: Option<Value>,
+    request_id: String,
+    op: String,
+    item_id: String,
+    data: Value,
+    state: tauri::State<'_, EntangledState>,
+) -> Result<(), String> {
+    let key = make_key(&entity, params);
+    state.cache.add_pending_op(&key, &request_id, &op, &item_id, &data);
+    tracing::debug!(
+        "[Optimistic] {} add pending: op={}, id={}, rid={}",
+        entity, op, item_id, request_id
+    );
+    Ok(())
+}
+
+/// Mark a pending op as failed.
+#[cfg(feature = "tauri")]
+#[tauri::command]
+pub async fn entity_optimistic_fail(
+    request_id: String,
+    error: String,
+    state: tauri::State<'_, EntangledState>,
+) -> Result<(), String> {
+    state.cache.fail_pending_op(&request_id, &error);
+    tracing::debug!("[Optimistic] fail pending: rid={}, err={}", request_id, error);
+    Ok(())
+}
+
+/// Remove a pending op (on mutation success or manual cleanup).
+#[cfg(feature = "tauri")]
+#[tauri::command]
+pub async fn entity_optimistic_remove(
+    request_id: String,
+    state: tauri::State<'_, EntangledState>,
+) -> Result<(), String> {
+    state.cache.remove_pending_op(&request_id);
+    Ok(())
+}
+
+/// Read confirmed items + pending ops merged (the sole read path for optimistic UI).
+/// Returns items with `_status` metadata injected.
+#[cfg(feature = "tauri")]
+#[tauri::command]
+pub async fn entity_list_merged(
+    entity: String,
+    params: Option<Value>,
+    state: tauri::State<'_, EntangledState>,
+) -> Result<Vec<Value>, String> {
+    let key = make_key(&entity, params);
+    Ok(state.cache.get_list_with_pending(&key))
 }
