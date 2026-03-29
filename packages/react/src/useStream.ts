@@ -1,20 +1,19 @@
 /**
  * @entangled/react — useStream.ts
  *
- * Generic stream (append-only) hook with Entangled sync.
+ * Generic stream (append-only) hook with Entangled sync + optimistic send.
+ *
+ * Uses the unified useOptimisticOps engine for optimistic state management.
+ * Stream-specific: only supports append (create) ops, uses ID-dedup confirmation.
  *
  * ALL data flows through the Rust entity cache:
  *   - Live data: subscribe → server pushes delta → Rust cache updated → entities_changed → re-read
  *   - History:   loadMore → cachePrependPage (fetches via WS, writes into Rust cache) → re-read
- *
- * The React Query layer is a thin read-through cache on top of the Rust cache.
- * Pagination is lazy-triggered by the cache — when the UI calls loadMore(),
- * the entity engine fetches a page from the server and prepends it into the cache.
  */
 
 import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { genRequestId } from './pendingOps';
+import { useOptimisticOps, mergeStreamPending, genRequestId } from './useOptimistic';
 import {
   cacheGetList,
   cacheHasMore, cachePrependPage, entangledMethod,
@@ -35,8 +34,23 @@ export interface StreamDef<T> {
   gcTime?: number;           // default: 10min
   depth?: number;            // initial sync depth (head_n), default: 50
 
+  /**
+   * Optimistic send configuration.
+   *
+   * When provided, `send()` immediately creates a temp item via `createTemp()`
+   * and appends it to the displayed list, so the user sees the item instantly
+   * before the server roundtrip completes.
+   *
+   * If `actionName` is set, send() uses a custom action instead of standard 'create'.
+   * If `transformPayload` is set, data is transformed before sending.
+   */
   optimisticSend?: {
+    /** Create a temporary item for immediate UI display */
     createTemp: (data: any, params: Record<string, string>) => T;
+    /** Custom action name. Default: 'create' (standard CRUD). Set to e.g. 'send' for custom actions. */
+    actionName?: string;
+    /** Transform data before sending to server. Default: data is sent as-is. */
+    transformPayload?: (data: any, params: Record<string, string>) => any;
   };
 
   enabled?: (params: Record<string, string>) => boolean;
@@ -70,12 +84,19 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
 
     // ── Check Server Capability ────────────────────────────────────
     const schema = getSubscriptionSchema(def.name);
-    const supportsListStream = schema?.capabilities?.listStream ?? true; // assume true if schema not loaded yet
+    const supportsListStream = schema?.capabilities?.listStream ?? true;
 
     // ── State: hasMore from Rust cache ───────────────────────────
     const [hasMore, setHasMore] = useState(false);
     const [isLoadingMore, setIsLoadingMore] = useState(false);
     const loadingMoreRef = useRef(false);
+
+    // ── Unified optimistic engine (serverIdDedup mode) ──────────
+    const optimistic = useOptimisticOps<T>({
+      entityName: def.name,
+      enabled: isEnabled,
+      confirmMode: 'serverIdDedup',
+    });
 
     // ── Subscribe with depth (head_n) ───────────────────────────
     useEffect(() => {
@@ -88,7 +109,6 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
         await subscribeWithCascade(def.name, backendParams, {
           depth: def.depth ?? pageSize,
         });
-        // After subscribe, check has_more from cache, but only if server supports it
         if (supportsListStream) {
           const more = await cacheHasMore(def.name, backendParams);
           if (mounted) setHasMore(more);
@@ -114,6 +134,26 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
       enabled: isEnabled,
     });
 
+    // ── Merge server items + optimistic pending items ────────────
+    const mergedItems = useMemo(() => {
+      const serverItems = query.data ?? [];
+      const { items, pendingCleaned } = mergeStreamPending(
+        serverItems,
+        optimistic.ops,
+        def.getId,
+      );
+
+      // Update the ops ref if dedup cleaned some items
+      // (This is a side-effect in useMemo, but it's safe because
+      // we're only pruning confirmed items, not adding new ones)
+      if (pendingCleaned.length !== optimistic.ops.length) {
+        // The engine's ref will be updated on next forceRender cycle
+        // For now, just return the correct merged items
+      }
+
+      return items;
+    }, [query.data, optimistic.renderTick]);
+
     // ── Load more: fetch older page → prepend into Rust cache ────
     const loadMore = useCallback(async () => {
       if (!supportsListStream) {
@@ -124,7 +164,6 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
       const items = query.data;
       if (!items || items.length === 0) return;
 
-      // Get the oldest item's ID as cursor
       const oldestId = def.getId(items[0]);
       loadingMoreRef.current = true;
       setIsLoadingMore(true);
@@ -134,7 +173,6 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
           def.name, backendParams, oldestId, pageSize,
         );
         setHasMore(result.hasMore);
-        // Invalidate query so it re-reads from the now-updated Rust cache
         qc.invalidateQueries({ queryKey });
       } catch (e) {
         console.error(`[useStream] loadMore failed for ${def.name}:`, e);
@@ -144,11 +182,49 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
       }
     }, [hasMore, query.data, backendParams, queryKey]);
 
-    // ── Send mutation ───────────────────────────────────────────
+    // ── Send mutation (with optimistic support) ──────────────────
     const sendMut = useMutation({
       mutationFn: async (data: any) => {
         const requestId = genRequestId();
-        await entangledMethod(def.name, 'create', { data, requestId }, backendParams);
+        let tempId: string | null = null;
+
+        // 1. Optimistic: create temp item immediately for instant UI feedback
+        if (def.optimisticSend) {
+          const tempItem = def.optimisticSend.createTemp(data, params);
+          tempId = def.getId(tempItem);
+
+          optimistic.addOp({
+            id: tempId,
+            requestId,
+            op: 'create',
+            data: tempItem as any,
+            status: 'pending',
+          });
+        }
+
+        try {
+          // 2. Send to server
+          const actionName = def.optimisticSend?.actionName;
+          if (actionName) {
+            const payload = def.optimisticSend?.transformPayload
+              ? def.optimisticSend.transformPayload(data, params)
+              : data;
+            await entangledMethod(def.name, actionName, { payload, requestId }, backendParams);
+          } else {
+            await entangledMethod(def.name, 'create', { data, requestId }, backendParams);
+          }
+
+          // 3. Success: remove pending item
+          if (tempId) {
+            optimistic.removeById(tempId);
+          }
+        } catch (err) {
+          // 4. Error: remove pending item
+          if (tempId) {
+            optimistic.removeById(tempId);
+          }
+          throw err;
+        }
       },
       onSettled: () => {
         qc.invalidateQueries({ queryKey });
@@ -156,7 +232,7 @@ export function createStreamStore<T>(def: StreamDef<T>): StreamStore<T> {
     });
 
     return {
-      items: query.data ?? [],
+      items: mergedItems,
       isLoading: query.isLoading,
       error: query.error,
       hasMore,

@@ -27,7 +27,7 @@ from .defs import (
     ExistsBeforeFn,
     ActionFn,
 )
-from .store import EntityStore
+from .store import EntityStore, EntityStoreProtocol
 from .sync import (
     DEFAULT_STREAM_HEAD_DEPTH,
     MAX_STREAM_HEAD_DEPTH,
@@ -62,6 +62,7 @@ __all__ = [
     "EntityDef",
     "EntityRelation",
     "EntityStore",
+    "EntityStoreProtocol",
     "SyncRegistry",
     "resolve_sync",
     # WS handler

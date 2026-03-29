@@ -3,29 +3,15 @@
  *
  * Generic list hook with Entangled sync + optimistic state.
  *
- * Data flow:
- *   1. Mount → subscribe(entity, params, version)
- *   2. Server sends sync frame → Rust cache applies → entities_changed emitted
- *   3. React reads from Rust cache (0 extra round-trip)
- *   4. Mutations: optimistic via pendingOps (survives invalidation)
- *   5. Delta push with requestId → confirms pendingOp
- *
- * Optimistic state:
- *   - pendingOps live in useRef, NOT in React Query cache
- *   - Each mutation generates a requestId that travels:
- *     WS request → Server → op_log → delta push → entities_changed → confirmByRequestIds
- *   - Components receive Entangled<T>[] with _status: 'confirmed' | 'pending' | 'failed'
+ * Uses the unified useOptimisticOps engine for all optimistic state management.
+ * Supports create/update/delete with requestId-based confirmation from delta pushes.
  */
 
-import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { useEffect, useMemo, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { cacheGetList, entangledMethod } from './client';
 import { subscribeWithCascade, unsubscribeWithCascade } from './subscriptionSchema';
-import {
-  mergeWithPending, confirmByRequestIds, cleanupStaleOps, genRequestId,
-  type PendingOp,
-} from './pendingOps';
+import { useOptimisticOps, mergeWithPending, genRequestId } from './useOptimistic';
 import type { Entangled } from '@entangled/protocol';
 import type { QueryClient } from '@tanstack/react-query';
 import { toSnakeParams } from './utils';
@@ -75,7 +61,6 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
 
   function useList(params: Record<string, string> = {}): ListHookResult<T> {
     const qc = useQueryClient();
-    // Stable serialized key — avoids JSON.stringify on every render
     const paramsKey = useMemo(
       () => JSON.stringify(params),
       [...(def.keyParams ?? []).map((k) => params[k])],
@@ -87,40 +72,12 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
     );
     const isEnabled = def.enabled ? def.enabled(params) : true;
 
-    // ── Pending ops (survives invalidation) ─────────────────────
-    const pendingOpsRef = useRef<PendingOp<T>[]>([]);
-    const [renderTick, setRenderTick] = useState(0);
-    const forceRender = useCallback(() => setRenderTick((n: number) => n + 1), []);
-
-    // ── Listen for entities_changed with requestIds ─────────────
-    useEffect(() => {
-      if (!isEnabled) return;
-
-      let unlisten: UnlistenFn | null = null;
-
-      (async () => {
-        unlisten = await listen<{ changes: Array<{ entity: string; requestIds?: string[] }> }>(
-          'entities_changed',
-          (event) => {
-            for (const change of event.payload.changes) {
-              if (change.entity !== def.name) continue;
-              if (change.requestIds?.length) {
-                const before = pendingOpsRef.current.length;
-                pendingOpsRef.current = confirmByRequestIds(
-                  pendingOpsRef.current,
-                  change.requestIds,
-                );
-                if (pendingOpsRef.current.length !== before) {
-                  forceRender();
-                }
-              }
-            }
-          },
-        );
-      })();
-
-      return () => { unlisten?.(); };
-    }, [def.name, isEnabled]);
+    // ── Unified optimistic engine ───────────────────────────────
+    const optimistic = useOptimisticOps<T>({
+      entityName: def.name,
+      enabled: isEnabled,
+      confirmMode: 'requestId',
+    });
 
     // ── Subscribe on mount ──────────────────────────────────────
     useEffect(() => {
@@ -139,17 +96,7 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
       };
     }, [def.name, paramsKey, isEnabled]);
 
-    // ── Timeout cleanup (30s safety net) ─────────────────────────
-    useEffect(() => {
-      const timer = setInterval(() => {
-        const before = pendingOpsRef.current.length;
-        pendingOpsRef.current = cleanupStaleOps(pendingOpsRef.current);
-        if (pendingOpsRef.current.length !== before) forceRender();
-      }, 5000);
-      return () => clearInterval(timer);
-    }, []);
-
-    // ── Query: 只读 Rust SQLite（由 subscribe → sync 帧写入；eager 实体在 initialize 额外 bootstrap）
+    // ── Query: read from Rust SQLite cache ───────────────────────
     const query = useQuery<T[]>({
       queryKey,
       queryFn: async () => cacheGetList<T>(def.name, backendParams),
@@ -162,28 +109,23 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
     // ── Merge confirmed + pending ───────────────────────────────
     const confirmedItems = query.data ?? [];
     const items = useMemo(
-      () => mergeWithPending(confirmedItems, pendingOpsRef.current, def.getId),
-      [confirmedItems, renderTick],
+      () => mergeWithPending(confirmedItems, optimistic.ops, def.getId),
+      [confirmedItems, optimistic.renderTick],
     );
 
-    // ── Create mutation (requestId on WS envelope matches delta requestIds) ──
+    // ── Create mutation ─────────────────────────────────────────
     const createMut = useMutation({
       mutationFn: async (data: any) => {
         const requestId = genRequestId();
         const tempId = `_tmp_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
-        pendingOpsRef.current = [
-          ...pendingOpsRef.current,
-          {
-            id: tempId,
-            requestId,
-            op: 'create',
-            data: { ...data, id: tempId },
-            status: 'pending',
-            startedAt: Date.now(),
-          },
-        ];
-        forceRender();
+        optimistic.addOp({
+          id: tempId,
+          requestId,
+          op: 'create',
+          data: { ...data, id: tempId },
+          status: 'pending',
+        });
 
         try {
           const result = await entangledMethod<T>(
@@ -192,17 +134,11 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
             { data, requestId },
             backendParams,
           );
-          pendingOpsRef.current = pendingOpsRef.current.filter(
-            (op: PendingOp<T>) => op.id !== tempId,
-          );
-          forceRender();
+          optimistic.removeById(tempId);
           return result;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          pendingOpsRef.current = pendingOpsRef.current.map((op: PendingOp<T>) =>
-            op.id === tempId ? { ...op, status: 'failed' as const, error: msg } : op,
-          );
-          forceRender();
+          optimistic.failOp(tempId, 'create', msg);
           throw err;
         }
       },
@@ -216,18 +152,13 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
       mutationFn: async ({ id, data }: { id: string; data: any }) => {
         const requestId = genRequestId();
 
-        pendingOpsRef.current = [
-          ...pendingOpsRef.current,
-          {
-            id,
-            requestId,
-            op: 'update',
-            data,
-            status: 'pending',
-            startedAt: Date.now(),
-          },
-        ];
-        forceRender();
+        optimistic.addOp({
+          id,
+          requestId,
+          op: 'update',
+          data,
+          status: 'pending',
+        });
 
         try {
           const result = await entangledMethod<T>(
@@ -236,19 +167,11 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
             { id, data, requestId },
             backendParams,
           );
-          pendingOpsRef.current = pendingOpsRef.current.filter(
-            (op: PendingOp<T>) => !(op.id === id && op.op === 'update'),
-          );
-          forceRender();
+          optimistic.removeOp(id, 'update');
           return result;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          pendingOpsRef.current = pendingOpsRef.current.map((op: PendingOp<T>) =>
-            op.id === id && op.op === 'update'
-              ? { ...op, status: 'failed' as const, error: msg }
-              : op,
-          );
-          forceRender();
+          optimistic.failOp(id, 'update', msg);
           throw err;
         }
       },
@@ -262,33 +185,20 @@ export function createListStore<T>(def: ListDef<T>): ListStore<T> {
       mutationFn: async (id: string) => {
         const requestId = genRequestId();
 
-        pendingOpsRef.current = [
-          ...pendingOpsRef.current,
-          {
-            id,
-            requestId,
-            op: 'delete',
-            data: {},
-            status: 'pending',
-            startedAt: Date.now(),
-          },
-        ];
-        forceRender();
+        optimistic.addOp({
+          id,
+          requestId,
+          op: 'delete',
+          data: {},
+          status: 'pending',
+        });
 
         try {
           await entangledMethod(def.name, 'delete', { id, requestId }, backendParams);
-          pendingOpsRef.current = pendingOpsRef.current.filter(
-            (op: PendingOp<T>) => !(op.id === id && op.op === 'delete'),
-          );
-          forceRender();
+          optimistic.removeOp(id, 'delete');
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          pendingOpsRef.current = pendingOpsRef.current.map((op: PendingOp<T>) =>
-            op.id === id && op.op === 'delete'
-              ? { ...op, status: 'failed' as const, error: msg }
-              : op,
-          );
-          forceRender();
+          optimistic.failOp(id, 'delete', msg);
           throw err;
         }
       },

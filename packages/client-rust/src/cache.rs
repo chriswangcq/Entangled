@@ -7,7 +7,8 @@
 //!   - `entity_meta`: version, has_more_before, subscribed per (entity, params_hash)
 //!   - `entity_items`: actual entity data as JSON blobs, ordered by `seq`
 
-use rusqlite::{Connection, params};
+use rusqlite::params;
+use r2d2_sqlite::SqliteConnectionManager;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::hash::{Hash, Hasher};
@@ -102,7 +103,7 @@ fn next_seq() -> i64 {
 
 /// The main entity cache — backed by a local SQLite database.
 pub struct Cache {
-    conn: Connection,
+    pool: r2d2::Pool<SqliteConnectionManager>,
 }
 
 impl std::fmt::Debug for Cache {
@@ -120,24 +121,29 @@ impl Default for Cache {
 impl Cache {
     /// Create cache backed by a file.
     pub fn new(path: &Path) -> Self {
-        let conn = Connection::open(path)
-            .expect("Failed to open entity cache database");
-        let cache = Self { conn };
+        let manager = SqliteConnectionManager::file(path);
+        let pool = r2d2::Pool::new(manager)
+            .expect("Failed to create entity cache database pool");
+        let cache = Self { pool };
         cache.init_schema();
         cache
     }
 
     /// Create cache in memory (for testing or ephemeral use).
     pub fn new_in_memory() -> Self {
-        let conn = Connection::open_in_memory()
-            .expect("Failed to create in-memory database");
-        let cache = Self { conn };
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder()
+            .max_size(1) // memory db must share the same connection
+            .build(manager)
+            .expect("Failed to create in-memory database pool");
+        let cache = Self { pool };
         cache.init_schema();
         cache
     }
 
     fn init_schema(&self) {
-        self.conn.execute_batch("
+        let conn = self.pool.get().unwrap();
+        conn.execute_batch("
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
             PRAGMA cache_size=-8000;
@@ -167,13 +173,13 @@ impl Cache {
         ").expect("Failed to initialize entity cache schema");
 
         // Migrate: add last_accessed column if missing (existing DBs)
-        let _ = self.conn.execute(
+        let _ = conn.execute(
             "ALTER TABLE entity_meta ADD COLUMN last_accessed INTEGER NOT NULL DEFAULT 0",
             [],
         );
 
         // Init seq counter from max existing seq
-        let max_seq: i64 = self.conn.query_row(
+        let max_seq: i64 = conn.query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM entity_items",
             [],
             |row| row.get(0),
@@ -183,11 +189,12 @@ impl Cache {
 
     /// Touch last_accessed timestamp for a cache key.
     fn touch(&self, key: &CacheKey) {
+        let conn = self.pool.get().unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        self.conn.execute(
+        conn.execute(
             "UPDATE entity_meta SET last_accessed = ?3 WHERE entity = ?1 AND params_hash = ?2",
             params![key.entity, key.params_hash as i64, now],
         ).ok();
@@ -196,6 +203,7 @@ impl Cache {
     /// Evict cache entries not accessed in the last `max_age_secs` seconds.
     /// Returns number of entries evicted.
     pub fn gc_stale(&self, max_age_secs: u64) -> usize {
+        let conn = self.pool.get().unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -203,23 +211,23 @@ impl Cache {
         let cutoff = now - max_age_secs as i64;
 
         // Find stale keys
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT entity, params_hash FROM entity_meta WHERE last_accessed < ?1 AND last_accessed > 0"
         ).unwrap();
         let keys: Vec<(String, i64)> = stmt.query_map(
             params![cutoff],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            |row: &rusqlite::Row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         ).unwrap()
         .filter_map(|r| r.ok())
         .collect();
 
         let count = keys.len();
         for (entity, ph) in &keys {
-            self.conn.execute(
+            conn.execute(
                 "DELETE FROM entity_items WHERE entity = ?1 AND params_hash = ?2",
                 params![entity, ph],
             ).ok();
-            self.conn.execute(
+            conn.execute(
                 "DELETE FROM entity_meta WHERE entity = ?1 AND params_hash = ?2",
                 params![entity, ph],
             ).ok();
@@ -235,10 +243,11 @@ impl Cache {
 
     /// Get metadata for a cache key.
     pub fn get_meta(&self, key: &CacheKey) -> EntityMeta {
-        self.conn.query_row(
+        let conn = self.pool.get().unwrap();
+        conn.query_row(
             "SELECT version, subscribed, has_more FROM entity_meta WHERE entity = ?1 AND params_hash = ?2",
             params![key.entity, key.params_hash as i64],
-            |row| Ok(EntityMeta {
+            |row: &rusqlite::Row| Ok(EntityMeta {
                 version: row.get::<_, i64>(0)? as u64,
                 subscribed: row.get::<_, bool>(1)?,
                 has_more_before: row.get::<_, bool>(2)?,
@@ -249,7 +258,8 @@ impl Cache {
     /// Upsert meta (single SQL, no SELECT+UPDATE dance).
     #[allow(dead_code)]
     fn upsert_meta(&self, key: &CacheKey, version: u64, subscribed: bool, has_more: bool) {
-        self.conn.execute(
+        let conn = self.pool.get().unwrap();
+        conn.execute(
             "INSERT INTO entity_meta (entity, params_hash, version, subscribed, has_more)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(entity, params_hash) DO UPDATE SET
@@ -262,7 +272,8 @@ impl Cache {
 
     /// Set subscribed flag only.
     pub fn set_subscribed(&self, key: &CacheKey, subscribed: bool) {
-        self.conn.execute(
+        let conn = self.pool.get().unwrap();
+        conn.execute(
             "INSERT INTO entity_meta (entity, params_hash, subscribed)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(entity, params_hash) DO UPDATE SET subscribed = excluded.subscribed",
@@ -297,12 +308,13 @@ impl Cache {
     /// Get all items in order. Also touches last_accessed for TTL.
     pub fn get_list(&self, key: &CacheKey) -> Vec<Value> {
         self.touch(key);
-        let mut stmt = self.conn.prepare_cached(
+        let conn = self.pool.get().unwrap();
+        let mut stmt = conn.prepare_cached(
             "SELECT data FROM entity_items WHERE entity = ?1 AND params_hash = ?2 ORDER BY seq ASC"
         ).unwrap();
         stmt.query_map(
             params![key.entity, key.params_hash as i64],
-            |row| {
+            |row: &rusqlite::Row| {
                 let json_str: String = row.get(0)?;
                 Ok(serde_json::from_str(&json_str).unwrap_or(Value::Null))
             },
@@ -314,10 +326,11 @@ impl Cache {
 
     /// Get a single item by ID.
     pub fn get_item(&self, key: &CacheKey, id: &str) -> Option<Value> {
-        self.conn.query_row(
+        let conn = self.pool.get().unwrap();
+        conn.query_row(
             "SELECT data FROM entity_items WHERE entity = ?1 AND params_hash = ?2 AND item_id = ?3",
             params![key.entity, key.params_hash as i64, id],
-            |row| {
+            |row: &rusqlite::Row| {
                 let json_str: String = row.get(0)?;
                 Ok(serde_json::from_str(&json_str).unwrap_or(Value::Null))
             },
@@ -327,9 +340,10 @@ impl Cache {
     /// Upsert a single item (used by public apply_delta internally — keep for future direct use).
     #[allow(dead_code)]
     fn upsert_item(&self, key: &CacheKey, id: &str, data: &Value) {
+        let conn = self.pool.get().unwrap();
         let json_str = serde_json::to_string(data).unwrap_or_default();
         let seq = next_seq();
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO entity_items (entity, params_hash, item_id, data, seq)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(entity, params_hash, item_id) DO UPDATE SET data = excluded.data",
@@ -340,7 +354,8 @@ impl Cache {
     /// Delete a single item.
     #[allow(dead_code)]
     fn delete_item(&self, key: &CacheKey, id: &str) {
-        self.conn.execute(
+        let conn = self.pool.get().unwrap();
+        conn.execute(
             "DELETE FROM entity_items WHERE entity = ?1 AND params_hash = ?2 AND item_id = ?3",
             params![key.entity, key.params_hash as i64, id],
         ).ok();
@@ -348,7 +363,8 @@ impl Cache {
 
     /// Delete all items for a key.
     fn clear_items(&self, key: &CacheKey) {
-        self.conn.execute(
+        let conn = self.pool.get().unwrap();
+        conn.execute(
             "DELETE FROM entity_items WHERE entity = ?1 AND params_hash = ?2",
             params![key.entity, key.params_hash as i64],
         ).ok();
@@ -360,7 +376,8 @@ impl Cache {
     /// Use `has_more = false` for full snapshots, `true` for head_n partial syncs.
     pub fn apply_snapshot(&self, key: &CacheKey, items: &[Value], version: u64, id_field: &str, has_more: bool) {
         // Wrap in transaction: DELETE + N INSERTs + meta update → 1 fsync
-        let tx = self.conn.unchecked_transaction().unwrap();
+        let conn = self.pool.get().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
         tx.execute(
             "DELETE FROM entity_items WHERE entity = ?1 AND params_hash = ?2",
             params![key.entity, key.params_hash as i64],
@@ -408,7 +425,8 @@ impl Cache {
         }
 
         // Wrap all ops in a single transaction
-        let tx = self.conn.unchecked_transaction().unwrap();
+        let conn = self.pool.get().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
         let mut has_invalidate = false;
 
         for op in ops {
@@ -431,7 +449,7 @@ impl Cache {
                         let existing: Option<String> = tx.query_row(
                             "SELECT data FROM entity_items WHERE entity = ?1 AND params_hash = ?2 AND item_id = ?3",
                             params![key.entity, key.params_hash as i64, op.id],
-                            |row| row.get(0),
+                            |row: &rusqlite::Row| row.get::<_, String>(0),
                         ).ok();
 
                         let merged = if let Some(ref json_str) = existing {
@@ -494,17 +512,19 @@ impl Cache {
     /// Returns number of items actually prepended.
     pub fn prepend_older(&self, key: &CacheKey, items: &[Value], has_more: bool, id_field: &str) -> usize {
         // Get the current minimum seq for this entity
-        let min_seq: i64 = self.conn.query_row(
+        let conn = self.pool.get().unwrap();
+        let min_seq: i64 = conn.query_row(
             "SELECT COALESCE(MIN(seq), 0) FROM entity_items WHERE entity = ?1 AND params_hash = ?2",
             params![key.entity, key.params_hash as i64],
-            |row| row.get(0),
+            |row: &rusqlite::Row| row.get(0),
         ).unwrap_or(0);
 
         // Items come in newest-first order from server (DESC), reverse to get chronological
         let items_reversed: Vec<&Value> = items.iter().rev().collect();
         let total = items_reversed.len() as i64;
 
-        let tx = self.conn.unchecked_transaction().unwrap();
+        let conn = self.pool.get().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
         let mut count = 0usize;
 
         {
@@ -548,7 +568,8 @@ impl Cache {
     /// Remove all data for a key.
     pub fn remove(&self, key: &CacheKey) {
         self.clear_items(key);
-        self.conn.execute(
+        let conn = self.pool.get().unwrap();
+        conn.execute(
             "DELETE FROM entity_meta WHERE entity = ?1 AND params_hash = ?2",
             params![key.entity, key.params_hash as i64],
         ).ok();
@@ -556,7 +577,8 @@ impl Cache {
 
     /// Clear everything.
     pub fn clear_all(&self) {
-        self.conn.execute_batch("
+        let conn = self.pool.get().unwrap();
+        conn.execute_batch("
             DELETE FROM entity_items;
             DELETE FROM entity_meta;
         ").ok();
@@ -564,12 +586,13 @@ impl Cache {
 
     /// Get all cache keys for a given entity name.
     pub fn keys_for_entity(&self, entity: &str) -> Vec<CacheKey> {
-        let mut stmt = self.conn.prepare_cached(
+        let conn = self.pool.get().unwrap();
+        let mut stmt = conn.prepare_cached(
             "SELECT params_hash FROM entity_meta WHERE entity = ?1"
         ).unwrap();
         stmt.query_map(
             params![entity],
-            |row| {
+            |row: &rusqlite::Row| {
                 let ph: i64 = row.get(0)?;
                 Ok(CacheKey {
                     entity: entity.to_string(),
@@ -583,17 +606,19 @@ impl Cache {
 
     /// Get item count for a key.
     pub fn item_count(&self, key: &CacheKey) -> usize {
-        self.conn.query_row(
+        let conn = self.pool.get().unwrap();
+        conn.query_row(
             "SELECT COUNT(*) FROM entity_items WHERE entity = ?1 AND params_hash = ?2",
             params![key.entity, key.params_hash as i64],
-            |row| row.get::<_, i64>(0),
+            |row: &rusqlite::Row| row.get::<_, i64>(0),
         ).unwrap_or(0) as usize
     }
 
     /// Database size in bytes (for diagnostics).
     pub fn db_size(&self) -> u64 {
-        let page_count: i64 = self.conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap_or(0);
-        let page_size: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap_or(4096);
+        let conn = self.pool.get().unwrap();
+        let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r: &rusqlite::Row| r.get(0)).unwrap_or(0);
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r: &rusqlite::Row| r.get(0)).unwrap_or(4096);
         (page_count * page_size) as u64
     }
 }

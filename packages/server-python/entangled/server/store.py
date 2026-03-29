@@ -4,11 +4,24 @@ entangled/server/store.py — EntityStore: the runtime engine.
 Holds all EntityDefs and dispatches CRUD + action operations.
 Fully generic — no business logic, just routes to the handlers
 defined in each EntityDef.
+
+Architecture:
+  EntityStore is a concrete class that dispatches CRUD operations
+  to EntityDef handler functions (list_fn, create_fn, etc.).
+
+  Subclasses (like NovAIC's SQL-backed EntityStore) can override
+  list(), list_stream(), exists_before() for storage-specific behavior.
+  The base class provides:
+    - Entity registration and schema management
+    - CRUD dispatch to EntityDef handler functions
+    - Notification routing via _notify_change()
+    - Access control via _check_access()
 """
 
 
 import inspect
 import logging
+from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
 from .defs import EntityDef
@@ -16,8 +29,160 @@ from .defs import EntityDef
 logger = logging.getLogger(__name__)
 
 
-class EntityStore:
+# ── Protocol: storage abstraction ────────────────────────────────
+
+class EntityStoreProtocol(ABC):
+    """Abstract protocol for entity storage engines.
+
+    Defines the minimal interface that any entity store must implement.
+    Concrete implementations include:
+      - EntityStore (this module): fn-pointer dispatch to EntityDef handlers
+      - NovAIC EntityStore (gateway/entity/store.py): SQL-backed with auto-schema
+
+    Subclasses MUST call super().__init__(defs) to register entity definitions.
+    """
+
+    @abstractmethod
+    def list(
+        self,
+        entity: str,
+        user_id: str,
+        *,
+        params: Optional[Dict[str, str]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """List entities for a given user and params."""
+        ...
+
+    @abstractmethod
+    def get(
+        self,
+        entity: str,
+        user_id: str,
+        entity_id: str,
+        *,
+        params: Optional[Dict[str, str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Get a single entity by ID."""
+        ...
+
+    @abstractmethod
+    def create(
+        self,
+        entity: str,
+        user_id: str,
+        data: Dict[str, Any],
+        *,
+        params: Optional[Dict[str, str]] = None,
+        request_id: Optional[str] = None,
+        notify: bool = True,
+    ) -> Dict[str, Any]:
+        """Create an entity."""
+        ...
+
+    @abstractmethod
+    def update(
+        self,
+        entity: str,
+        user_id: str,
+        entity_id: str,
+        data: Dict[str, Any],
+        *,
+        params: Optional[Dict[str, str]] = None,
+        request_id: Optional[str] = None,
+        notify: bool = True,
+    ) -> Dict[str, Any]:
+        """Update an entity."""
+        ...
+
+    @abstractmethod
+    def delete(
+        self,
+        entity: str,
+        user_id: str,
+        entity_id: str,
+        *,
+        params: Optional[Dict[str, str]] = None,
+        request_id: Optional[str] = None,
+        notify: bool = True,
+    ) -> bool:
+        """Delete an entity."""
+        ...
+
+    def list_stream(
+        self,
+        entity: str,
+        user_id: str,
+        *,
+        params: Optional[Dict[str, str]] = None,
+        before_id: Optional[str] = None,
+        after_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Cursor-based backward pagination. Default: falls back to list()."""
+        return self.list(entity, user_id, params=params, limit=limit)
+
+    def exists_before(
+        self,
+        entity: str,
+        user_id: str,
+        oldest_id: str,
+        *,
+        params: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        """Check if items exist before the cursor. Default: False."""
+        return False
+
+    def upsert(
+        self,
+        entity: str,
+        user_id: str,
+        entity_id: str,
+        data: Dict[str, Any],
+        *,
+        params: Optional[Dict[str, str]] = None,
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Insert-or-update. Default: delegates to update()."""
+        return self.update(entity, user_id, entity_id, data, params=params, request_id=request_id)
+
+    async def action(
+        self,
+        entity: str,
+        user_id: str,
+        action_name: str,
+        params: Dict[str, str],
+        payload: Dict[str, Any],
+    ) -> Any:
+        """Execute a custom action. Default: raises KeyError."""
+        raise KeyError(f"No action handler for '{action_name}' on '{entity}'")
+
+    @abstractmethod
+    def get_def(self, entity: str) -> EntityDef:
+        """Get the EntityDef for an entity."""
+        ...
+
+    @abstractmethod
+    def get_all_defs(self) -> List[EntityDef]:
+        """Get all registered EntityDefs."""
+        ...
+
+    @abstractmethod
+    def get_schema(self) -> List[dict]:
+        """Get entity schema for Entangled protocol."""
+        ...
+
+
+# ── Concrete EntityStore ─────────────────────────────────────────
+
+class EntityStore(EntityStoreProtocol):
     """Runtime entity store — dispatches operations to EntityDef handlers.
+
+    This is the default Entangled EntityStore. It dispatches CRUD operations
+    to the handler functions (list_fn, create_fn, etc.) defined in each EntityDef.
+
+    For SQL-backed storage, subclass this and override list()/get()/create()/etc.
+    or register EntityDefs with appropriate handler functions.
 
     Usage:
         store = EntityStore([todos_def, users_def, ...])
@@ -138,19 +303,21 @@ class EntityStore:
         *,
         params: Optional[Dict[str, str]] = None,
         request_id: Optional[str] = None,
+        notify: bool = True,
     ) -> Dict[str, Any]:
         defn = self.get_def(entity)
         self._check_access(defn, user_id, "create", params=params)
         if not defn.create_fn:
             raise NotImplementedError(f"{entity} does not support create")
         result = defn.create_fn(self, user_id, params or {}, data)
-        self._notify_change(
-            entity, "created", user_id,
-            entity_id=result.get("id") if isinstance(result, dict) else None,
-            params=params,
-            data=result,
-            request_id=request_id,
-        )
+        if notify:
+            self._notify_change(
+                entity, "created", user_id,
+                entity_id=result.get("id") if isinstance(result, dict) else None,
+                params=params,
+                data=result,
+                request_id=request_id,
+            )
         return result
 
     def update(
@@ -162,19 +329,21 @@ class EntityStore:
         *,
         params: Optional[Dict[str, str]] = None,
         request_id: Optional[str] = None,
+        notify: bool = True,
     ) -> Dict[str, Any]:
         defn = self.get_def(entity)
         self._check_access(defn, user_id, "update", entity_id=entity_id, params=params)
         if not defn.update_fn:
             raise NotImplementedError(f"{entity} does not support update")
         result = defn.update_fn(self, user_id, entity_id, data, params or {})
-        self._notify_change(
-            entity, "updated", user_id,
-            entity_id=entity_id,
-            params=params,
-            data=result,
-            request_id=request_id,
-        )
+        if notify:
+            self._notify_change(
+                entity, "updated", user_id,
+                entity_id=entity_id,
+                params=params,
+                data=result,
+                request_id=request_id,
+            )
         return result
 
     def delete(
@@ -185,13 +354,14 @@ class EntityStore:
         *,
         params: Optional[Dict[str, str]] = None,
         request_id: Optional[str] = None,
+        notify: bool = True,
     ) -> bool:
         defn = self.get_def(entity)
         self._check_access(defn, user_id, "delete", entity_id=entity_id, params=params)
         if not defn.delete_fn:
             raise NotImplementedError(f"{entity} does not support delete")
         ok = defn.delete_fn(self, user_id, entity_id, params or {})
-        if ok:
+        if ok and notify:
             self._notify_change(
                 entity, "deleted", user_id,
                 entity_id=entity_id,
@@ -270,7 +440,26 @@ class EntityStore:
         data: Optional[Dict[str, Any]] = None,
         request_id: Optional[str] = None,
     ) -> None:
-        """Notify subscribed clients of an entity change with inline data."""
+        """Notify subscribed clients of an entity change with inline data.
+
+        WARNING: If the entity has key_params but params is empty, the delta push
+        will be sent to state_key="entity" instead of "entity:[['key','val']]",
+        which means NO subscriber will receive it (they subscribe with params).
+        This is almost always a bug in the caller.
+        """
+        # Defense: warn if entity has key_params but notification has empty params
+        try:
+            defn = self.get_def(entity)
+            if defn.key_params and not params:
+                logger.warning(
+                    "[Entangled] ⚠️  _notify_change('%s', '%s') called with empty params "
+                    "but entity has key_params=%s — delta push will NOT reach any subscriber! "
+                    "entity_id=%s. This is almost certainly a bug in the caller.",
+                    entity, action, defn.key_params, entity_id,
+                )
+        except KeyError:
+            pass
+
         from .notifier import notify_entity_change
         notify_entity_change(
             user_id, entity, action,

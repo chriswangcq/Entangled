@@ -15,20 +15,7 @@ import type { FormHookResult } from './types';
 import type { QueryClient } from '@tanstack/react-query';
 import { genRequestId } from './pendingOps';
 
-function toSnakeParams(
-  params: Record<string, string>,
-  keyParams?: string[],
-): Record<string, string> {
-  if (!keyParams) return params;
-  const result: Record<string, string> = {};
-  for (const k of keyParams) {
-    if (params[k] !== undefined) {
-      const snake = k.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`);
-      result[snake] = params[k];
-    }
-  }
-  return result;
-}
+import { toSnakeParams } from './utils';
 
 // ── Definition ──────────────────────────────────────────────────
 
@@ -57,8 +44,20 @@ export interface FormStore<T> {
 function resolveEntityId(def: FormDef<any>, params: Record<string, string>): string {
   if (typeof def.entityId === 'function') return def.entityId(params);
   if (typeof def.entityId === 'string') return params[def.entityId] ?? '';
+
+  // Fallback: use keyParams[0] — deprecated, add explicit entityId to FormDef
   const firstKey = def.keyParams?.[0];
-  return firstKey ? (params[firstKey] ?? '') : '';
+  if (firstKey) {
+    if (typeof globalThis !== 'undefined' && (globalThis as any).__DEV__ !== false) {
+      console.warn(
+        `[Entangled] FormDef '${def.name}' has no explicit entityId — ` +
+        `falling back to keyParams[0]='${firstKey}'. ` +
+        `Add 'entityId: "${firstKey}"' to the FormDef to silence this warning.`,
+      );
+    }
+    return params[firstKey] ?? '';
+  }
+  return '';
 }
 
 // ── Factory ─────────────────────────────────────────────────────
@@ -72,7 +71,7 @@ export function createFormStore<T>(def: FormDef<T>): FormStore<T> {
   function useForm(params: Record<string, string> = {}): FormHookResult<T> {
     const qc = useQueryClient();
     const queryKey = useMemo(() => buildKey(params), [JSON.stringify(params)]);
-    const backendParams = useMemo(() => toSnakeParams(params, def.keyParams), [JSON.stringify(params)]);
+    const backendParams = useMemo(() => toSnakeParams(params, def.keyParams ?? []), [JSON.stringify(params)]);
     const isEnabled = def.enabled ? def.enabled(params) : true;
 
     // ── Subscribe / Unsubscribe ─────────────────────────────────

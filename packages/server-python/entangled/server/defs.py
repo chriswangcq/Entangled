@@ -93,6 +93,12 @@ class EntityDef:
     list_stream_fn: Optional[ListStreamFn] = None  # cursor-based backward pagination
     exists_before_fn: Optional[ExistsBeforeFn] = None  # (store, user_id, oldest_id, params) -> bool
 
+    # Data ordering contract: declares what order fetch_data_fn / list_fn returns.
+    # "desc" = newest first (typical for streams with ORDER BY timestamp DESC)
+    # "asc"  = oldest first (typical for logs with ORDER BY timestamp ASC)
+    # The sync engine uses this to normalize data to ASC before sending to clients.
+    data_order: str = "desc"
+
     # ── Custom actions ───────────────────────────────────────────
     actions: Dict[str, ActionFn] = field(default_factory=dict)
 
@@ -124,6 +130,7 @@ class EntityDef:
             "syncLimit": self.sync_limit,
             "subscriptionMode": self.subscription_mode,
             # Capability flags — lets clients know what ops are available
+            "dataOrder": self.data_order,
             "capabilities": {
                 "listStream": self.list_stream_fn is not None,
                 "existsBefore": self.exists_before_fn is not None,

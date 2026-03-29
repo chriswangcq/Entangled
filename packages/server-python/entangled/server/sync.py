@@ -251,6 +251,7 @@ def _stream_head_n_sync(
     *,
     reason: str = "subscribe",
     exists_before_fn: Optional[Callable[[str], bool]] = None,
+    data_order: str = "desc",
 ) -> dict:
     """
     Bounded sync for stream entities.
@@ -258,16 +259,22 @@ def _stream_head_n_sync(
     If ``exists_before_fn`` is provided, fetches exactly ``d`` rows and uses
     cursor-based ``SELECT EXISTS(...)`` to determine ``hasMore`` precisely.
     Otherwise falls back to N+1 detection (fetch d+1, compare count).
+
+    Data is always normalized to ASC (oldest first) before sending to clients.
+    The ``data_order`` parameter declares the order returned by ``fetch_data_fn``.
     """
     d = _effective_stream_depth(depth, default_stream_depth)
 
     if exists_before_fn:
         # Cursor-based: fetch exactly d items, then EXISTS check on oldest
         data = fetch_data_fn(limit=d)
+        # Normalize to ASC (oldest first) for client consumption
+        if data_order == "desc":
+            data = data[::-1]
+        # Now data is ASC: data[0] = oldest, data[-1] = newest
         if len(data) < d:
             has_more = False
         else:
-            # data is ASC-ordered (oldest first after reverse); oldest = data[0]
             oldest = data[0] if data else None
             oldest_id = oldest.get("id") if oldest else None
             has_more = exists_before_fn(oldest_id) if oldest_id else False
@@ -276,14 +283,21 @@ def _stream_head_n_sync(
         # Fallback: N+1 (for generic Entangled hosts without exists_before_fn)
         data = fetch_data_fn(limit=d + 1)
         has_more = len(data) > d
-        items = data[-d:] if has_more else data
+        if data_order == "desc":
+            # Keep the newest `d` items (data[:d] since DESC), then reverse to ASC
+            items = data[:d] if has_more else data
+            items = items[::-1]
+        else:
+            # ASC: keep the oldest `d` items (drop the extra newest one)
+            items = data[:d] if has_more else data
 
     logger.debug(
-        "[Entangled] head_n (%s): depth=%d rows=%d hasMore=%s",
+        "[Entangled] head_n (%s): depth=%d rows=%d hasMore=%s order=%s",
         reason,
         d,
         len(items),
         has_more,
+        data_order,
     )
     return {
         "mode": "head_n",
@@ -303,6 +317,7 @@ def resolve_sync(
     *,
     default_stream_depth: Optional[int] = None,
     exists_before_fn: Optional[Callable[[str], bool]] = None,
+    data_order: str = "desc",
 ) -> dict:
     """Decide sync mode (like git smart protocol).
 
@@ -319,6 +334,9 @@ def resolve_sync(
             cursor-based ``hasMore`` detection. When provided, stream sync fetches
             exactly ``depth`` rows and uses ``SELECT EXISTS(...)`` to check for older
             rows — precise and efficient. Without it, falls back to N+1 detection.
+        data_order: The ordering of data returned by ``fetch_data_fn``.
+            ``"desc"`` = newest first (default), ``"asc"`` = oldest first.
+            The sync engine normalizes all output to ASC before sending to clients.
 
     Returns:
         Dict with ``mode``, ``version``, and optional ``data`` / ``ops`` / ``hasMore``.
@@ -334,6 +352,7 @@ def resolve_sync(
                 default_stream_depth,
                 reason="first_subscribe",
                 exists_before_fn=exists_before_fn,
+                data_order=data_order,
             )
         data = fetch_data_fn()
         return {
@@ -376,6 +395,7 @@ def resolve_sync(
             default_stream_depth,
             reason="op_log_gap",
             exists_before_fn=exists_before_fn,
+            data_order=data_order,
         )
 
     data = fetch_data_fn()
