@@ -170,6 +170,22 @@ impl Cache {
 
             CREATE INDEX IF NOT EXISTS idx_entity_items_seq
                 ON entity_items (entity, params_hash, seq);
+
+            CREATE TABLE IF NOT EXISTS pending_ops (
+                request_id  TEXT NOT NULL PRIMARY KEY,
+                entity      TEXT NOT NULL,
+                params_hash INTEGER NOT NULL,
+                op          TEXT NOT NULL,
+                item_id     TEXT NOT NULL,
+                data        TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                error       TEXT,
+                created_at  INTEGER NOT NULL,
+                seq         INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pending_ops_entity
+                ON pending_ops (entity, params_hash);
         ").expect("Failed to initialize entity cache schema");
 
         // Migrate: add last_accessed column if missing (existing DBs)
@@ -184,7 +200,12 @@ impl Cache {
             [],
             |row| row.get(0),
         ).unwrap_or(0);
-        SEQ_COUNTER.store(max_seq + 1, Ordering::Relaxed);
+        let max_pending_seq: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM pending_ops",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        SEQ_COUNTER.store(max_seq.max(max_pending_seq) + 1, Ordering::Relaxed);
     }
 
     /// Touch last_accessed timestamp for a cache key.
@@ -414,6 +435,9 @@ impl Cache {
 
     /// Apply delta ops (git pull fast-forward).
     /// Returns false if base_version doesn't match (need re-sync).
+    ///
+    /// Also cleans up matching pending_ops by request_id when the server
+    /// confirms a mutation (the delta op carries the original request_id).
     pub fn apply_delta(&self, key: &CacheKey, base_version: u64, ops: &[SyncOp], new_version: u64) -> bool {
         let meta = self.get_meta(key);
         if base_version != meta.version {
@@ -430,6 +454,14 @@ impl Cache {
         let mut has_invalidate = false;
 
         for op in ops {
+            // Clean up matching pending op when server confirms via request_id
+            if let Some(ref rid) = op.request_id {
+                tx.execute(
+                    "DELETE FROM pending_ops WHERE request_id = ?1",
+                    params![rid],
+                ).ok();
+            }
+
             match op.op.as_str() {
                 "insert" => {
                     if let Some(ref data) = op.data {
@@ -488,6 +520,16 @@ impl Cache {
                 }
                 "invalidate" => {
                     has_invalidate = true;
+                    // Clear stale items so re-sync snapshot starts clean
+                    tx.execute(
+                        "DELETE FROM entity_items WHERE entity = ?1 AND params_hash = ?2",
+                        params![key.entity, key.params_hash as i64],
+                    ).ok();
+                    // Also clear pending ops for this entity
+                    tx.execute(
+                        "DELETE FROM pending_ops WHERE entity = ?1 AND params_hash = ?2",
+                        params![key.entity, key.params_hash as i64],
+                    ).ok();
                 }
                 _ => {
                     tracing::debug!("[Cache] Unknown op: {}", op.op);
@@ -620,5 +662,208 @@ impl Cache {
         let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r: &rusqlite::Row| r.get(0)).unwrap_or(0);
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r: &rusqlite::Row| r.get(0)).unwrap_or(4096);
         (page_count * page_size) as u64
+    }
+
+    // ── Optimistic / Pending Ops ─────────────────────────────────
+
+    /// Write a pending op — the UI should see this item immediately via get_list_with_pending.
+    /// Returns the item_id used.
+    pub fn add_pending_op(
+        &self,
+        key: &CacheKey,
+        request_id: &str,
+        op: &str,
+        item_id: &str,
+        data: &Value,
+    ) {
+        let conn = self.pool.get().unwrap();
+        let json_str = serde_json::to_string(data).unwrap_or_default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let seq = next_seq();
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_ops (request_id, entity, params_hash, op, item_id, data, status, created_at, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+            params![request_id, key.entity, key.params_hash as i64, op, item_id, json_str, now, seq],
+        ).ok();
+    }
+
+    /// Mark a pending op as failed.
+    pub fn fail_pending_op(&self, request_id: &str, error: &str) {
+        let conn = self.pool.get().unwrap();
+        conn.execute(
+            "UPDATE pending_ops SET status = 'failed', error = ?2 WHERE request_id = ?1",
+            params![request_id, error],
+        ).ok();
+    }
+
+    /// Remove a pending op by request_id (on success or manual cleanup).
+    pub fn remove_pending_op(&self, request_id: &str) {
+        let conn = self.pool.get().unwrap();
+        conn.execute(
+            "DELETE FROM pending_ops WHERE request_id = ?1",
+            params![request_id],
+        ).ok();
+    }
+
+    /// Remove a pending op by item_id (for create ops where tempId is the key).
+    pub fn remove_pending_by_item_id(&self, key: &CacheKey, item_id: &str) {
+        let conn = self.pool.get().unwrap();
+        conn.execute(
+            "DELETE FROM pending_ops WHERE entity = ?1 AND params_hash = ?2 AND item_id = ?3",
+            params![key.entity, key.params_hash as i64, item_id],
+        ).ok();
+    }
+
+    /// Get all pending ops for an entity+params (for UI merge).
+    pub fn get_pending_ops(&self, key: &CacheKey) -> Vec<Value> {
+        let conn = self.pool.get().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT data, op, status, error, request_id, item_id FROM pending_ops
+             WHERE entity = ?1 AND params_hash = ?2
+             ORDER BY seq ASC"
+        ).unwrap();
+        stmt.query_map(
+            params![key.entity, key.params_hash as i64],
+            |row: &rusqlite::Row| {
+                let json_str: String = row.get(0)?;
+                let op: String = row.get(1)?;
+                let status: String = row.get(2)?;
+                let error: Option<String> = row.get(3)?;
+                let request_id: String = row.get(4)?;
+                let item_id: String = row.get(5)?;
+
+                let mut val: Value = serde_json::from_str(&json_str).unwrap_or(Value::Null);
+                // Inject metadata into the JSON object
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert("_status".to_string(), Value::String(status));
+                    obj.insert("_op".to_string(), Value::String(op));
+                    obj.insert("_requestId".to_string(), Value::String(request_id));
+                    obj.insert("_tempId".to_string(), Value::String(item_id));
+                    if let Some(err) = error {
+                        obj.insert("_error".to_string(), Value::String(err));
+                    }
+                }
+                Ok(val)
+            },
+        ).unwrap()
+        .filter_map(|r| r.ok())
+        .filter(|v| !v.is_null())
+        .collect()
+    }
+
+    /// Get confirmed list + pending creates merged (the sole read path for UI).
+    /// Confirmed items get `_status: "confirmed"` injected.
+    /// Pending create items are appended.
+    /// Pending update items patch the matching confirmed item.
+    /// Pending delete items are marked with `_status: "pending", _op: "delete"`.
+    pub fn get_list_with_pending(&self, key: &CacheKey) -> Vec<Value> {
+        self.touch(key);
+        // 1. Get confirmed items
+        let mut items = self.get_list(key);
+
+        // 2. Get pending ops
+        let pending = self.get_pending_ops(key);
+        if pending.is_empty() {
+            // Fast path: inject _status: "confirmed" on all items
+            for item in &mut items {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("_status".to_string(), Value::String("confirmed".to_string()));
+                }
+            }
+            return items;
+        }
+
+        // 3. Merge
+        // Inject _status: "confirmed" on all confirmed items
+        for item in &mut items {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("_status".to_string(), Value::String("confirmed".to_string()));
+            }
+        }
+
+        for pop in &pending {
+            let op = pop.get("_op").and_then(|v| v.as_str()).unwrap_or("");
+            let pending_id = pop.get("_tempId").and_then(|v| v.as_str()).unwrap_or("");
+
+            match op {
+                "create" => {
+                    // Check if server already has this ID (dedup)
+                    let exists = items.iter().any(|i| {
+                        i.get("id").and_then(|v| v.as_str()) == Some(pending_id)
+                    });
+                    if !exists {
+                        items.push(pop.clone());
+                    }
+                }
+                "update" => {
+                    // Patch matching item
+                    if let Some(item) = items.iter_mut().find(|i| {
+                        i.get("id").and_then(|v| v.as_str()) == Some(pending_id)
+                    }) {
+                        if let (Some(obj), Some(patch)) = (item.as_object_mut(), pop.as_object()) {
+                            for (k, v) in patch {
+                                if !k.starts_with('_') {
+                                    obj.insert(k.clone(), v.clone());
+                                }
+                            }
+                            // Override status to pending
+                            obj.insert("_status".to_string(), Value::String("pending".to_string()));
+                            obj.insert("_op".to_string(), Value::String("update".to_string()));
+                        }
+                    }
+                }
+                "delete" => {
+                    // Mark as pending delete
+                    if let Some(item) = items.iter_mut().find(|i| {
+                        i.get("id").and_then(|v| v.as_str()) == Some(pending_id)
+                    }) {
+                        if let Some(obj) = item.as_object_mut() {
+                            obj.insert("_status".to_string(), Value::String("pending".to_string()));
+                            obj.insert("_op".to_string(), Value::String("delete".to_string()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        items
+    }
+
+    /// Cleanup stale pending ops (by age).
+    /// Returns number removed.
+    pub fn cleanup_stale_pending(&self, pending_max_age_ms: i64, failed_max_age_ms: i64) -> usize {
+        let conn = self.pool.get().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        let pending_cutoff = now - pending_max_age_ms;
+        let failed_cutoff = now - failed_max_age_ms;
+
+        let count: usize = conn.execute(
+            "DELETE FROM pending_ops WHERE
+             (status = 'pending' AND created_at < ?1) OR
+             (status = 'failed' AND created_at < ?2)",
+            params![pending_cutoff, failed_cutoff],
+        ).unwrap_or(0);
+
+        if count > 0 {
+            tracing::info!("[Cache] Cleaned up {} stale pending ops", count);
+        }
+        count
+    }
+
+    /// Clear all pending ops for an entity (on snapshot re-sync).
+    pub fn clear_pending(&self, key: &CacheKey) {
+        let conn = self.pool.get().unwrap();
+        conn.execute(
+            "DELETE FROM pending_ops WHERE entity = ?1 AND params_hash = ?2",
+            params![key.entity, key.params_hash as i64],
+        ).ok();
     }
 }

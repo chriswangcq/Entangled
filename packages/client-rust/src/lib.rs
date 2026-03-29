@@ -52,3 +52,5 @@ pub use auth::AuthProvider;
 pub use client::{EntangledClient, EntangledConfig};
 pub use push::{EntityChanged, SyncFrame};
 pub use cache::{Cache, CacheKey};
+#[cfg(feature = "tauri")]
+pub use commands::{SubscriptionRegistry, SubscriptionEntry};
