@@ -9,10 +9,10 @@
 //! ).await;
 //!
 //! // Subscribe to an entity
-//! client.subscribe("agents", None).await;
+//! client.subscribe("todos", None).await;
 //!
-//! // Read cached data
-//! let agents = client.get_list("agents", None);
+//! // Read from local cache
+//! let todos = client.get_list("todos", None);
 //!
 //! // Listen for changes
 //! let mut rx = client.on_change();

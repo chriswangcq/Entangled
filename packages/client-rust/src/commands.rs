@@ -1,7 +1,7 @@
 //! Tauri commands — thin adapter exposing EntangledClient to JS webview.
 //!
-//! This module is feature-gated behind `tauri` and is NovAIC-specific.
-//! Generic apps should use `EntangledClient` directly.
+//! This module is feature-gated behind `tauri`.
+//! Generic (non-Tauri) apps should use `EntangledClient` directly.
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -170,7 +170,7 @@ fn make_key(entity: &str, params: Option<Value>) -> CacheKey {
     }
 }
 
-/// Get list from SQLite cache (read path — always local, never hits Gateway).
+/// Get list from SQLite cache (read path — always local, never hits the server).
 /// Empty vec means no rows for this key (cold or legitimately empty after sync).
 #[cfg(feature = "tauri")]
 #[tauri::command]

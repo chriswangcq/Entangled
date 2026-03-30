@@ -87,7 +87,7 @@ class SyncState:
 
         if not ops:
             # Client is behind persisted current_version but op_log is empty
-            # (Gateway restart, deque maxlen GC, etc.) — must not return a bogus delta.
+            # (server restart, deque maxlen GC, etc.) — must not return a bogus delta.
             return None
 
         if ops[0].version != since_version + 1:
@@ -129,7 +129,7 @@ class SyncRegistry:
         self._states: Dict[str, SyncState] = {}
         self._client_subs: Dict[str, Set[str]] = {}
         self._op_log_sizes: Dict[str, int] = {}  # entity → maxlen
-        # Optional: persist (state_key, current_version) after each mutation (e.g. Gateway SQLite).
+        # Optional: persist (state_key, current_version) after each mutation (e.g. host SQLite).
         self._on_version_bump = on_version_bump
 
     def hydrate_versions(self, versions: Dict[str, int]) -> None:
