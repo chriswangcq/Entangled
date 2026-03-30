@@ -54,7 +54,7 @@ pub struct EntityChanged {
     pub request_ids: Vec<String>,
 }
 
-/// Incoming sync frame from server (Gateway uses camelCase for several fields).
+/// Incoming sync frame from server (server uses camelCase for several fields).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncFrame {

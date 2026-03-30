@@ -8,7 +8,7 @@
 
 **一切对服务端实体状态的变更，必须通过 Entangled Method 发出。**
 
-- **Method** 是宿主意图与 Gateway 实体引擎之间的**唯一写通道**：经 AppBridge（或等价 IPC）送达 Gateway，由 `EntityStore` / `EntityDef` 路由执行，再通过 sync / op-log 回到客户端缓存。
+- **Method** 是宿主意图与服务端实体引擎之间的**唯一写通道**：经 AppBridge（或等价 IPC）送达服务端，由 `EntityStore` / `EntityDef` 路由执行，再通过 sync / op-log 回到客户端缓存。
 - **TypeScript 权威 API**：`entangledMethod(entity, method, args, params?)`（见 `@entangled/react` / `client.ts`）。标准方法名为 `create` · `update` · `delete` · `upsert`；其余字符串为自定义 Method，对应 `EntityDef.actions`。
 - **不允许**在实体数据面上并行存在「另一套写路径」（例如绕过 Method 的直连 HTTP CRUD、随意 `fetch` 改实体表），除非该资源**明确声明**不属于 Entangled 实体域（例如静态资源、一次性 OAuth、非实体 RPC）。
 
@@ -38,9 +38,9 @@
 
 ---
 
-## 第三条：订阅策略 — 由 Gateway 声明
+## 第三条：订阅策略 — 由服务端声明
 
-**谁 lazy、谁 eager、级联订谁，由 Gateway 侧实体定义（及 schema 暴露）声明，不由宿主应用硬编码列表。**
+**谁 lazy、谁 eager、级联订谁，由服务端侧实体定义（及 schema 暴露）声明，不由宿主应用硬编码列表。**
 
 - 客户端只消费 schema（如 `subscriptionMode`、`subscriptionCascade`），执行 subscribe / 级联 subscribe；**不在业务壳层复制一份「要订哪些实体」的魔法常量**（允许临时回退与兼容层，但必须标注为违宪技术债）。
 
@@ -59,10 +59,10 @@
 
 - 首次订阅、op-log 空洞回退等场景一律使用 **`head_n`** 语义：`fetch_data_fn(limit = depth + 1)`，返回窗口内条目并带 `hasMore`。
 - **客户端 `depth`** 优先；**未传**时使用 **`EntityDef.sync_limit`**；二者皆缺失时由引擎常量 **`DEFAULT_STREAM_HEAD_DEPTH`**（见 `entangled/server/sync.py`）兜底，**并**受 **`MAX_STREAM_HEAD_DEPTH`** 上界约束。
-- **宿主**（Gateway）在调用 `resolve_sync` 时必须传入 **`default_stream_depth=EntityDef.sync_limit`**，且 **`fetch_data_fn`** 支持按 `limit` 查询。
+- **宿主（服务端）**在调用 `resolve_sync` 时必须传入 **`default_stream_depth=EntityDef.sync_limit`**，且 **`fetch_data_fn`** 支持按 `limit` 查询。
 
 ---
 
 ## 修订
 
-对本宪法的修改应在版本控制中可审计；破坏性语义变更须同步更新本文与 `@entangled/react` / Gateway 的对外说明。
+对本宪法的修改应在版本控制中可审计；破坏性语义变更须同步更新本文与客户端 / 服务端的对外说明。

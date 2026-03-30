@@ -9,7 +9,7 @@ Architecture:
   EntityStore is a concrete class that dispatches CRUD operations
   to EntityDef handler functions (list_fn, create_fn, etc.).
 
-  Subclasses (like NovAIC's SQL-backed EntityStore) can override
+  Subclasses (like a SQL-backed EntityStore) can override
   list(), list_stream(), exists_before() for storage-specific behavior.
   The base class provides:
     - Entity registration and schema management
@@ -37,7 +37,7 @@ class EntityStoreProtocol(ABC):
     Defines the minimal interface that any entity store must implement.
     Concrete implementations include:
       - EntityStore (this module): fn-pointer dispatch to EntityDef handlers
-      - NovAIC EntityStore (gateway/entity/store.py): SQL-backed with auto-schema
+      - Custom SQL-backed EntityStore: override list/get/create/update/delete with SQL queries
 
     Subclasses MUST call super().__init__(defs) to register entity definitions.
     """

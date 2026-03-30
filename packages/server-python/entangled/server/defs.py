@@ -75,7 +75,7 @@ class EntityDef:
     sync_limit: Optional[int] = None    # stream only; host should set (e.g. 50)
     op_log_size: int = 1000             # max op-log entries per (entity, params)
 
-    # ── Client subscription (declared on Gateway, exposed via get_schema()) ───
+    # ── Client subscription (declared on server, exposed via get_schema()) ───
     # lazy: subscribe only when a hook mounts (default).
     # eager: also subscribe at app startup (before any hook), for global entities.
     # subscription_cascade: after subscribing to this entity, client also subscribes
