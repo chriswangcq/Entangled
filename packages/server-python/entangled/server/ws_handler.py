@@ -41,9 +41,17 @@ class WsSender(Protocol):
 
 from .notifier import register_client, unregister_client, set_store, get_sync_registry
 from .store import EntityStore
-from .sync import resolve_sync
+from .sync import resolve_sync, snapshot_for_resolve, _pk_value_from_row
 
 logger = logging.getLogger(__name__)
+
+# B.3: subscribe delta path called full resolve again (get_ops_since returned None).
+_subscribe_reconcile_fallback_total = 0
+
+
+def get_subscribe_reconcile_fallback_total() -> int:
+    return _subscribe_reconcile_fallback_total
+
 
 # ── Configuration ────────────────────────────────────────────────
 
@@ -244,6 +252,9 @@ async def _subscribe_one(
     registry.subscribe(client_id, entity, params)
 
     state = registry.get_state(entity, params)
+    # Copy op-log/version before any await — then run resolve_sync + DB in a worker thread
+    # (Gateway Database uses thread-local SQLite connections).
+    snap = snapshot_for_resolve(state)
 
     def fetch_data(limit=None):
         return store.list(entity, user_id, params=params or {}, limit=limit)
@@ -258,22 +269,73 @@ async def _subscribe_one(
             def eb_fn(oldest_id: str) -> bool:
                 return store.exists_before(entity, user_id, oldest_id, params=params or {})
 
-    sync_result = resolve_sync(
-        state,
-        client_version=client_version,
-        client_head=client_head,
-        depth=depth,
-        fetch_data_fn=fetch_data,
-        sync_type=defn.sync_type,
-        default_stream_depth=defn.sync_limit,
-        exists_before_fn=eb_fn,
-        data_order=getattr(defn, 'data_order', 'desc'),
+    id_field = getattr(defn, "id_field", "id")
+
+    def _resolve_in_thread():
+        return resolve_sync(
+            snap,
+            client_version=client_version,
+            client_head=client_head,
+            depth=depth,
+            fetch_data_fn=fetch_data,
+            sync_type=defn.sync_type,
+            default_stream_depth=defn.sync_limit,
+            exists_before_fn=eb_fn,
+            data_order=getattr(defn, 'data_order', 'desc'),
+            id_field=id_field,
+        )
+
+    _t0 = time.perf_counter()
+    sync_result = await asyncio.to_thread(_resolve_in_thread)
+    _resolve_ms = (time.perf_counter() - _t0) * 1000.0
+    logger.debug(
+        "[WS] subscribe resolve_thread_ms=%.1f entity=%s client=%s mode=%s",
+        _resolve_ms,
+        entity,
+        client_id[:8],
+        sync_result.get("mode"),
     )
+
+    # Reconcile: version may have advanced while the thread ran; delta ops must match live op_log.
+    fresh = registry.get_state(entity, params)
+    sync_result["version"] = fresh.current_version
+    if sync_result.get("mode") == "delta" and client_version is not None:
+        ops2 = fresh.get_ops_since(client_version)
+        if ops2 is None:
+            global _subscribe_reconcile_fallback_total
+
+            def _reconcile_fallback_resolve():
+                return resolve_sync(
+                    fresh,
+                    client_version=client_version,
+                    client_head=client_head,
+                    depth=depth,
+                    fetch_data_fn=fetch_data,
+                    sync_type=defn.sync_type,
+                    default_stream_depth=defn.sync_limit,
+                    exists_before_fn=eb_fn,
+                    data_order=getattr(defn, 'data_order', 'desc'),
+                    id_field=id_field,
+                )
+
+            sync_result = await asyncio.to_thread(_reconcile_fallback_resolve)
+            sync_result["version"] = registry.get_state(entity, params).current_version
+            _subscribe_reconcile_fallback_total += 1
+            logger.debug(
+                "[WS] reconcile_fallback_to_thread entity=%s client=%s total=%d",
+                entity,
+                client_id[:8],
+                _subscribe_reconcile_fallback_total,
+            )
+        else:
+            sync_result["ops"] = [o.to_dict() for o in ops2]
+            sync_result["baseVersion"] = client_version
 
     frame = {
         "type": "sync",
         "entity": entity,
         "params": params,
+        "idField": id_field,
         **sync_result,
     }
     await ws.send_json(frame)
@@ -375,29 +437,29 @@ async def handle_load_more(
     try:
         defn = store.get_def(entity)
 
-        # Fetch via store.list_stream (cursor-based, returns DESC by default)
-        entries = store.list_stream(
-            entity, user_id,
-            before_id=before_id,
-            limit=limit,
-            params=params,
-        )
-        # DATA ORDER CONTRACT:
-        # entries are in default_order (DESC for messages, ASC for execution-logs).
-        # Rust client prepend_older() expects DESC and reverses internally.
-        # For ASC entities, prepend_older still works because the data is
-        # already chronological — it just needs to be inserted before the
-        # oldest cached item.
+        def _load_more_sync():
+            # Fetch via store.list_stream (cursor-based, returns DESC by default)
+            entries = store.list_stream(
+                entity, user_id,
+                before_id=before_id,
+                limit=limit,
+                params=params,
+            )
+            # DATA ORDER CONTRACT:
+            # entries are in default_order (DESC for messages, ASC for execution-logs).
+            # Rust client prepend_older() expects DESC and reverses internally.
 
-        # Cursor-based hasMore: prefer defn.exists_before_fn, then store.exists_before
-        if not entries:
-            has_more = False
-        elif defn.sync_type == "stream" and (defn.exists_before_fn or hasattr(store, 'exists_before')):
-            oldest_id = entries[-1].get("id") if entries else None
-            has_more = store.exists_before(entity, user_id, oldest_id, params=params) if oldest_id else False
-        else:
-            # Fallback: if we got exactly `limit` items, assume more exist
-            has_more = len(entries) >= limit
+            if not entries:
+                has_more = False
+            elif defn.sync_type == "stream" and (defn.exists_before_fn or hasattr(store, 'exists_before')):
+                id_field = getattr(defn, "id_field", "id")
+                oldest_id = _pk_value_from_row(entries[-1], id_field) if entries else None
+                has_more = store.exists_before(entity, user_id, oldest_id, params=params) if oldest_id else False
+            else:
+                has_more = len(entries) >= limit
+            return entries, has_more
+
+        entries, has_more = await asyncio.to_thread(_load_more_sync)
 
         await ws.send_json({
             "type": "response",
@@ -439,17 +501,19 @@ async def handle_request(ws: WsSender, store: EntityStore, user_id: str, msg: di
         })
 
 
-async def _dispatch(store: EntityStore, user_id: str, data: dict, request_id: str = "") -> dict:
+def _dispatch_entity_ops_blocking(
+    store: EntityStore, user_id: str, data: dict, request_id: str
+) -> dict:
+    """list/get/create/update/… — runs in ``asyncio.to_thread``.
+
+    Host ``EntityStore`` / DB must allow concurrent access from worker threads
+    (e.g. NovAIC ``Database`` thread-local SQLite connections).
+    """
     op = data.get("op", "")
     entity = data.get("entity", "")
     entity_id = data.get("id")
     params = data.get("params") or {}
     payload = data.get("data") or {}
-
-    if not entity:
-        return {"success": False, "error": "entity is required"}
-    if not op:
-        return {"success": False, "error": "op is required"}
 
     try:
         store.get_def(entity)
@@ -461,12 +525,13 @@ async def _dispatch(store: EntityStore, user_id: str, data: dict, request_id: st
             if len(entries) > _MAX_LIST_ENTRIES:
                 entries = entries[:_MAX_LIST_ENTRIES]
             return {"success": True, "entries": entries}
-        elif op == "list_stream":
+        if op == "list_stream":
             before_id = data.get("before_id") or data.get("id_lt")
             after_id = data.get("after_id") or data.get("id_gt")
             limit = min(int(data.get("limit", 50)), 500)
             entries = store.list_stream(
-                entity, user_id,
+                entity,
+                user_id,
                 params=params,
                 before_id=before_id,
                 after_id=after_id,
@@ -476,48 +541,94 @@ async def _dispatch(store: EntityStore, user_id: str, data: dict, request_id: st
             if has_more:
                 entries = entries[:limit]
             return {"success": True, "entries": entries, "has_more": has_more}
-        elif op == "list_all":
-            # list_all: no scope limit (host must implement via list_fn or list_stream_fn)
+        if op == "list_all":
             entries = store.list(entity, user_id, params=params)
             if len(entries) > _MAX_LIST_ENTRIES:
                 entries = entries[:_MAX_LIST_ENTRIES]
             return {"success": True, "entries": entries}
-        elif op == "get":
+        if op == "get":
             if not entity_id:
                 return {"success": False, "error": "id is required for get"}
             item = store.get(entity, user_id, entity_id, params=params)
             if item is None:
                 return {"success": False, "error": f"{entity} {entity_id} not found"}
             return {"success": True, "data": item}
-        elif op == "create":
-            result = store.create(entity, user_id, payload, params=params, request_id=request_id or None)
+        if op == "create":
+            result = store.create(
+                entity, user_id, payload, params=params, request_id=request_id or None
+            )
             return {"success": True, "data": result}
-        elif op == "update":
+        if op == "update":
             if not entity_id:
                 return {"success": False, "error": "id is required for update"}
-            result = store.update(entity, user_id, entity_id, payload, params=params, request_id=request_id or None)
+            result = store.update(
+                entity,
+                user_id,
+                entity_id,
+                payload,
+                params=params,
+                request_id=request_id or None,
+            )
             return {"success": True, "data": result}
-        elif op == "upsert":
+        if op == "upsert":
             if not entity_id:
                 return {"success": False, "error": "id is required for upsert"}
-            result = store.upsert(entity, user_id, entity_id, payload, params=params, request_id=request_id or None)
+            result = store.upsert(
+                entity,
+                user_id,
+                entity_id,
+                payload,
+                params=params,
+                request_id=request_id or None,
+            )
             return {"success": True, "data": result}
-        elif op == "delete":
+        if op == "delete":
             if not entity_id:
                 return {"success": False, "error": "id is required for delete"}
-            ok = store.delete(entity, user_id, entity_id, params=params, request_id=request_id or None)
+            ok = store.delete(
+                entity, user_id, entity_id, params=params, request_id=request_id or None
+            )
             return {"success": True} if ok else {"success": False, "error": "not found"}
-        elif op == "action":
-            action_name = data.get("action_name", "")
-            if not action_name:
-                return {"success": False, "error": "action_name is required"}
-            result = await store.action(entity, user_id, action_name, params, payload)
-            return {"success": True, "data": result}
-        else:
-            return {"success": False, "error": f"Unknown op: {op}"}
+        if op == "action":
+            return {"success": False, "error": "internal: action must run on asyncio loop"}
+        return {"success": False, "error": f"Unknown op: {op}"}
 
     except (KeyError, PermissionError, NotImplementedError) as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
         logger.error("[WS] Dispatch error: %s.%s %s", entity, op, e)
         return {"success": False, "error": str(e)}
+
+
+async def _dispatch(store: EntityStore, user_id: str, data: dict, request_id: str = "") -> dict:
+    op = data.get("op", "")
+    entity = data.get("entity", "")
+    params = data.get("params") or {}
+    payload = data.get("data") or {}
+
+    if not entity:
+        return {"success": False, "error": "entity is required"}
+    if not op:
+        return {"success": False, "error": "op is required"}
+
+    if op == "action":
+        action_name = data.get("action_name", "")
+        if not action_name:
+            return {"success": False, "error": "action_name is required"}
+        try:
+            store.get_def(entity)
+            result = await store.action(
+                entity, user_id, action_name, params, payload
+            )
+            return {"success": True, "data": result}
+        except (KeyError, PermissionError, NotImplementedError) as e:
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(
+                "[WS] Dispatch error: %s.action %s %s", entity, action_name, e
+            )
+            return {"success": False, "error": str(e)}
+
+    return await asyncio.to_thread(
+        _dispatch_entity_ops_blocking, store, user_id, data, request_id
+    )

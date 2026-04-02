@@ -29,6 +29,15 @@ from .defs import EntityDef
 logger = logging.getLogger(__name__)
 
 
+def _primary_key_value_from_row(result: dict, defn: EntityDef) -> Optional[str]:
+    """Extract string PK for sync notifications (supports non-`id` id_field, int PKs)."""
+    id_field = getattr(defn, "id_field", None) or "id"
+    v = result.get(id_field)
+    if v is None:
+        return None
+    return str(v)
+
+
 # ── Protocol: storage abstraction ────────────────────────────────
 
 class EntityStoreProtocol(ABC):
@@ -313,7 +322,7 @@ class EntityStore(EntityStoreProtocol):
         if notify:
             self._notify_change(
                 entity, "created", user_id,
-                entity_id=result.get("id") if isinstance(result, dict) else None,
+                entity_id=_primary_key_value_from_row(result, defn) if isinstance(result, dict) else None,
                 params=params,
                 data=result,
                 request_id=request_id,
@@ -460,8 +469,9 @@ class EntityStore(EntityStoreProtocol):
         except KeyError:
             pass
 
-        from .notifier import notify_entity_change
-        notify_entity_change(
+        from .push_port import get_sync_push_port
+
+        get_sync_push_port().notify_entity_change(
             user_id, entity, action,
             entity_id=entity_id,
             params=params,

@@ -82,11 +82,14 @@ def get_connected_count() -> int:
 def reset_state() -> None:
     """Clear all runtime state (for testing)."""
     global _store, _sync_registry
+    from .push_port import set_sync_push_port
+
     _clients.clear()
     _store = None
     if _sync_registry:
         _sync_registry.reset()
     _sync_registry = None
+    set_sync_push_port(None)
 
 
 # ── Entity change notification ───────────────────────────────────
@@ -101,7 +104,11 @@ def _action_to_op(action: str) -> str:
     }.get(action, "update")
 
 
-def notify_entity_change(
+# ADR-7: bound cascade fan-out / graph depth (misconfig or cycles).
+_MAX_CASCADE_DEPTH = 48
+
+
+def _inproc_notify_entity_change(
     user_id: str,
     entity: str,
     action: str,
@@ -111,12 +118,7 @@ def notify_entity_change(
     data: Optional[Dict[str, Any]] = None,
     request_id: Optional[str] = None,
 ) -> None:
-    """Record mutation + push delta to ALL subscribed clients + cascade.
-
-    NOTE: Pushes to all subscribers, not just the triggering user.
-    This enables multi-user collaboration — when user A changes data,
-    user B sees it automatically if subscribed.
-    """
+    """In-process implementation: record op, push delta, cascade."""
     registry = _get_registry()
     op_type = _action_to_op(action)
 
@@ -129,10 +131,18 @@ def notify_entity_change(
     # 2. Push delta to ALL subscribed clients (not just triggering user)
     subscribed = registry.get_subscribed_clients(entity, params)
     if subscribed:
+        id_field = "id"
+        if _store is not None:
+            try:
+                _defn = _store.get_def(entity)
+                id_field = getattr(_defn, "id_field", "id")
+            except KeyError:
+                pass
         delta_frame = {
             "type": "sync",
             "entity": entity,
             "params": params if params else None,
+            "idField": id_field,
             "mode": "delta",
             "version": state.current_version,
             "baseVersion": state.current_version - 1,
@@ -158,7 +168,7 @@ def notify_entity_change(
 
     # 3. Cascade to dependent entities
     if _store is not None:
-        _cascade(entity, action, params or {}, entity_id, visited=set())
+        _cascade(entity, action, params or {}, entity_id, visited=set(), depth=0)
 
 
 def _cascade(
@@ -167,11 +177,21 @@ def _cascade(
     source_params: Dict[str, str],
     entity_id: Optional[str],
     visited: Set[str],
+    *,
+    depth: int = 0,
 ) -> None:
     """Walk relation graph — push invalidation to dependent entities.
 
     Pushes to ALL subscribers of each dependent entity.
     """
+    if depth >= _MAX_CASCADE_DEPTH:
+        logger.warning(
+            "[Notifier] cascade stopped at depth cap (%d) entity=%s action=%s",
+            _MAX_CASCADE_DEPTH,
+            entity,
+            action,
+        )
+        return
     try:
         defn = _store.get_def(entity)
     except KeyError:
@@ -217,10 +237,17 @@ def _cascade(
         # Push to subscribers
         subscribed = registry.get_subscribed_clients(rel.target, target_params if target_params else None)
         if subscribed:
+            tgt_id_field = "id"
+            try:
+                tgt_defn = _store.get_def(rel.target)
+                tgt_id_field = getattr(tgt_defn, "id_field", "id")
+            except KeyError:
+                pass
             frame = {
                 "type": "sync",
                 "entity": rel.target,
                 "params": target_params if target_params else None,
+                "idField": tgt_id_field,
                 "mode": "delta",
                 "version": state.current_version,
                 "baseVersion": state.current_version - 1,
@@ -237,7 +264,62 @@ def _cascade(
                     logger.warning("[Notifier] Cascade push to %s failed: %s", cid, e)
 
         # Recurse
-        _cascade(rel.target, action, target_params, None, visited)
+        _cascade(rel.target, action, target_params, None, visited, depth=depth + 1)
+
+
+class InProcSyncPushPort:
+    """Default C.1 implementation: process-local registry + client push_fn map."""
+
+    def notify_entity_change(
+        self,
+        user_id: str,
+        entity: str,
+        action: str,
+        *,
+        entity_id: Optional[str] = None,
+        params: Optional[Dict[str, str]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        request_id: Optional[str] = None,
+    ) -> None:
+        _inproc_notify_entity_change(
+            user_id,
+            entity,
+            action,
+            entity_id=entity_id,
+            params=params,
+            data=data,
+            request_id=request_id,
+        )
+
+
+_default_inproc_push_port = InProcSyncPushPort()
+
+
+def notify_entity_change(
+    user_id: str,
+    entity: str,
+    action: str,
+    *,
+    entity_id: Optional[str] = None,
+    params: Optional[Dict[str, str]] = None,
+    data: Optional[Dict[str, Any]] = None,
+    request_id: Optional[str] = None,
+) -> None:
+    """Record mutation + push delta to ALL subscribed clients + cascade.
+
+    Delegates to SyncPushPort (see push_port.set_sync_push_port).
+    """
+    from .push_port import get_sync_push_port
+
+    get_sync_push_port().notify_entity_change(
+        user_id,
+        entity,
+        action,
+        entity_id=entity_id,
+        params=params,
+        data=data,
+        request_id=request_id,
+    )
 
 
 def notify_all(event: str, data: Optional[dict] = None) -> None:

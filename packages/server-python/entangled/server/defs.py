@@ -125,6 +125,8 @@ class EntityDef:
         return {
             "name": self.name,
             "keyParams": self.key_params,
+            # Primary-key JSON field for rows (NovAIC EntityDef; default "id" for generic hosts)
+            "idField": getattr(self, "id_field", "id"),
             "pushEvents": self.push_events or [],
             "syncType": self.sync_type,
             "syncLimit": self.sync_limit,

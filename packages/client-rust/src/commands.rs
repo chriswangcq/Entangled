@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::path::PathBuf;
 
 use crate::cache::{Cache, CacheKey};
-use crate::push::{process_sync, SyncFrame};
+use crate::push::{default_id_field_for_entity, process_sync, SyncFrame};
 use crate::schema::SchemaRegistry;
 
 // ── Subscription Registry (ref-counted, Rust-owned) ─────────────────────
@@ -222,7 +222,7 @@ pub async fn entity_apply_sync(
         .map_err(|e| format!("Invalid sync frame: {}", e))?;
 
     let cache = &state.cache;
-    let changed = process_sync(&cache, &sync_frame, "id");
+    let changed = process_sync(&cache, &sync_frame);
     Ok(changed.map(|c| c.entity))
 }
 
@@ -263,7 +263,8 @@ pub async fn entity_prepend_page(
 ) -> Result<usize, String> {
     let key = make_key(&entity, params);
     let cache = &state.cache;
-    let count = cache.prepend_older(&key, &items, has_more, "id");
+    let id_field = default_id_field_for_entity(&entity);
+    let count = cache.prepend_older(&key, &items, has_more, id_field);
 
     tracing::info!(
         "[Cache] {} prepend_page: {} items, has_more={}",

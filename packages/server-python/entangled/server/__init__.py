@@ -43,7 +43,13 @@ from .ws_handler import (
     handle_load_more,
     handle_request,
 )
-from .notifier import notify_entity_change, reset_state, get_connected_count
+from .notifier import (
+    notify_entity_change,
+    reset_state,
+    get_connected_count,
+    InProcSyncPushPort,
+)
+from .push_port import SyncPushPort, get_sync_push_port, set_sync_push_port
 
 __all__ = [
     # Types
@@ -73,9 +79,13 @@ __all__ = [
     "handle_unsubscribe",
     "handle_load_more",
     "handle_request",
-    # Notifier
+    # Notifier / push port (C.1)
     "notify_entity_change",
     "reset_state",
     "get_connected_count",
+    "InProcSyncPushPort",
+    "SyncPushPort",
+    "get_sync_push_port",
+    "set_sync_push_port",
 ]
 
