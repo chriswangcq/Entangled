@@ -12,6 +12,7 @@ use std::collections::HashMap;
 /// push events correspond to which entity. Relations, key_params,
 /// and other schema details are server-side concerns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EntitySchema {
     /// Entity name, e.g. "todos"
     pub name: String,
@@ -21,6 +22,9 @@ pub struct EntitySchema {
     /// Push events this entity subscribes to
     #[serde(default)]
     pub push_events: Vec<String>,
+    /// Row PK JSON field when server includes it (Sync Contract schema).
+    #[serde(default)]
+    pub id_field: Option<String>,
 }
 
 /// Schema registry — maps push events to entity names.

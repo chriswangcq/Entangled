@@ -550,14 +550,25 @@ impl Cache {
         }
 
         if !items.is_empty() && inserted < items.len() {
-            tracing::warn!(
-                target: "entangled_cache",
-                entity = %key.entity,
-                id_field = %id_field,
-                total = items.len(),
-                inserted,
-                "snapshot: some rows skipped (wrong id_field or non-string/non-number id)"
-            );
+            if inserted == 0 {
+                tracing::warn!(
+                    target: "entangled_cache",
+                    entity = %key.entity,
+                    params_hash = key.params_hash,
+                    id_field = %id_field,
+                    n = items.len(),
+                    "snapshot anomaly: zero rows inserted (id_field likely mismatches JSON row keys)"
+                );
+            } else {
+                tracing::warn!(
+                    target: "entangled_cache",
+                    entity = %key.entity,
+                    id_field = %id_field,
+                    total = items.len(),
+                    inserted,
+                    "snapshot: some rows skipped (wrong id_field or non-string/non-number id)"
+                );
+            }
         }
 
         tx.execute(

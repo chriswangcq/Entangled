@@ -81,9 +81,35 @@ pub struct SyncFrame {
 /// Re-export for callers that use `push::default_id_field_for_entity`.
 pub use crate::id_field::default_id_field_for_entity;
 
-/// Process a sync frame from the server.
+/// Minimum advertised `syncContractVersion` where snapshot/head_n frames MUST carry `idField`.
+pub const SYNC_CONTRACT_V2_MIN: u32 = 2;
+
+/// Process a sync frame from the server (no contract enforcement — use `process_sync_with_contract` in hosts).
 /// Returns what changed (for emitting to React).
 pub fn process_sync(cache: &Cache, frame: &SyncFrame) -> Option<EntityChanged> {
+    process_sync_with_contract(cache, frame, 0)
+}
+
+/// Like [`process_sync`], but enforces observability for Sync Contract v2+ when `sync_contract_version >= SYNC_CONTRACT_V2_MIN`.
+pub fn process_sync_with_contract(
+    cache: &Cache,
+    frame: &SyncFrame,
+    sync_contract_version: u32,
+) -> Option<EntityChanged> {
+    if sync_contract_version >= SYNC_CONTRACT_V2_MIN
+        && frame.id_field.is_none()
+        && matches!(frame.mode.as_str(), "snapshot" | "head_n")
+    {
+        tracing::error!(
+            target: "entangled_sync_contract",
+            entity = %frame.entity,
+            mode = %frame.mode,
+            contract_version = sync_contract_version,
+            metric = "sync_frame_missing_id_field_v2",
+            "Sync Contract v2: snapshot/head_n missing idField (using default_id_field fallback)"
+        );
+    }
+
     let id_field = frame
         .id_field
         .as_deref()

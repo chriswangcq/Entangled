@@ -51,7 +51,7 @@ pub mod commands;
 // Re-exports for convenience
 pub use auth::AuthProvider;
 pub use client::{EntangledClient, EntangledConfig};
-pub use push::{EntityChanged, SyncFrame};
+pub use push::{EntityChanged, SyncFrame, SYNC_CONTRACT_V2_MIN, process_sync_with_contract};
 pub use id_field::default_id_field_for_entity;
 pub use cache::{Cache, CacheKey};
 #[cfg(feature = "tauri")]
