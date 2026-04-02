@@ -113,7 +113,7 @@ impl EntangledClient {
                 if let Ok(frame) = serde_json::from_value::<SyncFrame>(val) {
                     let changed = {
                         let cache = client_clone.cache.lock().unwrap();
-                        push::process_sync(&cache, &frame, "id")
+                        push::process_sync(&cache, &frame)
                     };
                     if let Some(changed) = changed {
                         let _ = client_clone.change_tx.send(changed);
@@ -149,7 +149,7 @@ impl EntangledClient {
     pub fn handle_sync_frame(&self, val: Value) -> Option<EntityChanged> {
         let frame: SyncFrame = serde_json::from_value(val).ok()?;
         let cache = self.cache.lock().unwrap();
-        let changed = push::process_sync(&cache, &frame, "id")?;
+        let changed = push::process_sync(&cache, &frame)?;
         let _ = self.change_tx.send(changed.clone());
         Some(changed)
     }

@@ -55,13 +55,18 @@ pub struct EntityChanged {
 }
 
 /// Incoming sync frame from server (server uses camelCase for several fields).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncFrame {
     pub entity: String,
     pub params: Option<serde_json::Map<String, Value>>,
     pub mode: String,  // "snapshot" | "delta" | "head_n" | "up_to_date"
     pub version: u64,
+
+    /// Primary key field name (e.g. "id", "model_id"). Sent by server.
+    /// If absent, client uses `default_id_field_for_entity` (build-time generated from
+    /// `generated_entity_id_fields.json`; sync via `scripts/sync_entity_id_fields.sh`).
+    pub id_field: Option<String>,
 
     // snapshot / head_n
     pub data: Option<Vec<Value>>,
@@ -73,13 +78,16 @@ pub struct SyncFrame {
     pub ops: Option<Vec<SyncOp>>,
 }
 
+/// Re-export for callers that use `push::default_id_field_for_entity`.
+pub use crate::id_field::default_id_field_for_entity;
+
 /// Process a sync frame from the server.
 /// Returns what changed (for emitting to React).
-pub fn process_sync(
-    cache: &Cache,
-    frame: &SyncFrame,
-    id_field: &str,
-) -> Option<EntityChanged> {
+pub fn process_sync(cache: &Cache, frame: &SyncFrame) -> Option<EntityChanged> {
+    let id_field = frame
+        .id_field
+        .as_deref()
+        .unwrap_or_else(|| default_id_field_for_entity(&frame.entity));
     let key = match &frame.params {
         Some(p) => CacheKey::new(&frame.entity, p),
         None => CacheKey::new_empty(&frame.entity),
@@ -157,8 +165,9 @@ pub fn process_sync(
         }
 
         "up_to_date" => {
+            cache.align_version_from_server(&key, frame.version);
             tracing::debug!("[Sync] {} up_to_date v{}", frame.entity, frame.version);
-            None // No change needed
+            None
         }
 
         _ => {

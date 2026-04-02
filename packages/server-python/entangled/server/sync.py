@@ -17,9 +17,20 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
+
+
+def _pk_value_from_row(row: Optional[dict], id_field: str) -> Optional[str]:
+    """Normalize PK from a sync row for cursor / exists_before (int or str)."""
+    if not row:
+        return None
+    v = row.get(id_field)
+    if v is None:
+        return None
+    return str(v)
+
 
 # Fallback when client and EntityDef both omit a stream window (keep in sync with typical sync_limit).
 DEFAULT_STREAM_HEAD_DEPTH: int = 50
@@ -100,6 +111,37 @@ class SyncState:
 
     def unsubscribe(self, client_id: str) -> None:
         self.subscribers.pop(client_id, None)
+
+
+class SyncStateSnapshot:
+    """Immutable copy of :class:`SyncState` for running :func:`resolve_sync` in ``asyncio.to_thread``.
+
+    The live ``SyncState`` is mutated on the asyncio thread by :meth:`SyncRegistry.record_op`.
+    Passing a snapshot avoids races. Call :func:`snapshot_for_resolve` immediately after
+    ``subscribe``, with no ``await`` between snapshot and subscribe, then reconcile version
+    / delta on the event loop (see ``ws_handler._subscribe_one``).
+    """
+
+    __slots__ = ("current_version", "_op_log")
+
+    def __init__(self, current_version: int, op_log: List[SyncOp]):
+        self.current_version = current_version
+        self._op_log = op_log
+
+    def get_ops_since(self, since_version: int) -> Optional[List[SyncOp]]:
+        if since_version >= self.current_version:
+            return []
+        ops = [e for e in self._op_log if e.version > since_version]
+        if not ops:
+            return None
+        if ops[0].version != since_version + 1:
+            return None
+        return ops
+
+
+def snapshot_for_resolve(state: SyncState) -> SyncStateSnapshot:
+    """Build a thread-safe snapshot (deque copied to list)."""
+    return SyncStateSnapshot(state.current_version, list(state.op_log))
 
 
 # ── Sync State Registry ─────────────────────────────────────────
@@ -244,7 +286,7 @@ def _effective_stream_depth(
 
 
 def _stream_head_n_sync(
-    state: SyncState,
+    state: Union[SyncState, SyncStateSnapshot],
     fetch_data_fn: Callable,
     depth: Optional[int],
     default_stream_depth: Optional[int],
@@ -252,6 +294,7 @@ def _stream_head_n_sync(
     reason: str = "subscribe",
     exists_before_fn: Optional[Callable[[str], bool]] = None,
     data_order: str = "desc",
+    id_field: str = "id",
 ) -> dict:
     """
     Bounded sync for stream entities.
@@ -276,7 +319,7 @@ def _stream_head_n_sync(
             has_more = False
         else:
             oldest = data[0] if data else None
-            oldest_id = oldest.get("id") if oldest else None
+            oldest_id = _pk_value_from_row(oldest, id_field)
             has_more = exists_before_fn(oldest_id) if oldest_id else False
         items = data
     else:
@@ -308,7 +351,7 @@ def _stream_head_n_sync(
 
 
 def resolve_sync(
-    state: SyncState,
+    state: Union[SyncState, SyncStateSnapshot],
     client_version: Optional[int],
     client_head: Optional[str],
     depth: Optional[int],
@@ -318,6 +361,7 @@ def resolve_sync(
     default_stream_depth: Optional[int] = None,
     exists_before_fn: Optional[Callable[[str], bool]] = None,
     data_order: str = "desc",
+    id_field: str = "id",
 ) -> dict:
     """Decide sync mode (like git smart protocol).
 
@@ -337,6 +381,7 @@ def resolve_sync(
         data_order: The ordering of data returned by ``fetch_data_fn``.
             ``"desc"`` = newest first (default), ``"asc"`` = oldest first.
             The sync engine normalizes all output to ASC before sending to clients.
+        id_field: JSON / row key for the entity primary key (for stream hasMore cursor).
 
     Returns:
         Dict with ``mode``, ``version``, and optional ``data`` / ``ops`` / ``hasMore``.
@@ -353,6 +398,7 @@ def resolve_sync(
                 reason="first_subscribe",
                 exists_before_fn=exists_before_fn,
                 data_order=data_order,
+                id_field=id_field,
             )
         data = fetch_data_fn()
         return {
@@ -396,6 +442,7 @@ def resolve_sync(
             reason="op_log_gap",
             exists_before_fn=exists_before_fn,
             data_order=data_order,
+            id_field=id_field,
         )
 
     data = fetch_data_fn()

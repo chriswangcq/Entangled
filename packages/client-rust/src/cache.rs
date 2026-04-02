@@ -11,9 +11,36 @@ use rusqlite::params;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::id_field::default_id_field_for_entity;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
+
+fn log_pool_checkout(err: &r2d2::Error, op: &'static str) {
+    tracing::error!(target: "entangled_cache", error = %err, op, "SQLite pool checkout failed");
+}
+
+macro_rules! pool_conn {
+    ($self:expr, $op:literal) => {
+        match $self.checkout() {
+            Ok(c) => c,
+            Err(e) => {
+                log_pool_checkout(&e, $op);
+                return;
+            }
+        }
+    };
+    ($self:expr, $op:literal, $ret:expr) => {
+        match $self.checkout() {
+            Ok(c) => c,
+            Err(e) => {
+                log_pool_checkout(&e, $op);
+                return $ret;
+            }
+        }
+    };
+}
 
 // ── Sync Op (matches protocol) ──────────────────────────────────
 
@@ -58,6 +85,9 @@ impl CacheKey {
 }
 
 /// Hash params deterministically.
+///
+/// Used for `CacheKey.params_hash`. **Not** byte-identical to Python `_state_key` string
+/// (see `docs/entangled-params-canonical.md`); NovAIC relies on consistent JSON on the wire.
 pub fn hash_params(params: &serde_json::Map<String, Value>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let mut keys: Vec<&String> = params.keys().collect();
@@ -69,6 +99,56 @@ pub fn hash_params(params: &serde_json::Map<String, Value>) -> u64 {
         }
     }
     hasher.finish()
+}
+
+#[cfg(test)]
+mod hash_params_tests {
+    use super::{hash_params, CacheKey};
+    use serde_json::{json, Map, Value};
+
+    fn map_obj(items: &[(&str, Value)]) -> serde_json::Map<String, Value> {
+        let mut m = Map::new();
+        for (k, v) in items {
+            m.insert((*k).to_string(), v.clone());
+        }
+        m
+    }
+
+    #[test]
+    fn hash_stable_for_same_map() {
+        let a = map_obj(&[("agent_id", json!("abc"))]);
+        let b = map_obj(&[("agent_id", json!("abc"))]);
+        assert_eq!(hash_params(&a), hash_params(&b));
+    }
+
+    #[test]
+    fn key_order_independent() {
+        let m1 = map_obj(&[("a", json!("1")), ("b", json!("2"))]);
+        let m2 = map_obj(&[("b", json!("2")), ("a", json!("1"))]);
+        assert_eq!(hash_params(&m1), hash_params(&m2));
+    }
+
+    #[test]
+    fn different_values_differ() {
+        let m1 = map_obj(&[("agent_id", json!("x"))]);
+        let m2 = map_obj(&[("agent_id", json!("y"))]);
+        assert_ne!(hash_params(&m1), hash_params(&m2));
+    }
+
+    #[test]
+    fn new_empty_subscription_uses_zero_params_hash() {
+        let key = CacheKey::new_empty("messages");
+        assert_eq!(key.params_hash, 0);
+    }
+
+    /// Absent params use `CacheKey::new_empty`, not `CacheKey::new` with `{}`.
+    #[test]
+    fn empty_json_object_map_is_not_same_partition_as_new_empty() {
+        let empty = Map::new();
+        let via_new = CacheKey::new("messages", &empty);
+        let via_empty = CacheKey::new_empty("messages");
+        assert_ne!(via_new.params_hash, via_empty.params_hash);
+    }
 }
 
 // ── EntityMeta ──────────────────────────────────────────────────
@@ -141,8 +221,14 @@ impl Cache {
         cache
     }
 
+    fn checkout(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error> {
+        self.pool.get()
+    }
+
     fn init_schema(&self) {
-        let conn = self.pool.get().unwrap();
+        let conn = self
+            .checkout()
+            .expect("Failed to checkout SQLite connection for init_schema");
         conn.execute_batch("
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
@@ -210,7 +296,7 @@ impl Cache {
 
     /// Touch last_accessed timestamp for a cache key.
     fn touch(&self, key: &CacheKey) {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "touch");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -224,7 +310,7 @@ impl Cache {
     /// Evict cache entries not accessed in the last `max_age_secs` seconds.
     /// Returns number of entries evicted.
     pub fn gc_stale(&self, max_age_secs: u64) -> usize {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "gc_stale", 0);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -264,7 +350,7 @@ impl Cache {
 
     /// Get metadata for a cache key.
     pub fn get_meta(&self, key: &CacheKey) -> EntityMeta {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "get_meta", EntityMeta::default());
         conn.query_row(
             "SELECT version, subscribed, has_more FROM entity_meta WHERE entity = ?1 AND params_hash = ?2",
             params![key.entity, key.params_hash as i64],
@@ -279,7 +365,7 @@ impl Cache {
     /// Upsert meta (single SQL, no SELECT+UPDATE dance).
     #[allow(dead_code)]
     fn upsert_meta(&self, key: &CacheKey, version: u64, subscribed: bool, has_more: bool) {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "upsert_meta");
         conn.execute(
             "INSERT INTO entity_meta (entity, params_hash, version, subscribed, has_more)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -291,9 +377,28 @@ impl Cache {
         ).ok();
     }
 
+    /// After an `up_to_date` sync frame, align persisted version with server without touching rows.
+    pub fn align_version_from_server(&self, key: &CacheKey, server_version: u64) {
+        let m = self.get_meta(key);
+        let conn = pool_conn!(self, "align_version_from_server");
+        conn.execute(
+            "INSERT INTO entity_meta (entity, params_hash, version, subscribed, has_more)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(entity, params_hash) DO UPDATE SET version = excluded.version",
+            params![
+                key.entity,
+                key.params_hash as i64,
+                server_version as i64,
+                m.subscribed,
+                m.has_more_before
+            ],
+        )
+        .ok();
+    }
+
     /// Set subscribed flag only.
     pub fn set_subscribed(&self, key: &CacheKey, subscribed: bool) {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "set_subscribed");
         conn.execute(
             "INSERT INTO entity_meta (entity, params_hash, subscribed)
              VALUES (?1, ?2, ?3)
@@ -329,7 +434,7 @@ impl Cache {
     /// Get all items in order. Also touches last_accessed for TTL.
     pub fn get_list(&self, key: &CacheKey) -> Vec<Value> {
         self.touch(key);
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "get_list", Vec::new());
         let mut stmt = conn.prepare_cached(
             "SELECT data FROM entity_items WHERE entity = ?1 AND params_hash = ?2 ORDER BY seq ASC"
         ).unwrap();
@@ -347,7 +452,7 @@ impl Cache {
 
     /// Get a single item by ID.
     pub fn get_item(&self, key: &CacheKey, id: &str) -> Option<Value> {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "get_item", None);
         conn.query_row(
             "SELECT data FROM entity_items WHERE entity = ?1 AND params_hash = ?2 AND item_id = ?3",
             params![key.entity, key.params_hash as i64, id],
@@ -361,7 +466,7 @@ impl Cache {
     /// Upsert a single item (used by public apply_delta internally — keep for future direct use).
     #[allow(dead_code)]
     fn upsert_item(&self, key: &CacheKey, id: &str, data: &Value) {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "upsert_item");
         let json_str = serde_json::to_string(data).unwrap_or_default();
         let seq = next_seq();
         conn.execute(
@@ -375,7 +480,7 @@ impl Cache {
     /// Delete a single item.
     #[allow(dead_code)]
     fn delete_item(&self, key: &CacheKey, id: &str) {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "delete_item");
         conn.execute(
             "DELETE FROM entity_items WHERE entity = ?1 AND params_hash = ?2 AND item_id = ?3",
             params![key.entity, key.params_hash as i64, id],
@@ -384,7 +489,7 @@ impl Cache {
 
     /// Delete all items for a key.
     fn clear_items(&self, key: &CacheKey) {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "clear_items");
         conn.execute(
             "DELETE FROM entity_items WHERE entity = ?1 AND params_hash = ?2",
             params![key.entity, key.params_hash as i64],
@@ -393,28 +498,66 @@ impl Cache {
 
     // ── Snapshot / Delta / Prepend ───────────────────────────────
 
+    /// String id for SQLite `item_id` — supports string or numeric JSON (e.g. execution-logs `id`).
+    pub fn item_id_string(item: &Value, id_field: &str) -> Option<String> {
+        item.get(id_field).and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+    }
+
     /// Apply a full snapshot (git clone / re-clone).
     /// Use `has_more = false` for full snapshots, `true` for head_n partial syncs.
     pub fn apply_snapshot(&self, key: &CacheKey, items: &[Value], version: u64, id_field: &str, has_more: bool) {
         // Wrap in transaction: DELETE + N INSERTs + meta update → 1 fsync
-        let conn = self.pool.get().unwrap();
-        let tx = conn.unchecked_transaction().unwrap();
+        let conn = pool_conn!(self, "apply_snapshot");
+        let tx = match conn.unchecked_transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    target: "entangled_cache",
+                    error = %e,
+                    op = "apply_snapshot",
+                    "SQLite transaction start failed"
+                );
+                return;
+            }
+        };
         tx.execute(
             "DELETE FROM entity_items WHERE entity = ?1 AND params_hash = ?2",
             params![key.entity, key.params_hash as i64],
         ).ok();
 
+        let mut inserted = 0usize;
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO entity_items (entity, params_hash, item_id, data, seq) VALUES (?1, ?2, ?3, ?4, ?5)"
             ).unwrap();
             for item in items {
-                if let Some(id) = item.get(id_field).and_then(|v| v.as_str()) {
+                if let Some(id) = Self::item_id_string(item, id_field) {
                     let json_str = serde_json::to_string(item).unwrap_or_default();
                     let seq = next_seq();
-                    stmt.execute(params![key.entity, key.params_hash as i64, id, json_str, seq]).ok();
+                    if stmt
+                        .execute(params![key.entity, key.params_hash as i64, id, json_str, seq])
+                        .unwrap_or(0)
+                        > 0
+                    {
+                        inserted += 1;
+                    }
                 }
             }
+        }
+
+        if !items.is_empty() && inserted < items.len() {
+            tracing::warn!(
+                target: "entangled_cache",
+                entity = %key.entity,
+                id_field = %id_field,
+                total = items.len(),
+                inserted,
+                "snapshot: some rows skipped (wrong id_field or non-string/non-number id)"
+            );
         }
 
         tx.execute(
@@ -449,8 +592,19 @@ impl Cache {
         }
 
         // Wrap all ops in a single transaction
-        let conn = self.pool.get().unwrap();
-        let tx = conn.unchecked_transaction().unwrap();
+        let conn = pool_conn!(self, "apply_delta", false);
+        let tx = match conn.unchecked_transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    target: "entangled_cache",
+                    error = %e,
+                    op = "apply_delta",
+                    "SQLite transaction start failed"
+                );
+                return false;
+            }
+        };
         let mut has_invalidate = false;
 
         for op in ops {
@@ -553,20 +707,32 @@ impl Cache {
     /// Prepend older items to the front (stream backward pagination).
     /// Returns number of items actually prepended.
     pub fn prepend_older(&self, key: &CacheKey, items: &[Value], has_more: bool, id_field: &str) -> usize {
+        let conn = pool_conn!(self, "prepend_older", 0);
         // Get the current minimum seq for this entity
-        let conn = self.pool.get().unwrap();
-        let min_seq: i64 = conn.query_row(
-            "SELECT COALESCE(MIN(seq), 0) FROM entity_items WHERE entity = ?1 AND params_hash = ?2",
-            params![key.entity, key.params_hash as i64],
-            |row: &rusqlite::Row| row.get(0),
-        ).unwrap_or(0);
+        let min_seq: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MIN(seq), 0) FROM entity_items WHERE entity = ?1 AND params_hash = ?2",
+                params![key.entity, key.params_hash as i64],
+                |row: &rusqlite::Row| row.get(0),
+            )
+            .unwrap_or(0);
 
         // Items come in newest-first order from server (DESC), reverse to get chronological
         let items_reversed: Vec<&Value> = items.iter().rev().collect();
         let total = items_reversed.len() as i64;
 
-        let conn = self.pool.get().unwrap();
-        let tx = conn.unchecked_transaction().unwrap();
+        let tx = match conn.unchecked_transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    target: "entangled_cache",
+                    error = %e,
+                    op = "prepend_older",
+                    "SQLite transaction start failed"
+                );
+                return 0;
+            }
+        };
         let mut count = 0usize;
 
         {
@@ -575,7 +741,7 @@ impl Cache {
             ).unwrap();
 
             for (i, item) in items_reversed.iter().enumerate() {
-                if let Some(id) = item.get(id_field).and_then(|v| v.as_str()) {
+                if let Some(id) = Self::item_id_string(item, id_field) {
                     let json_str = serde_json::to_string(item).unwrap_or_default();
                     let seq = min_seq - total + i as i64;
                     let inserted = insert_stmt.execute(
@@ -598,6 +764,17 @@ impl Cache {
 
         tx.commit().ok();
 
+        if !items.is_empty() && count < items.len() {
+            tracing::warn!(
+                target: "entangled_cache",
+                entity = %key.entity,
+                id_field = %id_field,
+                total = items.len(),
+                inserted = count,
+                "prepend_older: some rows skipped or duplicate item_id"
+            );
+        }
+
         tracing::info!(
             "[Cache] {} prepend: {} items (of {}), has_more={}",
             key.entity, count, items.len(), has_more
@@ -610,7 +787,7 @@ impl Cache {
     /// Remove all data for a key.
     pub fn remove(&self, key: &CacheKey) {
         self.clear_items(key);
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "remove");
         conn.execute(
             "DELETE FROM entity_meta WHERE entity = ?1 AND params_hash = ?2",
             params![key.entity, key.params_hash as i64],
@@ -619,7 +796,7 @@ impl Cache {
 
     /// Clear everything.
     pub fn clear_all(&self) {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "clear_all");
         conn.execute_batch("
             DELETE FROM entity_items;
             DELETE FROM entity_meta;
@@ -628,7 +805,7 @@ impl Cache {
 
     /// Get all cache keys for a given entity name.
     pub fn keys_for_entity(&self, entity: &str) -> Vec<CacheKey> {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "keys_for_entity", Vec::new());
         let mut stmt = conn.prepare_cached(
             "SELECT params_hash FROM entity_meta WHERE entity = ?1"
         ).unwrap();
@@ -648,7 +825,7 @@ impl Cache {
 
     /// Get item count for a key.
     pub fn item_count(&self, key: &CacheKey) -> usize {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "item_count", 0);
         conn.query_row(
             "SELECT COUNT(*) FROM entity_items WHERE entity = ?1 AND params_hash = ?2",
             params![key.entity, key.params_hash as i64],
@@ -658,7 +835,7 @@ impl Cache {
 
     /// Database size in bytes (for diagnostics).
     pub fn db_size(&self) -> u64 {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "db_size", 0);
         let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r: &rusqlite::Row| r.get(0)).unwrap_or(0);
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r: &rusqlite::Row| r.get(0)).unwrap_or(4096);
         (page_count * page_size) as u64
@@ -676,7 +853,7 @@ impl Cache {
         item_id: &str,
         data: &Value,
     ) {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "add_pending_op");
         let json_str = serde_json::to_string(data).unwrap_or_default();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -692,7 +869,7 @@ impl Cache {
 
     /// Mark a pending op as failed.
     pub fn fail_pending_op(&self, request_id: &str, error: &str) {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "fail_pending_op");
         conn.execute(
             "UPDATE pending_ops SET status = 'failed', error = ?2 WHERE request_id = ?1",
             params![request_id, error],
@@ -701,7 +878,7 @@ impl Cache {
 
     /// Remove a pending op by request_id (on success or manual cleanup).
     pub fn remove_pending_op(&self, request_id: &str) {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "remove_pending_op");
         conn.execute(
             "DELETE FROM pending_ops WHERE request_id = ?1",
             params![request_id],
@@ -710,7 +887,7 @@ impl Cache {
 
     /// Remove a pending op by item_id (for create ops where tempId is the key).
     pub fn remove_pending_by_item_id(&self, key: &CacheKey, item_id: &str) {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "remove_pending_by_item_id");
         conn.execute(
             "DELETE FROM pending_ops WHERE entity = ?1 AND params_hash = ?2 AND item_id = ?3",
             params![key.entity, key.params_hash as i64, item_id],
@@ -719,7 +896,7 @@ impl Cache {
 
     /// Get all pending ops for an entity+params (for UI merge).
     pub fn get_pending_ops(&self, key: &CacheKey) -> Vec<Value> {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "get_pending_ops", Vec::new());
         let mut stmt = conn.prepare_cached(
             "SELECT data, op, status, error, request_id, item_id FROM pending_ops
              WHERE entity = ?1 AND params_hash = ?2
@@ -784,6 +961,7 @@ impl Cache {
             }
         }
 
+        let id_field = default_id_field_for_entity(&key.entity);
         for pop in &pending {
             let op = pop.get("_op").and_then(|v| v.as_str()).unwrap_or("");
             let pending_id = pop.get("_tempId").and_then(|v| v.as_str()).unwrap_or("");
@@ -792,7 +970,7 @@ impl Cache {
                 "create" => {
                     // Check if server already has this ID (dedup)
                     let exists = items.iter().any(|i| {
-                        i.get("id").and_then(|v| v.as_str()) == Some(pending_id)
+                        Self::item_id_string(i, id_field).as_deref() == Some(pending_id)
                     });
                     if !exists {
                         items.push(pop.clone());
@@ -801,7 +979,7 @@ impl Cache {
                 "update" => {
                     // Patch matching item
                     if let Some(item) = items.iter_mut().find(|i| {
-                        i.get("id").and_then(|v| v.as_str()) == Some(pending_id)
+                        Self::item_id_string(i, id_field).as_deref() == Some(pending_id)
                     }) {
                         if let (Some(obj), Some(patch)) = (item.as_object_mut(), pop.as_object()) {
                             for (k, v) in patch {
@@ -818,7 +996,7 @@ impl Cache {
                 "delete" => {
                     // Mark as pending delete
                     if let Some(item) = items.iter_mut().find(|i| {
-                        i.get("id").and_then(|v| v.as_str()) == Some(pending_id)
+                        Self::item_id_string(i, id_field).as_deref() == Some(pending_id)
                     }) {
                         if let Some(obj) = item.as_object_mut() {
                             obj.insert("_status".to_string(), Value::String("pending".to_string()));
@@ -836,7 +1014,7 @@ impl Cache {
     /// Cleanup stale pending ops (by age).
     /// Returns number removed.
     pub fn cleanup_stale_pending(&self, pending_max_age_ms: i64, failed_max_age_ms: i64) -> usize {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "cleanup_stale_pending", 0);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -860,10 +1038,54 @@ impl Cache {
 
     /// Clear all pending ops for an entity (on snapshot re-sync).
     pub fn clear_pending(&self, key: &CacheKey) {
-        let conn = self.pool.get().unwrap();
+        let conn = pool_conn!(self, "clear_pending");
         conn.execute(
             "DELETE FROM pending_ops WHERE entity = ?1 AND params_hash = ?2",
             params![key.entity, key.params_hash as i64],
         ).ok();
+    }
+}
+
+#[cfg(test)]
+mod item_id_tests {
+    use super::Cache;
+    use serde_json::json;
+
+    #[test]
+    fn item_id_string_custom_field() {
+        let row = json!({"model_id": "m1", "name": "x"});
+        assert_eq!(
+            Cache::item_id_string(&row, "model_id").as_deref(),
+            Some("m1")
+        );
+        assert!(Cache::item_id_string(&row, "id").is_none());
+    }
+
+    #[test]
+    fn item_id_string_numeric_pk() {
+        let row = json!({"id": 42});
+        assert_eq!(Cache::item_id_string(&row, "id").as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn snapshot_and_pending_merge_respects_id_field() {
+        let cache = Cache::new_in_memory();
+        let key = super::CacheKey::new_empty("models");
+        cache.apply_snapshot(
+            &key,
+            &[json!({"model_id": "a", "v": 1})],
+            1,
+            "model_id",
+            false,
+        );
+        cache.add_pending_op(
+            &key,
+            "rid1",
+            "create",
+            "temp-1",
+            &json!({"model_id": "temp-1", "v": 0}),
+        );
+        let list = cache.get_list_with_pending(&key);
+        assert_eq!(list.len(), 2);
     }
 }
