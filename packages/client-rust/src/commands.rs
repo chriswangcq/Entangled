@@ -5,11 +5,12 @@
 
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use crate::cache::{Cache, CacheKey};
-use crate::push::{default_id_field_for_entity, process_sync, SyncFrame};
+use crate::push::{default_id_field_for_entity, process_sync_with_contract, SyncFrame};
 use crate::schema::SchemaRegistry;
 
 // ── Subscription Registry (ref-counted, Rust-owned) ─────────────────────
@@ -117,6 +118,8 @@ pub struct EntangledState {
     pub registry: Arc<std::sync::RwLock<SchemaRegistry>>,
     pub cache: Arc<Cache>,
     pub subscriptions: Arc<std::sync::RwLock<SubscriptionRegistry>>,
+    /// Highest server-advertised Sync Contract version (schema REST push / WS `schema` push / Tauri command).
+    pub sync_contract_version: Arc<AtomicU32>,
 }
 
 // Safety: Cache is strictly Send+Sync thanks to r2d2::Pool.
@@ -131,6 +134,7 @@ impl EntangledState {
             registry: Arc::new(std::sync::RwLock::new(SchemaRegistry::new())),
             cache: Arc::new(Cache::new_in_memory()),
             subscriptions: Arc::new(std::sync::RwLock::new(SubscriptionRegistry::new())),
+            sync_contract_version: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -141,6 +145,7 @@ impl EntangledState {
             registry: Arc::new(std::sync::RwLock::new(SchemaRegistry::new())),
             cache: Arc::new(Cache::new(&db_path)),
             subscriptions: Arc::new(std::sync::RwLock::new(SubscriptionRegistry::new())),
+            sync_contract_version: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -153,7 +158,35 @@ impl EntangledState {
             registry: Arc::new(std::sync::RwLock::new(SchemaRegistry::new())),
             cache: Arc::new(Cache::new(&db_path)),
             subscriptions: Arc::new(std::sync::RwLock::new(SubscriptionRegistry::new())),
+            sync_contract_version: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// Record server-advertised contract version (monotonic max).
+    pub fn set_sync_contract_version(&self, version: u32) {
+        let mut cur = self.sync_contract_version.load(Ordering::Acquire);
+        while version > cur {
+            match self.sync_contract_version.compare_exchange_weak(
+                cur,
+                version,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    tracing::info!(
+                        target: "entangled_sync_contract",
+                        version,
+                        "sync contract version updated"
+                    );
+                    return;
+                }
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    pub fn get_sync_contract_version(&self) -> u32 {
+        self.sync_contract_version.load(Ordering::Acquire)
     }
 }
 
@@ -222,7 +255,8 @@ pub async fn entity_apply_sync(
         .map_err(|e| format!("Invalid sync frame: {}", e))?;
 
     let cache = &state.cache;
-    let changed = process_sync(&cache, &sync_frame);
+    let ver = state.get_sync_contract_version();
+    let changed = process_sync_with_contract(&cache, &sync_frame, ver);
     Ok(changed.map(|c| c.entity))
 }
 
@@ -259,11 +293,15 @@ pub async fn entity_prepend_page(
     params: Option<Value>,
     items: Vec<Value>,
     has_more: bool,
+    id_field: Option<String>,
     state: tauri::State<'_, EntangledState>,
 ) -> Result<usize, String> {
     let key = make_key(&entity, params);
     let cache = &state.cache;
-    let id_field = default_id_field_for_entity(&entity);
+    let id_field = id_field
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_id_field_for_entity(&entity));
     let count = cache.prepend_older(&key, &items, has_more, id_field);
 
     tracing::info!(

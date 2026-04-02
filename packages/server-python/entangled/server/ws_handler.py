@@ -59,6 +59,9 @@ PUSH_QUEUE_MAX_SIZE = 1000       # Backpressure: drop oldest when full
 HEARTBEAT_INTERVAL_S = 30        # Server → client heartbeat interval
 HEARTBEAT_TIMEOUT_S = 90         # Close connection if no message in this time
 
+# Sync Contract: advertised on WS schema push; REST mirrors via gateway.entity.sync_contract (same int).
+SYNC_CONTRACT_VERSION = 2
+
 
 def create_ws_handler(
     store: EntityStore,
@@ -148,7 +151,11 @@ def create_ws_handler(
             await websocket.send_json({
                 "type": "push",
                 "event": "schema",
-                "data": {"entities": schema, "hash": schema_hash},
+                "data": {
+                    "entities": schema,
+                    "hash": schema_hash,
+                    "syncContractVersion": SYNC_CONTRACT_VERSION,
+                },
             })
         except Exception as e:
             logger.error("[WS] Schema push failed: %s", e)
