@@ -15,7 +15,17 @@ dependencies = []
 [project.optional-dependencies]
 starlette = ["starlette>=0.27"]
 fastapi = ["fastapi>=0.100"]
+app = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-jose[cryptography]>=3.3",
+    "pydantic>=2.0",
+    "websockets>=13.0",
+]
 dev = ["pytest", "httpx", "uvicorn", "starlette>=0.27"]
+
+[project.scripts]
+entangled-service = "entangled.app.main:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
