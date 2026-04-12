@@ -7,9 +7,12 @@ real-time delta/snapshot pushes.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import time
 import uuid
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -20,6 +23,9 @@ from ..server.notifier import (
 )
 from ..server.sync import SyncRegistry
 from ..server.ws_handler import (
+    HEARTBEAT_INTERVAL_S,
+    HEARTBEAT_TIMEOUT_S,
+    PUSH_QUEUE_MAX_SIZE,
     SYNC_CONTRACT_VERSION,
     handle_load_more,
     handle_request,
@@ -74,6 +80,15 @@ class _WsSender:
         await self._ws.send_json(data)
 
 
+def _normalize_incoming_msg(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept requestId (camelCase) or request_id for load_more / request."""
+    m = dict(raw)
+    rid = m.get("request_id") or m.get("requestId")
+    if rid is not None:
+        m["request_id"] = rid
+    return m
+
+
 async def ws_sync_handler(websocket: WebSocket):
     """WS /v1/sync — the main Entangled sync endpoint."""
 
@@ -93,65 +108,103 @@ async def ws_sync_handler(websocket: WebSocket):
 
     await websocket.accept()
 
-    # 2. Register client
     client_id = f"ws_{uuid.uuid4().hex[:12]}"
     sender = _WsSender(websocket)
+    last_activity = time.monotonic()
 
-    async def _push_fn(data):
+    push_queue: asyncio.Queue = asyncio.Queue(maxsize=PUSH_QUEUE_MAX_SIZE)
+
+    async def push_consumer() -> None:
         try:
-            await sender.send_json(data)
-        except Exception:
+            while True:
+                msg = await push_queue.get()
+                if msg is None:
+                    break
+                try:
+                    await websocket.send_json(msg)
+                except Exception:
+                    break
+        except asyncio.CancelledError:
             pass
 
-    register_client(client_id, user_id, _push_fn)
+    def sync_push(event: str, data: Any) -> None:
+        msg = data if isinstance(data, dict) and data.get("type") == "sync" else {
+            "type": "push",
+            "event": event,
+            "data": data,
+        }
+        if push_queue.full():
+            try:
+                push_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        push_queue.put_nowait(msg)
+
+    consumer_task = asyncio.ensure_future(push_consumer())
+    register_client(client_id, user_id, sync_push)
     logger.info("[WS] Client %s connected (user=%s)", client_id, user_id)
 
     store = get_store()
 
-    # 3. Push schema on connect
+    async def heartbeat() -> None:
+        try:
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+                elapsed = time.monotonic() - last_activity
+                if elapsed > HEARTBEAT_TIMEOUT_S:
+                    logger.warning(
+                        "[WS] Client %s heartbeat timeout (%.0fs), closing",
+                        client_id,
+                        elapsed,
+                    )
+                    await websocket.close(code=4002, reason="Heartbeat timeout")
+                    return
+                try:
+                    await websocket.send_json({"type": "heartbeat", "ts": time.time()})
+                except Exception:
+                    return
+        except asyncio.CancelledError:
+            pass
+
+    heartbeat_task = asyncio.ensure_future(heartbeat())
+
+    # 3. Push schema on connect — same frame as Gateway /app/ws and ws_handler.create_ws_handler
     try:
+        schema = store.get_schema()
+        schema_hash = hashlib.md5(
+            json.dumps(schema, sort_keys=True).encode()
+        ).hexdigest()[:12]
         await sender.send_json({
-            "type": "schema",
-            "schema": store.get_schema(),
-            "syncContractVersion": SYNC_CONTRACT_VERSION,
+            "type": "push",
+            "event": "schema",
+            "data": {
+                "entities": schema,
+                "hash": schema_hash,
+                "syncContractVersion": SYNC_CONTRACT_VERSION,
+            },
         })
     except Exception as e:
         logger.warning("[WS] Failed to push schema to %s: %s", client_id, e)
 
-    # 4. Message loop
+    # 4. Message loop (protocol matches gateway/api/app_client.py + ws_handler)
     try:
         while True:
             data = await websocket.receive_json()
+            last_activity = time.monotonic()
             msg_type = data.get("type")
 
             if msg_type == "subscribe":
-                await handle_subscribe(
-                    store, sender, client_id, user_id,
-                    data.get("entity"), data.get("params"),
-                    data.get("version"), data.get("head"),
-                    data.get("depth"),
-                )
+                await handle_subscribe(sender, store, user_id, client_id, data)
             elif msg_type == "unsubscribe":
-                await handle_unsubscribe(
-                    sender, client_id,
-                    data.get("entity"), data.get("params"),
-                )
+                handle_unsubscribe(client_id, data, store=store)
             elif msg_type == "request":
-                request_data = data.get("data", {})
-                request_id = data.get("requestId")
-                await handle_request(
-                    store, sender, user_id,
-                    request_data, request_id,
-                )
+                await handle_request(sender, store, user_id, _normalize_incoming_msg(data))
             elif msg_type == "load_more":
-                await handle_load_more(
-                    store, sender, user_id,
-                    data.get("entity"), data.get("params"),
-                    data.get("before_id"), data.get("limit", 50),
-                    data.get("requestId"),
-                )
+                await handle_load_more(sender, store, user_id, _normalize_incoming_msg(data))
             elif msg_type == "ping":
                 await sender.send_json({"type": "pong"})
+            elif msg_type in ("pong", "heartbeat"):
+                pass
             else:
                 logger.debug("[WS] Unknown message type from %s: %s", client_id, msg_type)
 
@@ -161,3 +214,9 @@ async def ws_sync_handler(websocket: WebSocket):
         logger.warning("[WS] Error for client %s: %s", client_id, e)
     finally:
         unregister_client(client_id)
+        try:
+            push_queue.put_nowait(None)
+        except Exception:
+            pass
+        consumer_task.cancel()
+        heartbeat_task.cancel()

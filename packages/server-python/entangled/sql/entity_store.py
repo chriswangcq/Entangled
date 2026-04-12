@@ -373,7 +373,8 @@ class SqlEntityStore(BaseStore):
     # ── Batch / advanced ops ──────────────────────────────────────────────
 
     def batch_update(self, entity: str, user_id: str, entity_ids: list[str],
-                     data: Dict[str, Any], *, params: Optional[Dict[str, str]] = None) -> int:
+                     data: Dict[str, Any], *, params: Optional[Dict[str, str]] = None,
+                     emit_notifications: bool = True) -> int:
         defn = self.get_def(entity)
         if not entity_ids:
             return 0
@@ -395,7 +396,7 @@ class SqlEntityStore(BaseStore):
         with self.db.transaction("global", resource_id=res_id, timeout=10.0):
             cur = self.db.execute(sql, tuple(set_vals + where_vals))
             rowcount = cur.rowcount
-        if rowcount > 0:
+        if emit_notifications and rowcount > 0:
             for eid in entity_ids:
                 self._notify_change(entity, "updated", user_id, entity_id=eid, params=params, data=data)
         return rowcount
@@ -522,7 +523,8 @@ class SqlEntityStore(BaseStore):
         self._notify_change(entity, "stream_chunk", user_id, entity_id=entity_id, params=params, data=data_payload)
 
     def cas_update(self, entity: str, user_id: str, where_condition: Dict[str, Any],
-                   update_data: Dict[str, Any], *, params: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
+                   update_data: Dict[str, Any], *, params: Optional[Dict[str, str]] = None,
+                   emit_notifications: bool = True) -> Optional[Dict[str, Any]]:
         """Atomic CAS (Compare-And-Swap) update."""
         defn = self.get_def(entity)
         row = self._in(defn, update_data)
@@ -548,7 +550,8 @@ class SqlEntityStore(BaseStore):
                 return {"_cas_success": True, "rowcount": cur.rowcount}
         result = self.get(entity, user_id, str(id_val), params=params)
         notify_data = result if result is not None else self._out(defn, update_data)
-        self._notify_change(entity, "updated", user_id, entity_id=str(id_val), params=params, data=notify_data)
+        if emit_notifications:
+            self._notify_change(entity, "updated", user_id, entity_id=str(id_val), params=params, data=notify_data)
         return result
 
     # ── Action dispatch ───────────────────────────────────────────────────
