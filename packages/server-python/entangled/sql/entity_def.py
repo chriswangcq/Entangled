@@ -109,6 +109,30 @@ class SqlEntityDef(BaseEntityDef):
 
     # ── Spec serialization (for schema registration API) ──────────────────
 
+    def to_spec(self) -> dict:
+        """Serialize to a JSON-compatible dict for POST /v1/schema/register."""
+        spec: Dict[str, Any] = {
+            "name": self.name,
+            "table": self.table,
+            "id_field": self.id_field,
+            "user_scoped": self.user_scoped,
+            "key_params": list(self.key_params),
+            "fields": [f.to_spec() for f in self.fields],
+            "constraints": list(self.constraints),
+            "default_order": self.default_order,
+            "lock_type": self.lock_type,
+            "auto_timestamps": self.auto_timestamps,
+            "sync_type": self.sync_type,
+            "sync_limit": self.sync_limit,
+            "op_log_size": self.op_log_size,
+            "subscription_mode": self.subscription_mode,
+            "data_order": self.data_order,
+            "default_not_in_filters": dict(self.default_not_in_filters),
+        }
+        if self.parent:
+            spec["parent"] = list(self.parent)
+        return spec
+
     @classmethod
     def from_spec(cls, spec: dict) -> SqlEntityDef:
         fields = [FieldDef.from_spec(f) for f in spec.get("fields", [])]

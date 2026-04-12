@@ -388,6 +388,7 @@ class EntityStore(EntityStoreProtocol):
         *,
         params: Optional[Dict[str, str]] = None,
         request_id: Optional[str] = None,
+        notify: bool = True,
     ) -> Dict[str, Any]:
         """Insert-or-update. Falls back to update() if no upsert_fn defined."""
         defn = self.get_def(entity)
@@ -398,13 +399,14 @@ class EntityStore(EntityStoreProtocol):
             result = defn.update_fn(self, user_id, entity_id, data, params or {})
         else:
             raise NotImplementedError(f"{entity} does not support upsert or update")
-        self._notify_change(
-            entity, "updated", user_id,
-            entity_id=entity_id,
-            params=params,
-            data=result,
-            request_id=request_id,
-        )
+        if notify:
+            self._notify_change(
+                entity, "updated", user_id,
+                entity_id=entity_id,
+                params=params,
+                data=result,
+                request_id=request_id,
+            )
         return result
 
     async def action(

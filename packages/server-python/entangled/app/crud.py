@@ -61,6 +61,83 @@ def list_entities(
     return {"data": data, "total": len(data)}
 
 
+class ListAdvancedBody(BaseModel):
+    filters: Optional[Dict[str, Any]] = None
+    order_by: Optional[str] = None
+    limit: Optional[int] = None
+    skip_default_not_in: bool = False
+
+
+@router.post("/{entity}/list")
+def list_entities_advanced(
+    entity: str,
+    body: ListAdvancedBody,
+    user_id: str = Depends(verify_service_or_user),
+    params: Optional[Dict[str, str]] = Depends(_parse_params),
+):
+    store = get_store()
+    try:
+        data = store.list(
+            entity,
+            user_id,
+            params=params,
+            filters=body.filters,
+            order_by=body.order_by,
+            limit=body.limit,
+            skip_default_not_in=body.skip_default_not_in,
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"data": data, "total": len(data)}
+
+
+class ExistsBeforeBody(BaseModel):
+    before_id: str
+
+
+@router.post("/{entity}/exists-before")
+def exists_before_entity(
+    entity: str,
+    body: ExistsBeforeBody,
+    user_id: str = Depends(verify_service_or_user),
+    params: Optional[Dict[str, str]] = Depends(_parse_params),
+):
+    store = get_store()
+    try:
+        ok = store.exists_before(entity, user_id, body.before_id, params=params)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"exists": ok}
+
+
+class UpdateWhereBody(BaseModel):
+    data: Dict[str, Any]
+    filters: Optional[Dict[str, Any]] = None
+
+
+@router.post("/{entity}/update-where")
+def update_where_entity(
+    entity: str,
+    body: UpdateWhereBody,
+    user_id: str = Depends(verify_service_or_user),
+    params: Optional[Dict[str, str]] = Depends(_parse_params),
+    notify: bool = Depends(_parse_notify),
+):
+    store = get_store()
+    try:
+        affected = store.update_where(
+            entity,
+            user_id,
+            body.data,
+            params=params,
+            filters=body.filters,
+            notify=notify,
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"affected": affected}
+
+
 # ── Get ───────────────────────────────────────────────────────────────────
 
 
@@ -96,10 +173,11 @@ def create_entity(
     user_id: str = Depends(verify_service_or_user),
     params: Optional[Dict[str, str]] = Depends(_parse_params),
     x_request_id: Optional[str] = Header(None),
+    notify: bool = Depends(_parse_notify),
 ):
     store = get_store()
     try:
-        item = store.create(entity, user_id, body, params=params)
+        item = store.create(entity, user_id, body, params=params, notify=notify)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -117,10 +195,11 @@ def update_entity(
     body: dict,
     user_id: str = Depends(verify_service_or_user),
     params: Optional[Dict[str, str]] = Depends(_parse_params),
+    notify: bool = Depends(_parse_notify),
 ):
     store = get_store()
     try:
-        item = store.update(entity, user_id, entity_id, body, params=params)
+        item = store.update(entity, user_id, entity_id, body, params=params, notify=notify)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     if item is None:
@@ -137,10 +216,11 @@ def delete_entity(
     entity_id: str,
     user_id: str = Depends(verify_service_or_user),
     params: Optional[Dict[str, str]] = Depends(_parse_params),
+    notify: bool = Depends(_parse_notify),
 ):
     store = get_store()
     try:
-        ok = store.delete(entity, user_id, entity_id, params=params)
+        ok = store.delete(entity, user_id, entity_id, params=params, notify=notify)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     if not ok:
@@ -158,10 +238,11 @@ def upsert_entity(
     body: dict,
     user_id: str = Depends(verify_service_or_user),
     params: Optional[Dict[str, str]] = Depends(_parse_params),
+    notify: bool = Depends(_parse_notify),
 ):
     store = get_store()
     try:
-        item = store.upsert(entity, user_id, entity_id, body, params=params)
+        item = store.upsert(entity, user_id, entity_id, body, params=params, notify=notify)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"data": item}
@@ -260,10 +341,13 @@ def batch_update_entities(
     body: BatchUpdateBody,
     user_id: str = Depends(verify_service_or_user),
     params: Optional[Dict[str, str]] = Depends(_parse_params),
+    notify: bool = Depends(_parse_notify),
 ):
     store = get_store()
     try:
-        affected = store.batch_update(entity, user_id, body.ids, body.data, params=params)
+        affected = store.batch_update(
+            entity, user_id, body.ids, body.data, params=params, emit_notifications=notify
+        )
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"affected": affected}
@@ -283,10 +367,13 @@ def cas_update_entity(
     body: CasUpdateBody,
     user_id: str = Depends(verify_service_or_user),
     params: Optional[Dict[str, str]] = Depends(_parse_params),
+    notify: bool = Depends(_parse_notify),
 ):
     store = get_store()
     try:
-        result = store.cas_update(entity, user_id, body.where, body.data, params=params)
+        result = store.cas_update(
+            entity, user_id, body.where, body.data, params=params, emit_notifications=notify
+        )
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     if result is None:
