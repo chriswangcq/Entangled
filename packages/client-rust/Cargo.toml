@@ -18,7 +18,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 
 # Transport (WS connection management)
-tokio-tungstenite = { version = "0.21", features = ["native-tls"], optional = true }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
 futures-util = { version = "0.3", optional = true }
 
 # Optional: Tauri integration (thin adapter)

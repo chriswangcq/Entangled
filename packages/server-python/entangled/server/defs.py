@@ -2,10 +2,10 @@
 entangled/server/defs.py — Entity definitions.
 
 An EntityDef declares what an entity is: its name, key params, CRUD functions,
-custom actions, relationships, and sync strategy.
+custom actions, and sync strategy.
 
-This is the ONLY place business entities are defined. The engine (store, WS handler,
-push notifier, cascade) is fully generic.
+This is the ONLY place business entities are defined. The engine (store,
+WS handler, push notifier) is fully generic — one write = one notification.
 """
 
 
@@ -14,22 +14,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class EntityRelation:
-    """A pointer from one entity to another (for cascade invalidation).
-
-    When the source entity changes, the target entity's cache is invalidated.
-
-    Attributes:
-        target:    Target entity name, e.g. "todo-items"
-        param_map: Map source params to target params, e.g. {"id": "todo_id"}
-        on_actions: Only cascade on specific actions. None = all actions.
-    """
-    target: str
-    param_map: Dict[str, str] = field(default_factory=dict)
-    on_actions: Optional[List[str]] = None  # None = all
 
 
 # Type aliases for handler signatures
@@ -49,7 +33,7 @@ class EntityDef:
     """Definition of an entity in the Entangled system.
 
     This is the single source of truth for an entity's schema, CRUD operations,
-    custom actions, relationships, and sync strategy.
+    custom actions, and sync strategy.
 
     Example:
         todos = EntityDef(
@@ -58,9 +42,6 @@ class EntityDef:
             sync_type="list",
             list_fn=lambda store, uid, params: db.query(...),
             create_fn=lambda store, uid, params, data: db.insert(...),
-            relations=[
-                EntityRelation(target="todo-items", param_map={"id": "todo_id"}),
-            ],
         )
     """
     # ── Identity ─────────────────────────────────────────────────
@@ -71,17 +52,13 @@ class EntityDef:
 
     # ── Sync strategy ────────────────────────────────────────────
     sync_type: str = "list"             # "list" (mutable CRUD) | "stream" (append-only)
-    # Default head_n window when the client omits ``depth``; passed to ``resolve_sync(..., default_stream_depth=...)``.
     sync_limit: Optional[int] = None    # stream only; host should set (e.g. 50)
     op_log_size: int = 1000             # max op-log entries per (entity, params)
 
-    # ── Client subscription (declared on server, exposed via get_schema()) ───
-    # lazy: subscribe only when a hook mounts (default).
-    # eager: also subscribe at app startup (before any hook), for global entities.
-    # subscription_cascade: after subscribing to this entity, client also subscribes
-    #   to these names with the same params (same keyParams scope).
+    # ── Client entanglement (declared on server, exposed via get_schema()) ───
+    # lazy: entangle only when a hook mounts (default).
+    # eager: also entangle at app startup (before any hook), for global entities.
     subscription_mode: str = "lazy"  # "lazy" | "eager"
-    subscription_cascade: List[str] = field(default_factory=list)
 
     # ── CRUD handlers ────────────────────────────────────────────
     list_fn: Optional[ListFn] = None
@@ -102,9 +79,10 @@ class EntityDef:
     # ── Custom actions ───────────────────────────────────────────
     actions: Dict[str, ActionFn] = field(default_factory=dict)
 
-    # ── Relations (cascade invalidation pointers) ────────────────
-    # Server-side only — never pushed to clients
-    relations: List[EntityRelation] = field(default_factory=list)
+    # ── Remote action hooks (action_name → callback URL) ──────
+    # When an action has no local handler, Entangled will HTTP POST to the
+    # registered hook URL.  Populated by Gateway during schema registration.
+    action_hooks: Dict[str, str] = field(default_factory=dict)
 
     # ── Push events ──────────────────────────────────────────────
     push_events: Optional[List[str]] = None
@@ -117,21 +95,15 @@ class EntityDef:
             self.push_events = [f"entity_change:{self.name}"]
 
     def to_schema_dict(self) -> dict:
-        """Serialize to schema format for pushing to clients.
-
-        NOTE: relations are NOT included — cascade is server-side logic.
-        Clients only need name → push_events mapping.
-        """
+        """Serialize to schema format for pushing to clients."""
         return {
             "name": self.name,
             "keyParams": self.key_params,
-            # Primary-key JSON field for rows (NovAIC EntityDef; default "id" for generic hosts)
             "idField": getattr(self, "id_field", "id"),
             "pushEvents": self.push_events or [],
             "syncType": self.sync_type,
             "syncLimit": self.sync_limit,
             "subscriptionMode": self.subscription_mode,
-            # Capability flags — lets clients know what ops are available
             "dataOrder": self.data_order,
             "capabilities": {
                 "listStream": self.list_stream_fn is not None,
@@ -139,7 +111,4 @@ class EntityDef:
                 "upsert": self.upsert_fn is not None,
                 "actions": list(self.actions.keys()) if self.actions else [],
             },
-            # NOTE: subscriptionCascade intentionally omitted — cascade is now
-            # handled server-side in ws_handler._handle_subscribe; clients never
-            # need to expand cascade targets themselves.
         }

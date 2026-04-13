@@ -106,11 +106,15 @@ class SyncState:
 
         return ops
 
-    def subscribe(self, client_id: str) -> None:
+    def entangle(self, client_id: str) -> None:
         self.subscribers[client_id] = self.current_version
 
-    def unsubscribe(self, client_id: str) -> None:
+    def disentangle(self, client_id: str) -> None:
         self.subscribers.pop(client_id, None)
+
+    # Backward-compat aliases
+    subscribe = entangle
+    unsubscribe = disentangle
 
 
 class SyncStateSnapshot:
@@ -118,8 +122,8 @@ class SyncStateSnapshot:
 
     The live ``SyncState`` is mutated on the asyncio thread by :meth:`SyncRegistry.record_op`.
     Passing a snapshot avoids races. Call :func:`snapshot_for_resolve` immediately after
-    ``subscribe``, with no ``await`` between snapshot and subscribe, then reconcile version
-    / delta on the event loop (see ``ws_handler._subscribe_one``).
+    ``entangle``, with no ``await`` between snapshot and entangle, then reconcile version
+    / delta on the event loop (see ``ws_handler._entangle_one``).
     """
 
     __slots__ = ("current_version", "_op_log")
@@ -201,26 +205,31 @@ class SyncRegistry:
             self._states[key] = SyncState.with_maxlen(maxlen)
         return self._states[key]
 
-    def subscribe(self, client_id: str, entity: str, params: Optional[Dict[str, str]] = None) -> None:
+    def entangle(self, client_id: str, entity: str, params: Optional[Dict[str, str]] = None) -> None:
         params = _normalize_params(params)
         state = self.get_state(entity, params)
-        state.subscribe(client_id)
+        state.entangle(client_id)
         if client_id not in self._client_subs:
             self._client_subs[client_id] = set()
         self._client_subs[client_id].add(_state_key(entity, params))
 
-    def unsubscribe(self, client_id: str, entity: str, params: Optional[Dict[str, str]] = None) -> None:
+    def disentangle(self, client_id: str, entity: str, params: Optional[Dict[str, str]] = None) -> None:
         params = _normalize_params(params)
         state = self.get_state(entity, params)
-        state.unsubscribe(client_id)
+        state.disentangle(client_id)
         if client_id in self._client_subs:
             self._client_subs[client_id].discard(_state_key(entity, params))
 
-    def unsubscribe_all(self, client_id: str) -> None:
+    def disentangle_all(self, client_id: str) -> None:
         keys = self._client_subs.pop(client_id, set())
         for key in keys:
             if key in self._states:
-                self._states[key].unsubscribe(client_id)
+                self._states[key].disentangle(client_id)
+
+    # Backward-compat aliases
+    subscribe = entangle
+    unsubscribe = disentangle
+    unsubscribe_all = disentangle_all
 
     def record_op(
         self,
@@ -247,7 +256,7 @@ class SyncRegistry:
                 )
         return state, entry
 
-    def get_subscribed_clients(
+    def get_entangled_clients(
         self,
         entity: str,
         params: Optional[Dict[str, str]] = None,
@@ -255,6 +264,9 @@ class SyncRegistry:
         params = _normalize_params(params)
         state = self.get_state(entity, params)
         return list(state.subscribers.keys())
+
+    # Backward-compat alias
+    get_subscribed_clients = get_entangled_clients
 
     def reset(self) -> None:
         """Clear all state (for testing)."""
@@ -291,7 +303,7 @@ def _stream_head_n_sync(
     depth: Optional[int],
     default_stream_depth: Optional[int],
     *,
-    reason: str = "subscribe",
+    reason: str = "entangle",
     exists_before_fn: Optional[Callable[[str], bool]] = None,
     data_order: str = "desc",
     id_field: str = "id",
@@ -367,7 +379,7 @@ def resolve_sync(
 
     Args:
         state: Per-(entity, params) version and op-log.
-        client_version: Client's last known server version (None = first subscribe).
+        client_version: Client's last known server version (None = first entangle).
         client_head: Reserved for stream cursors; None uses version-based sync.
         depth: Client-requested head_n window (WS ``depth``); may be None.
         fetch_data_fn: Host callback; MUST support ``limit`` kw/arg for bounded reads.
@@ -387,7 +399,7 @@ def resolve_sync(
         Dict with ``mode``, ``version``, and optional ``data`` / ``ops`` / ``hasMore``.
     """
 
-    # Case 1: First subscribe (git clone)
+    # Case 1: First entangle (git clone)
     if client_version is None and client_head is None:
         if sync_type == "stream":
             return _stream_head_n_sync(

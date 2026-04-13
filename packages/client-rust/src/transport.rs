@@ -23,6 +23,7 @@ mod ws {
     #[derive(Debug, serde::Serialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum OutMsg {
+        /// Establish entity entanglement (subscribe is the legacy alias).
         Subscribe {
             entity: String,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -30,11 +31,25 @@ mod ws {
             #[serde(skip_serializing_if = "Option::is_none")]
             version: Option<u64>,
         },
+        /// Break entity entanglement.
         Unsubscribe {
             entity: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             params: Option<Value>,
         },
+        /// First-class mutation verb: create/update/delete/upsert/custom.
+        Action {
+            request_id: String,
+            entity: String,
+            op: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            id: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            params: Option<Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            data: Option<Value>,
+        },
+        /// [Deprecated] Generic RPC dispatch — prefer Action for mutations.
         Request {
             request_id: String,
             action: String,
@@ -43,6 +58,16 @@ mod ws {
             #[serde(skip_serializing_if = "Option::is_none")]
             data: Option<Value>,
         },
+        /// Backward pagination for stream entities.
+        LoadMore {
+            request_id: String,
+            entity: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            params: Option<Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            before_id: Option<String>,
+            limit: u32,
+        },
         Pong,
     }
 
@@ -50,7 +75,9 @@ mod ws {
     pub enum InMsg {
         /// Entangled sync frame — handled internally by the engine
         Sync(Value),
-        /// Request/response — matched by request_id
+        /// Action acknowledgement — matched by request_id for optimistic update correlation
+        Ack { request_id: String, success: bool, data: Option<Value>, error: Option<String> },
+        /// Request/response (legacy) — matched by request_id
         Response { request_id: String, data: Option<Value>, error: Option<String> },
         /// Server ping
         Ping,
@@ -69,12 +96,18 @@ mod ws {
             let msg_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match msg_type {
                 "sync" => InMsg::Sync(val),
+                "ack" => InMsg::Ack {
+                    request_id: val.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    success: val.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+                    data: val.get("data").cloned(),
+                    error: val.get("error").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                },
                 "response" => InMsg::Response {
                     request_id: val.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                     data: val.get("data").cloned(),
                     error: val.get("error").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 },
-                "ping" => InMsg::Ping,
+                "ping" | "heartbeat" => InMsg::Ping,
                 "push" => InMsg::Push {
                     event: val.get("event").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                     data: val.get("data").cloned(),
@@ -154,7 +187,79 @@ mod ws {
             }).await;
         }
 
-        /// Send a request and wait for response.
+        /// Send a first-class action (mutation) and wait for ack.
+        pub async fn send_action(
+            &self,
+            entity: &str,
+            op: &str,
+            id: Option<String>,
+            params: Option<Value>,
+            data: Option<Value>,
+        ) -> Result<Value, String> {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let mut rx = self.response_tx.subscribe();
+
+            self.send(&OutMsg::Action {
+                request_id: request_id.clone(),
+                entity: entity.to_string(),
+                op: op.to_string(),
+                id,
+                params,
+                data,
+            }).await;
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Ok((rid, result))) if rid == request_id => return result,
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(_)) => return Err("Channel closed".into()),
+                    Err(_) => return Err("Action timeout (15s)".into()),
+                }
+            }
+        }
+
+        /// Send a load_more request and wait for response.
+        pub async fn send_load_more(
+            &self,
+            entity: &str,
+            params: Option<Value>,
+            before_id: Option<String>,
+            limit: u32,
+        ) -> Result<Value, String> {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let mut rx = self.response_tx.subscribe();
+
+            self.send(&OutMsg::LoadMore {
+                request_id: request_id.clone(),
+                entity: entity.to_string(),
+                params,
+                before_id,
+                limit,
+            }).await;
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Ok((rid, result))) if rid == request_id => return result,
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(_)) => return Err("Channel closed".into()),
+                    Err(_) => return Err("load_more timeout (15s)".into()),
+                }
+            }
+        }
+
+        /// Take the sync frame receiver (can only be called once).
+        pub async fn take_sync_receiver(&self) -> Option<mpsc::UnboundedReceiver<Value>> {
+            self.sync_rx.lock().await.take()
+        }
+
+        /// Subscribe to connection state changes.
+        pub fn subscribe_connection_state(&self) -> broadcast::Receiver<bool> {
+            self.connected_tx.subscribe()
+        }
+
+        /// [Deprecated] Send a request and wait for response — prefer ``send_action``.
         pub async fn request(&self, action: &str, data: Option<Value>) -> Result<Value, String> {
             let request_id = uuid::Uuid::new_v4().to_string();
             let mut rx = self.response_tx.subscribe();
@@ -264,9 +369,9 @@ mod ws {
                     }
                     r = tokio::time::timeout(Duration::from_secs(90), stream.next()) => {
                         match r {
-                            Err(_) => { tracing::warn!("[Entangled] Read timeout"); return; }
+                            Err(_) => { tracing::warn!("[Entangled] Read timeout (90s no data)"); return; }
                             Ok(Some(r)) => r,
-                            Ok(None) => return,
+                            Ok(None) => { tracing::warn!("[Entangled] WS stream ended (server closed)"); return; }
                         }
                     }
                 };
@@ -274,16 +379,26 @@ mod ws {
                 let text = match msg {
                     Ok(Message::Text(t)) => t,
                     Ok(Message::Close(frame)) => {
-                        // Check for auth rejection
                         if let Some(ref f) = frame {
+                            tracing::warn!(
+                                "[Entangled] Server closed connection: code={}, reason={}",
+                                u16::from(f.code), f.reason
+                            );
                             if f.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(4001) {
-                                tracing::warn!("[Entangled] Auth rejected by server");
                                 auth.on_auth_rejected();
                             }
+                        } else {
+                            tracing::warn!("[Entangled] Server closed connection (no close frame)");
                         }
                         return;
                     }
-                    Ok(Message::Ping(_)) => continue,
+                    Ok(Message::Ping(payload)) => {
+                        let mut g = self.sink.lock().await;
+                        if let Some(ref mut s) = *g {
+                            let _ = s.send(Message::Pong(payload)).await;
+                        }
+                        continue;
+                    }
                     Err(e) => { tracing::warn!("[Entangled] WS error: {}", e); return; }
                     _ => continue,
                 };
@@ -291,6 +406,14 @@ mod ws {
                 match InMsg::parse(&text) {
                     InMsg::Sync(val) => {
                         let _ = sync_tx.send(val);
+                    }
+                    InMsg::Ack { request_id, success, data, error } => {
+                        let result = if !success {
+                            Err(error.unwrap_or_else(|| "action failed".into()))
+                        } else {
+                            Ok(data.unwrap_or(Value::Null))
+                        };
+                        let _ = self.response_tx.send((request_id, result));
                     }
                     InMsg::Response { request_id, data, error } => {
                         let result = if let Some(err) = error {
@@ -306,7 +429,15 @@ mod ws {
                     InMsg::Push { event, data } => {
                         let _ = self.push_tx.send((event, data));
                     }
-                    InMsg::Unknown => {}
+                    InMsg::Unknown => {
+                        let msg_type = serde_json::from_str::<Value>(&text)
+                            .ok()
+                            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from));
+                        tracing::debug!(
+                            "[Entangled] Unhandled message type: {:?}",
+                            msg_type.as_deref().unwrap_or("(no type)")
+                        );
+                    }
                 }
             }
         }

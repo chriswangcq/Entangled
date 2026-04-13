@@ -413,7 +413,7 @@ class SqlEntityStore(BaseStore):
         return row["cnt"] if row else 0
 
     def delete_where(self, entity: str, user_id: str, *, params: Optional[Dict[str, str]] = None,
-                     filters: Optional[Dict[str, Any]] = None) -> int:
+                     filters: Optional[Dict[str, Any]] = None, notify: bool = True) -> int:
         defn = self.get_def(entity)
         where, values = self._scope_where(defn, user_id, params)
         if filters:
@@ -424,12 +424,15 @@ class SqlEntityStore(BaseStore):
         res_id = (params or {}).get(defn.key_params[0], "batch") if defn.key_params else "batch"
         with self.db.transaction(defn.lock_type, resource_id=res_id):
             cur = self.db.execute(sql, tuple(values))
-        return cur.rowcount
+        rowcount = cur.rowcount
+        if notify and rowcount > 0:
+            self._notify_change(entity, "deleted", user_id, params=params)
+        return rowcount
 
     def update_where(self, entity: str, user_id: str, data: Dict[str, Any],
                      *, params: Optional[Dict[str, str]] = None,
                      filters: Optional[Dict[str, Any]] = None,
-                     notify: bool = False) -> int:
+                     notify: bool = True) -> int:
         defn = self.get_def(entity)
         row = self._in(defn, data)
         if not row:
@@ -456,7 +459,7 @@ class SqlEntityStore(BaseStore):
 
     def cleanup(self, entity: str, user_id: str, keep_count: int,
                 *, params: Optional[Dict[str, str]] = None,
-                order_by: Optional[str] = None) -> int:
+                order_by: Optional[str] = None, notify: bool = True) -> int:
         defn = self.get_def(entity)
         order = order_by or defn.default_order or "rowid DESC"
         where, values = self._scope_where(defn, user_id, params)
@@ -473,7 +476,10 @@ class SqlEntityStore(BaseStore):
         res_id = (params or {}).get(defn.key_params[0], "cleanup") if defn.key_params else "cleanup"
         with self.db.transaction(defn.lock_type, resource_id=res_id):
             cur = self.db.execute(sql, tuple(all_values))
-        return cur.rowcount
+        rowcount = cur.rowcount
+        if notify and rowcount > 0:
+            self._notify_change(entity, "deleted", user_id, params=params)
+        return rowcount
 
     # ── Stream ops ────────────────────────────────────────────────────────
 
@@ -517,7 +523,7 @@ class SqlEntityStore(BaseStore):
 
     def stream_chunk(self, entity: str, user_id: str, entity_id: str,
                      chunk_delta: Any, *, params: Optional[Dict[str, str]] = None) -> None:
-        """Broadcast a streaming chunk (no DB write, just push to subscribers)."""
+        """Broadcast a streaming chunk (no DB write, just push to entangled peers)."""
         self.get_def(entity)
         data_payload = {"delta": chunk_delta}
         self._notify_change(entity, "stream_chunk", user_id, entity_id=entity_id, params=params, data=data_payload)
@@ -565,16 +571,52 @@ class SqlEntityStore(BaseStore):
         payload: Dict[str, Any],
     ) -> Any:
         defn = self.get_def(entity)
-        if not defn.actions or action_name not in defn.actions:
-            raise KeyError(f"No action handler for '{action_name}' on '{entity}'")
-        handler = defn.actions[action_name]
-        if inspect.iscoroutinefunction(handler):
-            return await handler(self, user_id, params, payload)
-        else:
-            res = handler(self, user_id, params, payload)
-            if inspect.isawaitable(res):
-                return await res
-            return res
+
+        if defn.actions and action_name in defn.actions:
+            handler = defn.actions[action_name]
+            if inspect.iscoroutinefunction(handler):
+                return await handler(self, user_id, params, payload)
+            else:
+                res = handler(self, user_id, params, payload)
+                if inspect.isawaitable(res):
+                    return await res
+                return res
+
+        if defn.action_hooks and action_name in defn.action_hooks:
+            return await self._call_action_hook(
+                defn.action_hooks[action_name], entity, action_name, user_id, params, payload,
+            )
+
+        raise KeyError(f"No action handler for '{action_name}' on '{entity}'")
+
+    async def _call_action_hook(
+        self, url: str, entity: str, action_name: str,
+        user_id: str, params: Dict[str, str], payload: Dict[str, Any],
+    ) -> Any:
+        """Forward a custom action to an external service (Gateway) via HTTP POST."""
+        import asyncio
+        import urllib.request
+
+        body = json.dumps({
+            "user_id": user_id,
+            "params": params,
+            "payload": payload,
+        }).encode("utf-8")
+
+        headers = {"Content-Type": "application/json"}
+        service_token = getattr(self, "_service_token", None)
+        if service_token:
+            headers["X-Service-Token"] = service_token
+
+        def _do_request() -> Any:
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp_body = json.loads(resp.read())
+            if not resp_body.get("success"):
+                raise RuntimeError(resp_body.get("error", f"Action hook failed: {entity}.{action_name}"))
+            return resp_body.get("data")
+
+        return await asyncio.to_thread(_do_request)
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
@@ -617,18 +659,22 @@ class SqlEntityStore(BaseStore):
         return (" AND ".join(clauses) if clauses else "1=1"), values
 
     def _in(self, defn: SqlEntityDef, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Input dict → DB-ready dict (serialize per-field)."""
+        """Input dict → DB-ready dict (serialize per-field, compute has_* from hidden)."""
         result = dict(data)
         if not defn.fields:
             raise ValueError(f"Entity '{defn.name}' has no fields defined.")
         fm = defn.field_map
+        for h in defn.hidden_fields:
+            has_key = f"has_{h}"
+            if has_key in fm and h in result:
+                result[has_key] = bool(result[h])
         for k in list(result.keys()):
             if k in fm:
                 result[k] = fm[k].serialize(result[k])
         return result
 
     def _out(self, defn: SqlEntityDef, row: Dict[str, Any], *, include_hidden: bool = False) -> Dict[str, Any]:
-        """DB row → Python dict (deserialize + strip hidden)."""
+        """DB row → Python dict (deserialize + strip hidden + compute has_* fields)."""
         result = dict(row)
         if defn.fields:
             fm = defn.field_map
@@ -637,5 +683,8 @@ class SqlEntityStore(BaseStore):
                     result[k] = fm[k].deserialize(result[k])
             if not include_hidden:
                 for h in defn.hidden_fields:
+                    has_key = f"has_{h}"
+                    if has_key in fm:
+                        result[has_key] = bool(result.get(h))
                     result.pop(h, None)
         return result

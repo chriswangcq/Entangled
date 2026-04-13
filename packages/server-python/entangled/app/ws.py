@@ -1,6 +1,6 @@
 """WebSocket Sync endpoint — fronts Entangled's sync engine.
 
-Clients connect with a JWT token, subscribe to entities, and receive
+Clients connect with a JWT token, entangle with entities, and receive
 real-time delta/snapshot pushes.
 """
 
@@ -27,10 +27,11 @@ from ..server.ws_handler import (
     HEARTBEAT_TIMEOUT_S,
     PUSH_QUEUE_MAX_SIZE,
     SYNC_CONTRACT_VERSION,
+    handle_action,
     handle_load_more,
     handle_request,
-    handle_subscribe,
-    handle_unsubscribe,
+    handle_entangle,
+    handle_disentangle,
 )
 
 from .auth import decode_jwt_from_raw
@@ -193,10 +194,12 @@ async def ws_sync_handler(websocket: WebSocket):
             last_activity = time.monotonic()
             msg_type = data.get("type")
 
-            if msg_type == "subscribe":
-                await handle_subscribe(sender, store, user_id, client_id, data)
-            elif msg_type == "unsubscribe":
-                handle_unsubscribe(client_id, data, store=store)
+            if msg_type in ("entangle", "subscribe"):
+                await handle_entangle(sender, store, user_id, client_id, data)
+            elif msg_type in ("disentangle", "unsubscribe"):
+                handle_disentangle(client_id, data, store=store)
+            elif msg_type == "action":
+                await handle_action(sender, store, user_id, client_id, _normalize_incoming_msg(data))
             elif msg_type == "request":
                 await handle_request(sender, store, user_id, _normalize_incoming_msg(data))
             elif msg_type == "load_more":

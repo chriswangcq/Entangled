@@ -410,16 +410,45 @@ class DeleteWhereBody(BaseModel):
     filters: Optional[Dict[str, Any]] = None
 
 
+# ── Stream chunk (push-only, no persistence) ─────────────────────────────
+
+
+class StreamChunkBody(BaseModel):
+    entity_id: str
+    delta: Any
+    params: Optional[Dict[str, str]] = None
+
+
+@router.post("/{entity}/stream-chunk")
+def stream_chunk(
+    entity: str,
+    body: StreamChunkBody,
+    user_id: str = Depends(verify_service_or_user),
+):
+    """Push a streaming delta to entangled peers without writing to the database."""
+    store = get_store()
+    try:
+        store.stream_chunk(
+            entity, user_id, body.entity_id, body.delta, params=body.params,
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"ok": True}
+
+
 @router.delete("/{entity}/where")
 def delete_where(
     entity: str,
     body: DeleteWhereBody,
     user_id: str = Depends(verify_service_or_user),
     params: Optional[Dict[str, str]] = Depends(_parse_params),
+    notify: bool = Depends(_parse_notify),
 ):
     store = get_store()
     try:
-        affected = store.delete_where(entity, user_id, params=params, filters=body.filters)
+        affected = store.delete_where(entity, user_id, params=params, filters=body.filters, notify=notify)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"affected": affected}
+
+

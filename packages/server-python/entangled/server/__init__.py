@@ -16,7 +16,6 @@ Usage:
 
 from .defs import (
     EntityDef,
-    EntityRelation,
     ListFn,
     ListStreamFn,
     GetFn,
@@ -37,7 +36,6 @@ from .sync import (
 from .ws_handler import (
     create_ws_handler,
     WsSender,
-    cascade_targets,
     handle_subscribe,
     handle_unsubscribe,
     handle_load_more,
@@ -66,7 +64,6 @@ __all__ = [
     "DEFAULT_STREAM_HEAD_DEPTH",
     "MAX_STREAM_HEAD_DEPTH",
     "EntityDef",
-    "EntityRelation",
     "EntityStore",
     "EntityStoreProtocol",
     "SyncRegistry",
@@ -74,7 +71,6 @@ __all__ = [
     # WS handler
     "create_ws_handler",
     "WsSender",
-    "cascade_targets",
     "handle_subscribe",
     "handle_unsubscribe",
     "handle_load_more",

@@ -43,8 +43,8 @@ def main():
         host=config.host,
         port=config.port,
         log_level=config.log_level.lower(),
-        ws_ping_interval=20,
-        ws_ping_timeout=20,
+        ws_ping_interval=None,
+        ws_ping_timeout=None,
     )
 
 
