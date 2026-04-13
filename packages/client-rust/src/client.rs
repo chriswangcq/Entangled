@@ -203,15 +203,6 @@ impl EntangledClient {
         }
     }
 
-    /// Send an entity CRUD request (standalone mode).
-    #[cfg(feature = "transport")]
-    pub async fn request(&self, action: &str, data: Option<Value>) -> Result<Value, String> {
-        match &self.transport {
-            Some(t) => t.request(action, data).await,
-            None => Err("No transport in embedded mode".into()),
-        }
-    }
-
     // ── Cache reads (both modes) ─────────────────────────────────────────────
 
     /// Get a list of items for an entity.

@@ -131,6 +131,8 @@ class SqlEntityDef(BaseEntityDef):
         }
         if self.parent:
             spec["parent"] = list(self.parent)
+        if self.action_hooks:
+            spec["action_hooks"] = dict(self.action_hooks)
         return spec
 
     @classmethod
@@ -154,4 +156,5 @@ class SqlEntityDef(BaseEntityDef):
             data_order=spec.get("data_order", "desc"),
             default_not_in_filters=spec.get("default_not_in_filters", {}),
             parent=tuple(spec["parent"]) if spec.get("parent") else None,
+            action_hooks=spec.get("action_hooks", {}),
         )

@@ -41,6 +41,7 @@ def create_app(config: ServiceConfig) -> FastAPI:
 
         # 3. EntityStore
         store = init_store(db=db)
+        store._service_token = config.service_token or ""
         logger.info("EntityStore ready (0 entities — waiting for schema registration)")
 
         # 4. Auth
@@ -75,6 +76,7 @@ def create_app(config: ServiceConfig) -> FastAPI:
     app.include_router(health_router)
     app.include_router(schema_router)
     app.include_router(crud_router)
-    app.add_websocket_route("/v1/sync", ws_sync_handler)
+    add_ws = getattr(app, "add_api_websocket_route", None) or app.add_websocket_route
+    add_ws("/v1/sync", ws_sync_handler)
 
     return app

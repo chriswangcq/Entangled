@@ -1,9 +1,10 @@
 """
-entangled/server/notifier.py — Subscription-based push with cascade.
+entangled/server/notifier.py — Entanglement-based push notification.
 
-Only pushes to clients that have active subscriptions (entanglements).
-Pushes to ALL subscribed clients regardless of who triggered the change
-(multi-user collaboration).
+One write = one notification.  Only pushes to clients that have active
+entanglements for the exact (entity, params) that was written.
+User-scoped entities only push to the owning user's clients; global
+entities push to all entangled peers.
 
 NOTE: Uses module-level state bound via set_store(). This is intentional
 for backwards compatibility — a single process serves one store instance.
@@ -12,7 +13,7 @@ For multi-process deployments, use a process-local store per worker.
 
 
 import logging
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional
 
 from .sync import SyncOp, SyncRegistry
 
@@ -65,7 +66,7 @@ def register_client(client_id: str, user_id: str, push_fn: Callable) -> None:
 def unregister_client(client_id: str) -> None:
     _clients.pop(client_id, None)
     registry = _get_registry()
-    registry.unsubscribe_all(client_id)
+    registry.disentangle_all(client_id)
     logger.debug("[Notifier] Client %s unregistered (remaining=%d)", client_id, len(_clients))
 
 
@@ -92,7 +93,40 @@ def reset_state() -> None:
     set_sync_push_port(None)
 
 
-# ── Entity change notification ───────────────────────────────────
+# ── User-scope resolution ────────────────────────────────────────
+
+_user_owned_cache: Dict[str, bool] = {}
+
+
+def _is_user_owned(entity: str) -> bool:
+    """Return True if this entity is user-scoped directly or via parent chain.
+
+    User-owned entities must only push deltas to the owning user's clients.
+    Global entities (e.g. models) push to all subscribers.
+    """
+    if entity in _user_owned_cache:
+        return _user_owned_cache[entity]
+    result = _resolve_user_owned(entity, depth=0)
+    _user_owned_cache[entity] = result
+    return result
+
+
+def _resolve_user_owned(entity: str, depth: int) -> bool:
+    if _store is None or depth > 8:
+        return False
+    try:
+        defn = _store.get_def(entity)
+    except KeyError:
+        return False
+    if defn.user_scoped:
+        return True
+    if defn.parent:
+        parent_name = defn.parent[0]
+        return _resolve_user_owned(parent_name, depth + 1)
+    return False
+
+
+# ── Entity change notification (no cascade) ──────────────────────
 
 def _action_to_op(action: str) -> str:
     return {
@@ -102,10 +136,6 @@ def _action_to_op(action: str) -> str:
         "deleted": "delete",
         "clear": "invalidate"
     }.get(action, "update")
-
-
-# ADR-7: bound cascade fan-out / graph depth (misconfig or cycles).
-_MAX_CASCADE_DEPTH = 48
 
 
 def _inproc_notify_entity_change(
@@ -118,7 +148,7 @@ def _inproc_notify_entity_change(
     data: Optional[Dict[str, Any]] = None,
     request_id: Optional[str] = None,
 ) -> None:
-    """In-process implementation: record op, push delta, cascade."""
+    """In-process implementation: record op, push delta to entangled peers."""
     registry = _get_registry()
     op_type = _action_to_op(action)
 
@@ -128,9 +158,10 @@ def _inproc_notify_entity_change(
         request_id=request_id,
     )
 
-    # 2. Push delta to ALL subscribed clients (not just triggering user)
-    subscribed = registry.get_subscribed_clients(entity, params)
-    if subscribed:
+    # 2. Push delta to entangled clients (scoped by user for user-owned entities)
+    entangled = registry.get_entangled_clients(entity, params)
+    user_owned = _is_user_owned(entity)
+    if entangled:
         id_field = "id"
         if _store is not None:
             try:
@@ -150,10 +181,12 @@ def _inproc_notify_entity_change(
         }
 
         sent = 0
-        for cid in subscribed:
+        for cid in entangled:
             if cid not in _clients:
                 continue
-            _, push_fn = _clients[cid]
+            client_uid, push_fn = _clients[cid]
+            if user_owned and user_id and client_uid != user_id:
+                continue
             try:
                 push_fn("sync", delta_frame)
                 sent += 1
@@ -165,106 +198,6 @@ def _inproc_notify_entity_change(
                 "[Notifier] %s.%s v%d → %d client(s)",
                 entity, op_type, state.current_version, sent,
             )
-
-    # 3. Cascade to dependent entities
-    if _store is not None:
-        _cascade(entity, action, params or {}, entity_id, visited=set(), depth=0)
-
-
-def _cascade(
-    entity: str,
-    action: str,
-    source_params: Dict[str, str],
-    entity_id: Optional[str],
-    visited: Set[str],
-    *,
-    depth: int = 0,
-) -> None:
-    """Walk relation graph — push invalidation to dependent entities.
-
-    Pushes to ALL subscribers of each dependent entity.
-    """
-    if depth >= _MAX_CASCADE_DEPTH:
-        logger.warning(
-            "[Notifier] cascade stopped at depth cap (%d) entity=%s action=%s",
-            _MAX_CASCADE_DEPTH,
-            entity,
-            action,
-        )
-        return
-    try:
-        defn = _store.get_def(entity)
-    except KeyError:
-        return
-
-    registry = _get_registry()
-
-    for rel in defn.relations:
-        if rel.on_actions and action not in rel.on_actions:
-            continue
-
-        rel_key = f"{rel.target}:{sorted(rel.param_map.items())}"
-        if rel_key in visited:
-            continue
-        visited.add(rel_key)
-
-        # Map params: use entity_id as source if needed
-        target_params: Dict[str, str] = {}
-        all_source = dict(source_params)
-        if entity_id:
-            all_source["id"] = entity_id
-
-        has_all_keys = True
-        for src_key, tgt_key in rel.param_map.items():
-            if src_key in all_source:
-                target_params[tgt_key] = all_source[src_key]
-            else:
-                has_all_keys = False
-
-        if not has_all_keys and not target_params:
-            # Can't map params — skip this relation (would push to wrong scope)
-            logger.debug(
-                "[Notifier] Skipping cascade %s→%s: incomplete param_map",
-                entity, rel.target,
-            )
-            continue
-
-        # Record invalidation
-        state, sync_op = registry.record_op(
-            rel.target, "invalidate", "", params=target_params if target_params else None,
-        )
-
-        # Push to subscribers
-        subscribed = registry.get_subscribed_clients(rel.target, target_params if target_params else None)
-        if subscribed:
-            tgt_id_field = "id"
-            try:
-                tgt_defn = _store.get_def(rel.target)
-                tgt_id_field = getattr(tgt_defn, "id_field", "id")
-            except KeyError:
-                pass
-            frame = {
-                "type": "sync",
-                "entity": rel.target,
-                "params": target_params if target_params else None,
-                "idField": tgt_id_field,
-                "mode": "delta",
-                "version": state.current_version,
-                "baseVersion": state.current_version - 1,
-                "ops": [sync_op.to_dict()],
-            }
-
-            for cid in subscribed:
-                if cid not in _clients:
-                    continue
-                _, push_fn = _clients[cid]
-                try:
-                    push_fn("sync", frame)
-                except Exception as e:
-                    logger.warning("[Notifier] Cascade push to %s failed: %s", cid, e)
-
-        # Recurse
-        _cascade(rel.target, action, target_params, None, visited, depth=depth + 1)
 
 
 class InProcSyncPushPort:
@@ -305,7 +238,7 @@ def notify_entity_change(
     data: Optional[Dict[str, Any]] = None,
     request_id: Optional[str] = None,
 ) -> None:
-    """Record mutation + push delta to ALL subscribed clients + cascade.
+    """Record mutation + push delta to all entangled clients.
 
     Delegates to SyncPushPort (see push_port.set_sync_push_port).
     """

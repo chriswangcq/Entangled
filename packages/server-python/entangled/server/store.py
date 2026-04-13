@@ -451,11 +451,11 @@ class EntityStore(EntityStoreProtocol):
         data: Optional[Dict[str, Any]] = None,
         request_id: Optional[str] = None,
     ) -> None:
-        """Notify subscribed clients of an entity change with inline data.
+        """Notify entangled clients of an entity change with inline data.
 
         WARNING: If the entity has key_params but params is empty, the delta push
         will be sent to state_key="entity" instead of "entity:[['key','val']]",
-        which means NO subscriber will receive it (they subscribe with params).
+        which means NO entangled peer will receive it (they entangle with params).
         This is almost always a bug in the caller.
         """
         # Defense: warn if entity has key_params but notification has empty params
@@ -464,7 +464,7 @@ class EntityStore(EntityStoreProtocol):
             if defn.key_params and not params:
                 logger.warning(
                     "[Entangled] ⚠️  _notify_change('%s', '%s') called with empty params "
-                    "but entity has key_params=%s — delta push will NOT reach any subscriber! "
+                    "but entity has key_params=%s — delta push will NOT reach any entangled peer! "
                     "entity_id=%s. This is almost certainly a bug in the caller.",
                     entity, action, defn.key_params, entity_id,
                 )

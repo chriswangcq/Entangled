@@ -1,13 +1,18 @@
 """
 entangled/server/ws_handler.py — WebSocket handler for Entangled protocol.
 
-Handles:
-  1. Connect: register client, push schema (with hash for skip-if-unchanged)
-  2. Subscribe/Unsubscribe: establish/break entity entanglement
-  3. Request: dispatch entity CRUD/action
-  4. Load More: backward pagination (first-class protocol message)
-  5. Heartbeat: server-side dead-connection detection
-  6. Disconnect: cleanup subscriptions
+Three-operation model (quantum entanglement ideal):
+  1. Entangle/Disentangle: establish/break entity entanglement
+  2. Action: first-class mutation verb (create/update/delete/upsert/custom)
+  3. Passive sync: server pushes sync frames automatically
+
+Legacy support (deprecated):
+  - Request: generic RPC dispatch (prefer action + local cache reads)
+  - Load More: backward pagination (prefer entangle with before_id)
+
+Infrastructure:
+  - Heartbeat: server-side dead-connection detection
+  - Connect: register client, push schema
 """
 
 import asyncio
@@ -21,7 +26,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
 # Starlette is an optional dependency — only needed for create_ws_handler().
-# Hosts that use the public handler APIs (handle_subscribe, etc.) don't need it.
+# Hosts that use the public handler APIs (handle_entangle, etc.) don't need it.
 try:
     from starlette.websockets import WebSocket, WebSocketDisconnect
 except ImportError:  # pragma: no cover
@@ -45,12 +50,12 @@ from .sync import resolve_sync, snapshot_for_resolve, _pk_value_from_row
 
 logger = logging.getLogger(__name__)
 
-# B.3: subscribe delta path called full resolve again (get_ops_since returned None).
-_subscribe_reconcile_fallback_total = 0
+# B.3: entangle delta path called full resolve again (get_ops_since returned None).
+_entangle_reconcile_fallback_total = 0
 
 
-def get_subscribe_reconcile_fallback_total() -> int:
-    return _subscribe_reconcile_fallback_total
+def get_entangle_reconcile_fallback_total() -> int:
+    return _entangle_reconcile_fallback_total
 
 
 # ── Configuration ────────────────────────────────────────────────
@@ -192,14 +197,16 @@ def create_ws_handler(
                 msg = json.loads(raw)
                 msg_type = msg.get("type")
 
-                if msg_type == "request":
-                    await handle_request(websocket, store, user_id, msg)
-                elif msg_type == "subscribe":
-                    await handle_subscribe(
+                if msg_type in ("entangle", "subscribe"):
+                    await handle_entangle(
                         websocket, store, user_id, client_id, msg,
                     )
-                elif msg_type == "unsubscribe":
-                    handle_unsubscribe(client_id, msg, store=store)
+                elif msg_type in ("disentangle", "unsubscribe"):
+                    handle_disentangle(client_id, msg, store=store)
+                elif msg_type == "action":
+                    await handle_action(websocket, store, user_id, client_id, msg)
+                elif msg_type == "request":
+                    await handle_request(websocket, store, user_id, msg)
                 elif msg_type == "load_more":
                     await handle_load_more(websocket, store, user_id, msg)
                 elif msg_type in ("ping", "pong", "heartbeat"):
@@ -222,22 +229,9 @@ def create_ws_handler(
     return ws_handler
 
 
-# ── Subscribe ────────────────────────────────────────────────────
+# ── Entangle ─────────────────────────────────────────────────────
 
-def cascade_targets(store: EntityStore, entity: str) -> list:
-    """Return [entity] + its subscription_cascade targets (deduped, ordered)."""
-    targets = [entity]
-    try:
-        defn = store.get_def(entity)
-    except KeyError:
-        return targets
-    for t in defn.subscription_cascade:
-        if t and t not in targets:
-            targets.append(t)
-    return targets
-
-
-async def _subscribe_one(
+async def _entangle_one(
     ws: WsSender,
     store: EntityStore,
     user_id: str,
@@ -248,15 +242,15 @@ async def _subscribe_one(
     client_head,
     depth,
 ) -> None:
-    """Subscribe + resolve_sync + send frame for a single entity."""
+    """Entangle + resolve_sync + send frame for a single entity."""
     try:
         defn = store.get_def(entity)
     except KeyError:
-        logger.debug("[WS] Cascade target %s unknown, skipping", entity)
+        logger.debug("[WS] Entity %s unknown, skipping", entity)
         return
 
     registry = get_sync_registry()
-    registry.subscribe(client_id, entity, params)
+    registry.entangle(client_id, entity, params)
 
     state = registry.get_state(entity, params)
     # Copy op-log/version before any await — then run resolve_sync + DB in a worker thread
@@ -296,7 +290,7 @@ async def _subscribe_one(
     sync_result = await asyncio.to_thread(_resolve_in_thread)
     _resolve_ms = (time.perf_counter() - _t0) * 1000.0
     logger.debug(
-        "[WS] subscribe resolve_thread_ms=%.1f entity=%s client=%s mode=%s",
+        "[WS] entangle resolve_thread_ms=%.1f entity=%s client=%s mode=%s",
         _resolve_ms,
         entity,
         client_id[:8],
@@ -309,7 +303,7 @@ async def _subscribe_one(
     if sync_result.get("mode") == "delta" and client_version is not None:
         ops2 = fresh.get_ops_since(client_version)
         if ops2 is None:
-            global _subscribe_reconcile_fallback_total
+            global _entangle_reconcile_fallback_total
 
             def _reconcile_fallback_resolve():
                 return resolve_sync(
@@ -327,12 +321,12 @@ async def _subscribe_one(
 
             sync_result = await asyncio.to_thread(_reconcile_fallback_resolve)
             sync_result["version"] = registry.get_state(entity, params).current_version
-            _subscribe_reconcile_fallback_total += 1
+            _entangle_reconcile_fallback_total += 1
             logger.debug(
                 "[WS] reconcile_fallback_to_thread entity=%s client=%s total=%d",
                 entity,
                 client_id[:8],
-                _subscribe_reconcile_fallback_total,
+                _entangle_reconcile_fallback_total,
             )
         else:
             sync_result["ops"] = [o.to_dict() for o in ops2]
@@ -348,23 +342,34 @@ async def _subscribe_one(
     await ws.send_json(frame)
 
     logger.info(
-        "[WS] %s subscribed to %s (mode=%s, v%d)",
+        "[WS] %s entangled with %s (mode=%s, v%d)",
         client_id[:8], entity, sync_result["mode"], sync_result["version"],
     )
 
 
-async def handle_subscribe(
+async def handle_entangle(
     ws: WsSender,
     store: EntityStore,
     user_id: str,
     client_id: str,
     msg: dict,
 ) -> None:
+    """Establish entity entanglement, or deepen the entanglement window.
+
+    Standard entangle:
+        {type: "entangle", entity, params?, version?, depth?}
+        → server sends sync frame (snapshot/delta/head_n)
+
+    Deepen window (replaces load_more):
+        {type: "entangle", entity, params?, before_id, limit?}
+        → server sends {type: "sync", entity, params, mode: "page", ...}
+    """
     entity = msg.get("entity", "")
     params = msg.get("params") or None  # Normalize
     client_version = msg.get("version")
     client_head = msg.get("head")
     depth = msg.get("depth")
+    before_id = msg.get("before_id")
 
     if not entity:
         await ws.send_json({"type": "error", "error": "entity is required"})
@@ -376,45 +381,94 @@ async def handle_subscribe(
         await ws.send_json({"type": "error", "error": f"Unknown entity: {entity}"})
         return
 
-    # Server-side cascade expansion: subscribe to entity + all its cascade targets.
-    # Client sends ONE subscribe; server fans out and sends one sync frame per target.
-    targets = cascade_targets(store, entity)
-    for target in targets:
-        await _subscribe_one(
-            ws, store, user_id, client_id, target, params,
-            client_version, client_head, depth,
-        )
+    # Deepen window: entangle with before_id → fetch older page
+    if before_id is not None:
+        limit = min(int(msg.get("limit", 50)), 500)
+        request_id = msg.get("request_id") or msg.get("requestId", "")
+        await _entangle_deepen(ws, store, user_id, entity, params, before_id, limit, request_id)
+        return
 
-    if len(targets) > 1:
-        logger.debug(
-            "[WS] %s subscribe %s cascaded to %s",
-            client_id[:8], entity, targets[1:],
-        )
+    # Standard entangle
+    await _entangle_one(
+        ws, store, user_id, client_id, entity, params,
+        client_version, client_head, depth,
+    )
 
 
-# ── Unsubscribe ──────────────────────────────────────────────────
+async def _entangle_deepen(
+    ws: WsSender,
+    store: EntityStore,
+    user_id: str,
+    entity: str,
+    params: Optional[dict],
+    before_id: str,
+    limit: int,
+    request_id: str,
+) -> None:
+    """Deepen the entanglement window — fetch older entries for a stream entity."""
+    try:
+        defn = store.get_def(entity)
 
-def handle_unsubscribe(client_id: str, msg: dict, store: Optional[EntityStore] = None) -> None:
+        def _fetch():
+            entries = store.list_stream(
+                entity, user_id,
+                before_id=before_id,
+                limit=limit,
+                params=params or {},
+            )
+            if not entries:
+                has_more = False
+            elif defn.sync_type == "stream" and (defn.exists_before_fn or hasattr(store, 'exists_before')):
+                id_field = getattr(defn, "id_field", "id")
+                oldest_id = _pk_value_from_row(entries[-1], id_field) if entries else None
+                has_more = store.exists_before(entity, user_id, oldest_id, params=params or {}) if oldest_id else False
+            else:
+                has_more = len(entries) >= limit
+            return entries, has_more
+
+        entries, has_more = await asyncio.to_thread(_fetch)
+
+        await ws.send_json({
+            "type": "sync",
+            "entity": entity,
+            "params": params if params else None,
+            "mode": "page",
+            "data": entries,
+            "hasMore": has_more,
+            "requestId": request_id if request_id else None,
+        })
+    except Exception as e:
+        logger.error("[WS] entangle deepen %s failed: %s\n%s", entity, e, traceback.format_exc())
+        await ws.send_json({
+            "type": "error",
+            "entity": entity,
+            "error": str(e),
+            "requestId": request_id if request_id else None,
+        })
+
+
+# Backward-compat alias
+handle_subscribe = handle_entangle
+
+
+# ── Disentangle ──────────────────────────────────────────────────
+
+def handle_disentangle(client_id: str, msg: dict, store: Optional[EntityStore] = None) -> None:
     entity = msg.get("entity", "")
     params = msg.get("params") or None
     if not entity:
         return
 
     registry = get_sync_registry()
-
-    # Server-side cascade: unsubscribe entity + cascade targets
-    if store:
-        targets = cascade_targets(store, entity)
-    else:
-        targets = [entity]
-
-    for target in targets:
-        registry.unsubscribe(client_id, target, params)
-
-    logger.debug("[WS] %s unsubscribed from %s", client_id[:8], targets)
+    registry.disentangle(client_id, entity, params)
+    logger.debug("[WS] %s disentangled from %s", client_id[:8], entity)
 
 
-# ── Load More (backward pagination, first-class protocol) ────────
+# Backward-compat alias
+handle_unsubscribe = handle_disentangle
+
+
+# ── Load More (DEPRECATED — use entangle with before_id) ─────────
 
 async def handle_load_more(
     ws: WsSender,
@@ -422,7 +476,11 @@ async def handle_load_more(
     user_id: str,
     msg: dict,
 ) -> None:
-    """Handle backward pagination as a first-class Entangled protocol message.
+    """[DEPRECATED] Backward pagination — prefer ``entangle`` with ``before_id``.
+
+    New clients should send ``{type: "entangle", entity, before_id, limit}``
+    to deepen their entanglement window.  This handler is kept for backward
+    compatibility only.
 
     Protocol:
         Client sends: {type: "load_more", request_id, entity, params, before_id, limit}
@@ -486,9 +544,128 @@ async def handle_load_more(
         })
 
 
-# ── Request ──────────────────────────────────────────────────────
+# ── Action (first-class mutation verb) ────────────────────────────
+#
+# The "action" message type is the canonical way for clients to mutate
+# entities.  Built-in ops (create/update/delete/upsert) and custom
+# EntityDef actions all flow through the same path.
+#
+# Protocol:
+#   Client sends: {type: "action", request_id, entity, op, id?, params?, data?}
+#   Server sends: {type: "ack", request_id, success, data?, error?}
+#
+# On success the mutation also triggers a sync delta to all entangled
+# clients (including the originator, with request_id for optimistic-
+# update correlation).
+
+
+async def handle_action(
+    ws: WsSender,
+    store: EntityStore,
+    user_id: str,
+    client_id: str,
+    msg: dict,
+) -> None:
+    """Handle a first-class action message (mutation intent)."""
+    request_id = msg.get("request_id") or msg.get("requestId", "")
+    entity = msg.get("entity", "")
+    op = msg.get("op", "")
+    entity_id = msg.get("id")
+    params = msg.get("params") or {}
+    payload = msg.get("data") or {}
+
+    if not entity:
+        await ws.send_json({"type": "ack", "request_id": request_id, "success": False, "error": "entity is required"})
+        return
+    if not op:
+        await ws.send_json({"type": "ack", "request_id": request_id, "success": False, "error": "op is required"})
+        return
+
+    try:
+        result = await _dispatch_action(store, user_id, entity, op, entity_id, params, payload, request_id)
+        await ws.send_json({
+            "type": "ack",
+            "request_id": request_id,
+            **result,
+        })
+    except Exception as e:
+        logger.error("[WS] Action %s.%s failed: %s\n%s", entity, op, e, traceback.format_exc())
+        await ws.send_json({
+            "type": "ack",
+            "request_id": request_id,
+            "success": False,
+            "error": str(e),
+        })
+
+
+def _dispatch_action_blocking(
+    store: EntityStore, user_id: str,
+    entity: str, op: str, entity_id: Optional[str],
+    params: dict, payload: dict, request_id: str,
+) -> dict:
+    """Execute a built-in mutation (create/update/delete/upsert) in a worker thread."""
+    try:
+        store.get_def(entity)
+
+        if op == "create":
+            result = store.create(entity, user_id, payload, params=params, request_id=request_id or None)
+            return {"success": True, "data": result}
+        if op == "update":
+            if not entity_id:
+                return {"success": False, "error": "id is required for update"}
+            result = store.update(entity, user_id, entity_id, payload, params=params, request_id=request_id or None)
+            return {"success": True, "data": result}
+        if op == "upsert":
+            if not entity_id:
+                return {"success": False, "error": "id is required for upsert"}
+            result = store.upsert(entity, user_id, entity_id, payload, params=params, request_id=request_id or None)
+            return {"success": True, "data": result}
+        if op == "delete":
+            if not entity_id:
+                return {"success": False, "error": "id is required for delete"}
+            ok = store.delete(entity, user_id, entity_id, params=params, request_id=request_id or None)
+            return {"success": True} if ok else {"success": False, "error": "not found"}
+
+        return {"success": False, "error": f"Unknown action op: {op}"}
+
+    except (KeyError, PermissionError, NotImplementedError) as e:
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.error("[WS] Action dispatch error: %s.%s %s", entity, op, e)
+        return {"success": False, "error": str(e)}
+
+
+async def _dispatch_action(
+    store: EntityStore, user_id: str,
+    entity: str, op: str, entity_id: Optional[str],
+    params: dict, payload: dict, request_id: str,
+) -> dict:
+    """Route action to the correct executor (async for custom actions, thread for CRUD)."""
+    if op not in ("create", "update", "delete", "upsert"):
+        # Custom EntityDef action — runs on the asyncio loop
+        try:
+            store.get_def(entity)
+            result = await store.action(entity, user_id, op, params, payload)
+            return {"success": True, "data": result}
+        except (KeyError, PermissionError, NotImplementedError) as e:
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error("[WS] Action dispatch error: %s.%s %s", entity, op, e)
+            return {"success": False, "error": str(e)}
+
+    return await asyncio.to_thread(
+        _dispatch_action_blocking, store, user_id, entity, op, entity_id, params, payload, request_id,
+    )
+
+
+# ── Request (deprecated — use "action" for mutations) ────────────
+#
+# The "request" message type is retained for backward compatibility.
+# New clients should use "action" for mutations and read from local
+# cache (populated by entangle sync) instead of WS reads.
 
 async def handle_request(ws: WsSender, store: EntityStore, user_id: str, msg: dict) -> None:
+    """[DEPRECATED] Generic RPC dispatch — prefer ``action`` for mutations."""
     request_id = msg.get("request_id", "")
     data = msg.get("data", {})
 
@@ -511,10 +688,13 @@ async def handle_request(ws: WsSender, store: EntityStore, user_id: str, msg: di
 def _dispatch_entity_ops_blocking(
     store: EntityStore, user_id: str, data: dict, request_id: str
 ) -> dict:
-    """list/get/create/update/… — runs in ``asyncio.to_thread``.
+    """[DEPRECATED] list/get/create/update/… — runs in ``asyncio.to_thread``.
 
-    Host ``EntityStore`` / DB must allow concurrent access from worker threads
-    (e.g. NovAIC ``Database`` thread-local SQLite connections).
+    Read ops (list, get, list_stream, list_all) are **deprecated** on the WS
+    protocol.  Clients should entangle with the entity and read from their
+    local cache.  These ops remain for backward compatibility only.
+
+    For mutations, prefer the first-class ``action`` message type.
     """
     op = data.get("op", "")
     entity = data.get("entity", "")
@@ -527,6 +707,7 @@ def _dispatch_entity_ops_blocking(
 
         _MAX_LIST_ENTRIES = 5000
 
+        # ── Read ops (DEPRECATED — use local cache after entangle) ──
         if op == "list":
             entries = store.list(entity, user_id, params=params)
             if len(entries) > _MAX_LIST_ENTRIES:
@@ -560,6 +741,8 @@ def _dispatch_entity_ops_blocking(
             if item is None:
                 return {"success": False, "error": f"{entity} {entity_id} not found"}
             return {"success": True, "data": item}
+
+        # ── Mutation ops (DEPRECATED — use "action" message type) ──
         if op == "create":
             result = store.create(
                 entity, user_id, payload, params=params, request_id=request_id or None
@@ -608,6 +791,7 @@ def _dispatch_entity_ops_blocking(
 
 
 async def _dispatch(store: EntityStore, user_id: str, data: dict, request_id: str = "") -> dict:
+    """[DEPRECATED] Route request ops — kept for backward compatibility."""
     op = data.get("op", "")
     entity = data.get("entity", "")
     params = data.get("params") or {}
