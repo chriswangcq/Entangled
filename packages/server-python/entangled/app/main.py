@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--host", default=None, help="Host to bind")
     parser.add_argument("--port", type=int, default=None, help="Port to listen")
     parser.add_argument("--db-path", default=None, help="SQLite database path")
+    parser.add_argument("--service-token", default=None, help="Service-to-service auth token (shared JWT secret)")
     parser.add_argument("--log-level", default=None, help="Log level")
     args = parser.parse_args()
 
@@ -27,6 +28,9 @@ def main():
         config.port = args.port
     if args.db_path:
         config.db_path = args.db_path
+    if args.service_token:
+        config.service_token = args.service_token
+        config.jwt_secret = args.service_token
     if args.log_level:
         config.log_level = args.log_level
 
