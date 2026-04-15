@@ -609,9 +609,20 @@ class SqlEntityStore(BaseStore):
             headers["X-Service-Token"] = service_token
 
         def _do_request() -> Any:
+            import urllib.error
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                resp_body = json.loads(resp.read())
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    resp_body = json.loads(resp.read())
+            except urllib.error.HTTPError as he:
+                try:
+                    err_body = json.loads(he.read())
+                    detail = err_body.get("detail", err_body.get("error", str(he)))
+                except Exception:
+                    detail = str(he)
+                raise RuntimeError(
+                    f"Action hook {entity}.{action_name} returned {he.code}: {detail}"
+                ) from he
             if not resp_body.get("success"):
                 raise RuntimeError(resp_body.get("error", f"Action hook failed: {entity}.{action_name}"))
             return resp_body.get("data")
