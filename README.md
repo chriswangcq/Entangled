@@ -29,15 +29,16 @@ python -m entangled.app.main --port 19900 --db-path data/entangled.db
 entangled-service --port 19900
 ```
 
-环境变量：
+运行配置通过 CLI 参数传入，`packages/server-python/entangled/app/config.py`
+不读取任何环境变量。
 
-| 变量 | 默认值 | 说明 |
+| 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `ENTANGLED_HOST` | `0.0.0.0` | 绑定地址 |
-| `ENTANGLED_PORT` | `19900` | 端口 |
-| `ENTANGLED_DB_PATH` | `data/entangled.db` | SQLite 路径 |
-| `JWT_SECRET` | _(空)_ | JWT 密钥 |
-| `ENTANGLED_SERVICE_TOKEN` | _(空)_ | 服务间认证 token |
+| `--host` | `0.0.0.0` | 绑定地址 |
+| `--port` | `19900` | 端口 |
+| `--db-path` | `data/entangled.db` | SQLite 路径 |
+| `--service-token` | _(空)_ | 服务间认证 token，同时作为 `jwt_secret` |
+| `--log-level` | `INFO` | 日志级别 |
 
 ## 作为库使用
 
