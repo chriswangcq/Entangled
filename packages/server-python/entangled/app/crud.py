@@ -436,7 +436,7 @@ def stream_chunk(
     return {"ok": True}
 
 
-@router.delete("/{entity}/where")
+@router.post("/{entity}/delete-where")
 def delete_where(
     entity: str,
     body: DeleteWhereBody,
