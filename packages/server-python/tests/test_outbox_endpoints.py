@@ -164,3 +164,32 @@ def test_claim_and_mark_failed_permanent(client, db):
     # Should not be claimed again because attempts >= 5
     res3 = client.post("/v1/outbox/claim", json={"worker_id": "w2", "max_attempts": 5})
     assert res3.json()["count"] == 0
+
+def test_claim_ttl_expires_and_reclaims(client, db):
+    db.execute("""
+        INSERT INTO message_outbox 
+        (message_id, agent_id, trigger_type, payload_json, created_at)
+        VALUES ('msg_recover', 'agt_1', 'user_message', '{}', 1000)
+    """)
+    
+    # Worker A claims with 100ms TTL
+    r1 = client.post("/v1/outbox/claim", json={"worker_id": "w_a", "claim_ttl_ms": 100})
+    assert r1.json()["count"] == 1
+    row_id = r1.json()["rows"][0]["id"]
+    
+    # Worker B immediately claims -> 0 rows (A holds lock)
+    r2 = client.post("/v1/outbox/claim", json={"worker_id": "w_b", "claim_ttl_ms": 100})
+    assert r2.json()["count"] == 0
+    
+    # Wait for TTL expiration
+    import time
+    time.sleep(0.15)
+    
+    # Worker B claims -> gets SAME row (this is the real recovery semantic)
+    r3 = client.post("/v1/outbox/claim", json={"worker_id": "w_b", "claim_ttl_ms": 100})
+    assert r3.json()["count"] == 1
+    assert r3.json()["rows"][0]["id"] == row_id
+    
+    # Verify locked_by swapped
+    db_row = db.execute("SELECT locked_by FROM message_outbox WHERE id = ?", (row_id,)).fetchone()
+    assert db_row["locked_by"] == "w_b"
