@@ -45,7 +45,7 @@ class MarkAckResponse(BaseModel):
 def claim_outbox(req: ClaimRequest, db=Depends(get_db), _: dict = Depends(verify_service_or_user)):
     import time
     now_ms = int(time.time() * 1000)
-    
+
     # DLQ semantic: attempts < max_attempts ensures poison messages aren't infinitely claimed
     sql = """
         UPDATE message_outbox
@@ -61,14 +61,19 @@ def claim_outbox(req: ClaimRequest, db=Depends(get_db), _: dict = Depends(verify
          RETURNING id, message_id, agent_id, trigger_type, payload_json, attempts, created_at
     """
     locked_until = now_ms + req.claim_ttl_ms
-    rows = db.execute(sql, (
-        req.worker_id, 
-        locked_until, 
-        now_ms, 
-        req.max_attempts, 
-        req.batch_size
-    )).fetchall()
-    
+    # PR-17: wrap in Entangled's global FIFO lock so the claim UPDATE serializes
+    # against concurrent message appends (SqlEntityStore.append also uses this
+    # lock). Without this, the subscriber's 2 TPS polling + concurrent writes
+    # collide under SQLite's busy_timeout and return 500 "database is locked".
+    with db.transaction("global"):
+        rows = db.execute(sql, (
+            req.worker_id,
+            locked_until,
+            now_ms,
+            req.max_attempts,
+            req.batch_size
+        )).fetchall()
+
     out = []
     for row in rows:
         out.append(ClaimedRow(
@@ -80,17 +85,17 @@ def claim_outbox(req: ClaimRequest, db=Depends(get_db), _: dict = Depends(verify
             attempts=row["attempts"],
             created_at=row["created_at"],
         ))
-        
+
     return ClaimResponse(rows=out, count=len(out))
 
 @router.post("/mark_delivered", response_model=MarkAckResponse)
 def mark_delivered(req: MarkDeliveredRequest, db=Depends(get_db), _: dict = Depends(verify_service_or_user)):
     if not req.ids:
         return MarkAckResponse(updated=0)
-        
+
     import time
     now_ms = int(time.time() * 1000)
-    
+
     placeholders = ",".join(["?"] * len(req.ids))
     sql = f"""
         UPDATE message_outbox
@@ -98,38 +103,40 @@ def mark_delivered(req: MarkDeliveredRequest, db=Depends(get_db), _: dict = Depe
          WHERE id IN ({placeholders})
     """
     params = [now_ms] + req.ids
-    
-    cur = db.execute(sql, params)
-    return MarkAckResponse(updated=cur.rowcount)
+
+    with db.transaction("global"):
+        cur = db.execute(sql, params)
+        updated = cur.rowcount
+    return MarkAckResponse(updated=updated)
 
 @router.post("/mark_failed", response_model=MarkAckResponse)
 def mark_failed(req: MarkFailedRequest, db=Depends(get_db), _: dict = Depends(verify_service_or_user)):
     import time
     now_ms = int(time.time() * 1000)
-    
-    row = db.execute("SELECT attempts FROM message_outbox WHERE id = ?", (req.id,)).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Outbox message not found")
-        
-    attempts = row["attempts"] + 1
-    
-    if req.permanent:
-        # If permanent, we boost attempts to a very high number (or max_attempts) 
-        # so it drops out of the claim query. We leave locked_until = NULL so it's technically free
-        # but the attempts < max_attempts clause ignores it.
-        # Let's set it to a very high number to be safe.
-        attempts = 999999
-        locked_until = None
-    else:
-        locked_until = now_ms + (req.retry_delay_ms or 1000)
-        
-    sql = """
-        UPDATE message_outbox
-           SET attempts = ?, last_error = ?, locked_by = NULL, locked_until = ?
-         WHERE id = ?
-    """
-    
-    error_msg = f"{req.kind}: {req.error}"
-    cur = db.execute(sql, (attempts, error_msg, locked_until, req.id))
-    
-    return MarkAckResponse(updated=cur.rowcount)
+
+    with db.transaction("global"):
+        row = db.execute("SELECT attempts FROM message_outbox WHERE id = ?", (req.id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Outbox message not found")
+
+        attempts = row["attempts"] + 1
+
+        if req.permanent:
+            # Sentinel value 999999 drops the row from the claim query's
+            # `attempts < max_attempts` filter. See PR-26 TD about recording
+            # the real attempt count for observability.
+            attempts = 999999
+            locked_until = None
+        else:
+            locked_until = now_ms + (req.retry_delay_ms or 1000)
+
+        sql = """
+            UPDATE message_outbox
+               SET attempts = ?, last_error = ?, locked_by = NULL, locked_until = ?
+             WHERE id = ?
+        """
+
+        error_msg = f"{req.kind}: {req.error}"
+        cur = db.execute(sql, (attempts, error_msg, locked_until, req.id))
+        updated = cur.rowcount
+    return MarkAckResponse(updated=updated)
