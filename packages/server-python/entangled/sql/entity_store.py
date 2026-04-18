@@ -13,6 +13,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -45,6 +46,7 @@ class SqlEntityStore(BaseStore):
     def __init__(self, db=None):
         super().__init__([])
         self._db = db
+        self._outbox_schema_ensured = False
 
     @property
     def db(self):
@@ -110,6 +112,41 @@ class SqlEntityStore(BaseStore):
         for defn in self._defs.values():
             if defn.fields:
                 self.ensure_schema(defn)
+        # Ensure outbox table exists if any entity uses outbox triggers
+        if any(getattr(d, 'outbox_trigger_types', None) for d in self._defs.values()):
+            self._ensure_outbox_schema()
+
+    def _ensure_outbox_schema(self) -> None:
+        """Idempotent creation of the message_outbox infrastructure table.
+
+        This table is NOT a registered entity — it is an internal
+        changefeed mechanism used by the dispatch subscriber (PR-15/16).
+        """
+        if self._outbox_schema_ensured:
+            return
+        with self.db.transaction("global"):
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS message_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL UNIQUE,
+                    agent_id TEXT NOT NULL,
+                    trigger_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    delivered_at INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    locked_by TEXT,
+                    locked_until INTEGER
+                )
+            """)
+            self.db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_outbox_undelivered
+                ON message_outbox (delivered_at, locked_until, id)
+                WHERE delivered_at IS NULL
+            """)
+        self._outbox_schema_ensured = True
+        logger.info("[SqlEntityStore] message_outbox schema ensured")
 
     def get_def(self, entity: str) -> SqlEntityDef:
         defn = self._defs.get(entity)
@@ -515,6 +552,46 @@ class SqlEntityStore(BaseStore):
             if is_auto_int and cur.lastrowid:
                 row[defn.id_field] = cur.lastrowid
                 res_id = str(cur.lastrowid)
+            # Co-transaction outbox insert
+            if defn.outbox_trigger_types:
+                msg_type = row.get("type", "")
+                trigger_value = defn.outbox_trigger_types.get(msg_type)
+                if trigger_value:
+                    entity_id_val = str(row.get(defn.id_field, res_id))
+                    agent_id_val = row.get("agent_id", "")
+                    # metadata may be a JSON string from _in(); decode for payload
+                    raw_meta = row.get("metadata")
+                    if isinstance(raw_meta, str):
+                        try:
+                            meta_dict = json.loads(raw_meta)
+                        except (json.JSONDecodeError, TypeError):
+                            meta_dict = {}
+                    else:
+                        meta_dict = raw_meta or {}
+                    payload = {
+                        "message_ids": [entity_id_val],
+                        "metadata": meta_dict,
+                    }
+                    # Extract subagent_id from metadata if present
+                    sub_id = meta_dict.get("target_subagent_id") or meta_dict.get("subagent_id")
+                    if sub_id:
+                        payload["subagent_id"] = sub_id
+                    self.db.execute("""
+                        INSERT INTO message_outbox
+                            (message_id, agent_id, trigger_type, payload_json, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(message_id) DO NOTHING
+                    """, (
+                        entity_id_val,
+                        agent_id_val,
+                        trigger_value,
+                        json.dumps(payload, ensure_ascii=False),
+                        int(time.time() * 1000),
+                    ))
+                    logger.info(
+                        "event=outbox_enqueue message_id=%s agent=%s trigger=%s",
+                        entity_id_val, agent_id_val, trigger_value,
+                    )
         entity_id = str(row.get(defn.id_field, res_id))
         result = self.get(entity, user_id, entity_id, params=params) or row
         if notify:
