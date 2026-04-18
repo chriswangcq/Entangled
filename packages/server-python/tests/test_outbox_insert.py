@@ -135,8 +135,11 @@ def test_assistant_message_no_outbox_row(store):
     assert row is None
 
 
-def test_duplicate_message_id_silent(store):
-    """ON CONFLICT(message_id) DO NOTHING should silently skip duplicates."""
+def test_duplicate_outbox_insert_silent(store):
+    """ON CONFLICT(message_id) DO NOTHING protects against subscriber retries.
+    NOTE: Not triggered through append() in normal flow (chat_messages PK fires first).
+    Simulated here by direct SQL insert to verify the constraint semantics for PR-15/16.
+    """
     data = {
         "id": "msg-dup",
         "agent_id": "agent-abc",

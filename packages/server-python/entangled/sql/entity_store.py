@@ -106,6 +106,9 @@ class SqlEntityStore(BaseStore):
             for alter_sql in entity_def.alter_add_column_sqls(existing_cols):
                 logger.info("[SqlEntityStore] Migrating: %s", alter_sql)
                 self.db.execute(alter_sql)
+        # Auto-create outbox infrastructure if this entity uses it
+        if getattr(entity_def, 'outbox_trigger_types', None):
+            self._ensure_outbox_schema()
 
     def ensure_all_schemas(self) -> None:
         """Run ensure_schema for all registered entities that have fields."""
