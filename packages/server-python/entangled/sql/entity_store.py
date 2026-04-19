@@ -15,12 +15,26 @@ import json
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..server.store import EntityStore as BaseStore
 from .entity_def import SqlEntityDef
 
 logger = logging.getLogger(__name__)
+
+
+def _iso_now_utc() -> str:
+    """ISO-8601 UTC timestamp with millisecond precision and 'Z' suffix.
+
+    Kept in sync with `common.utils.time.utc_now_iso` in the business layer so
+    that *all* NOT-NULL timestamp fields end up with one canonical wire format
+    regardless of which code path wrote them. Entangled is a foundation package
+    and cannot import from novaic-common, so the format literal is duplicated
+    here; a cross-repo format test (tests/test_timestamp_format_parity.py)
+    locks the two helpers together.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 class SqlEntityStore(BaseStore):
@@ -346,6 +360,7 @@ class SqlEntityStore(BaseStore):
                 res_id = uuid.uuid4().hex
                 row[defn.id_field] = res_id
 
+        self._apply_defaults(defn, row)
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
         sql = f"INSERT INTO {defn.table} ({', '.join(cols)}) VALUES ({ph})"
@@ -396,6 +411,7 @@ class SqlEntityStore(BaseStore):
             for kp in defn.key_params:
                 if kp in params:
                     row[kp] = params[kp]
+        self._apply_defaults(defn, row)
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
         update_parts = [f"{c} = excluded.{c}" for c in cols if c != defn.id_field]
@@ -547,6 +563,7 @@ class SqlEntityStore(BaseStore):
                 res_id = uuid.uuid4().hex
                 row[defn.id_field] = res_id
         lock_id = res_id or (params.get(defn.key_params[0], "") if params and defn.key_params else "") or "auto"
+        self._apply_defaults(defn, row)
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
         sql = f"INSERT INTO {defn.table} ({', '.join(cols)}) VALUES ({ph})"
@@ -763,6 +780,38 @@ class SqlEntityStore(BaseStore):
             if k in fm:
                 result[k] = fm[k].serialize(result[k])
         return result
+
+    def _apply_defaults(self, defn: SqlEntityDef, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Fill schema-declared defaults for NOT NULL fields missing from `row`.
+
+        Purpose: eliminate the "silent 400 on missing NOT NULL" class of bugs
+        (see novaic /docs/roadmap/tickets/PR-33 §"no silent failure"). A field
+        declared ``nullable=False, default=<X>`` carries an explicit intent:
+        *if the caller did not provide this value, fill X*. Previously that
+        intent was only honored via a SQL ``DEFAULT`` clause at CREATE TABLE
+        time, which does NOT apply to existing tables and does NOT propagate
+        through generic CRUD callers that don't know per-entity semantics
+        (e.g. agent-runtime's ``gw.entity_create("messages", {...})``).
+
+        Scope (deliberately narrow to avoid behaviour change for existing
+        fields such as ``F.timestamp(auto=True)`` which are ``nullable=True``):
+
+            * Only fields with ``nullable=False`` AND ``default is not None``
+              AND whose name is NOT already present in ``row``.
+            * ``default="NOW"``  →  filled with :func:`_iso_now_utc`.
+            * Any other literal  →  filled verbatim.
+
+        Explicit ``None`` from the caller is left untouched (the caller has
+        stated an intent; we honour it and let the SQL layer fail loudly).
+        """
+        fm = defn.field_map
+        for f in defn.fields:
+            if f.nullable or f.default is None:
+                continue
+            if f.name in row:
+                continue
+            row[f.name] = _iso_now_utc() if f.default == "NOW" else f.default
+        return row
 
     def _out(self, defn: SqlEntityDef, row: Dict[str, Any], *, include_hidden: bool = False) -> Dict[str, Any]:
         """DB row → Python dict (deserialize + strip hidden + compute has_* fields)."""
