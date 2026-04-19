@@ -361,6 +361,7 @@ class SqlEntityStore(BaseStore):
                 row[defn.id_field] = res_id
 
         self._apply_defaults(defn, row)
+        self._check_required(defn, row)
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
         sql = f"INSERT INTO {defn.table} ({', '.join(cols)}) VALUES ({ph})"
@@ -412,6 +413,7 @@ class SqlEntityStore(BaseStore):
                 if kp in params:
                     row[kp] = params[kp]
         self._apply_defaults(defn, row)
+        self._check_required(defn, row)
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
         update_parts = [f"{c} = excluded.{c}" for c in cols if c != defn.id_field]
@@ -564,6 +566,7 @@ class SqlEntityStore(BaseStore):
                 row[defn.id_field] = res_id
         lock_id = res_id or (params.get(defn.key_params[0], "") if params and defn.key_params else "") or "auto"
         self._apply_defaults(defn, row)
+        self._check_required(defn, row)
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
         sql = f"INSERT INTO {defn.table} ({', '.join(cols)}) VALUES ({ph})"
@@ -812,6 +815,45 @@ class SqlEntityStore(BaseStore):
                 continue
             row[f.name] = _iso_now_utc() if f.default == "NOW" else f.default
         return row
+
+    def _check_required(self, defn: SqlEntityDef, row: Dict[str, Any]) -> None:
+        """Raise ``ValueError`` listing every NOT-NULL, no-default, non-primary
+        field that the caller didn't provide.
+
+        Called right after :meth:`_apply_defaults` so this only fires for
+        fields the *schema* says are caller-must-provide (i.e. nullable=False
+        AND default is None). Those are business invariants — we'd rather
+        fail loudly at the Python layer with an actionable message than let
+        the write reach SQLite and surface as the opaque
+        ``IntegrityError: NOT NULL constraint failed: <table>.<col>``
+        (which an HTTP 400 hands back to the caller with no field attribution).
+
+        PR-33 §"no silent failure" motivation: the failure already happens,
+        but the caller gets *named* fields they forgot. Combined with
+        ``_apply_defaults`` this closes the loop:
+
+            * time-like defaults → filled
+            * business required → ValueError with field names
+            * nullable fields → None, SQL accepts
+
+        Crossing row ``None`` values: an explicit ``None`` is considered
+        "caller stated an intent (NULL)" and is *not* reported here —
+        ``_apply_defaults`` already documented that contract. SQL will then
+        raise the classic NOT NULL error for that case, which is loud enough
+        given the caller's deliberate None.
+        """
+        missing: List[str] = []
+        for f in defn.fields:
+            if f.nullable or f.primary or f.default is not None:
+                continue
+            if f.name in row:
+                continue
+            missing.append(f.name)
+        if missing:
+            raise ValueError(
+                f"missing required field(s) on entity='{defn.name}': "
+                f"{', '.join(missing)}"
+            )
 
     def _out(self, defn: SqlEntityDef, row: Dict[str, Any], *, include_hidden: bool = False) -> Dict[str, Any]:
         """DB row → Python dict (deserialize + strip hidden + compute has_* fields)."""
