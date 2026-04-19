@@ -13,13 +13,28 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..server.store import EntityStore as BaseStore
 from .entity_def import SqlEntityDef
 
 logger = logging.getLogger(__name__)
+
+
+def _iso_now_utc() -> str:
+    """ISO-8601 UTC timestamp with millisecond precision and 'Z' suffix.
+
+    Kept in sync with `common.utils.time.utc_now_iso` in the business layer so
+    that *all* NOT-NULL timestamp fields end up with one canonical wire format
+    regardless of which code path wrote them. Entangled is a foundation package
+    and cannot import from novaic-common, so the format literal is duplicated
+    here; a cross-repo format test (tests/test_timestamp_format_parity.py)
+    locks the two helpers together.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 class SqlEntityStore(BaseStore):
@@ -45,6 +60,7 @@ class SqlEntityStore(BaseStore):
     def __init__(self, db=None):
         super().__init__([])
         self._db = db
+        self._outbox_schema_ensured = False
 
     @property
     def db(self):
@@ -104,12 +120,50 @@ class SqlEntityStore(BaseStore):
             for alter_sql in entity_def.alter_add_column_sqls(existing_cols):
                 logger.info("[SqlEntityStore] Migrating: %s", alter_sql)
                 self.db.execute(alter_sql)
+        # Auto-create outbox infrastructure if this entity uses it
+        if getattr(entity_def, 'outbox_trigger_types', None):
+            self._ensure_outbox_schema()
 
     def ensure_all_schemas(self) -> None:
         """Run ensure_schema for all registered entities that have fields."""
         for defn in self._defs.values():
             if defn.fields:
                 self.ensure_schema(defn)
+        # Ensure outbox table exists if any entity uses outbox triggers
+        if any(getattr(d, 'outbox_trigger_types', None) for d in self._defs.values()):
+            self._ensure_outbox_schema()
+
+    def _ensure_outbox_schema(self) -> None:
+        """Idempotent creation of the message_outbox infrastructure table.
+
+        This table is NOT a registered entity — it is an internal
+        changefeed mechanism used by the dispatch subscriber (PR-15/16).
+        """
+        if self._outbox_schema_ensured:
+            return
+        with self.db.transaction("global"):
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS message_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL UNIQUE,
+                    agent_id TEXT NOT NULL,
+                    trigger_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    delivered_at INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    locked_by TEXT,
+                    locked_until INTEGER
+                )
+            """)
+            self.db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_outbox_undelivered
+                ON message_outbox (delivered_at, locked_until, id)
+                WHERE delivered_at IS NULL
+            """)
+        self._outbox_schema_ensured = True
+        logger.info("[SqlEntityStore] message_outbox schema ensured")
 
     def get_def(self, entity: str) -> SqlEntityDef:
         defn = self._defs.get(entity)
@@ -306,6 +360,8 @@ class SqlEntityStore(BaseStore):
                 res_id = uuid.uuid4().hex
                 row[defn.id_field] = res_id
 
+        self._apply_defaults(defn, row)
+        self._check_required(defn, row)
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
         sql = f"INSERT INTO {defn.table} ({', '.join(cols)}) VALUES ({ph})"
@@ -356,6 +412,8 @@ class SqlEntityStore(BaseStore):
             for kp in defn.key_params:
                 if kp in params:
                     row[kp] = params[kp]
+        self._apply_defaults(defn, row)
+        self._check_required(defn, row)
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
         update_parts = [f"{c} = excluded.{c}" for c in cols if c != defn.id_field]
@@ -507,6 +565,8 @@ class SqlEntityStore(BaseStore):
                 res_id = uuid.uuid4().hex
                 row[defn.id_field] = res_id
         lock_id = res_id or (params.get(defn.key_params[0], "") if params and defn.key_params else "") or "auto"
+        self._apply_defaults(defn, row)
+        self._check_required(defn, row)
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
         sql = f"INSERT INTO {defn.table} ({', '.join(cols)}) VALUES ({ph})"
@@ -515,6 +575,46 @@ class SqlEntityStore(BaseStore):
             if is_auto_int and cur.lastrowid:
                 row[defn.id_field] = cur.lastrowid
                 res_id = str(cur.lastrowid)
+            # Co-transaction outbox insert
+            if defn.outbox_trigger_types:
+                msg_type = row.get("type", "")
+                trigger_value = defn.outbox_trigger_types.get(msg_type)
+                if trigger_value:
+                    entity_id_val = str(row.get(defn.id_field, res_id))
+                    agent_id_val = row.get("agent_id", "")
+                    # metadata may be a JSON string from _in(); decode for payload
+                    raw_meta = row.get("metadata")
+                    if isinstance(raw_meta, str):
+                        try:
+                            meta_dict = json.loads(raw_meta)
+                        except (json.JSONDecodeError, TypeError):
+                            meta_dict = {}
+                    else:
+                        meta_dict = raw_meta or {}
+                    payload = {
+                        "message_ids": [entity_id_val],
+                        "metadata": meta_dict,
+                    }
+                    # Extract subagent_id from metadata if present
+                    sub_id = meta_dict.get("target_subagent_id") or meta_dict.get("subagent_id")
+                    if sub_id:
+                        payload["subagent_id"] = sub_id
+                    self.db.execute("""
+                        INSERT INTO message_outbox
+                            (message_id, agent_id, trigger_type, payload_json, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(message_id) DO NOTHING
+                    """, (
+                        entity_id_val,
+                        agent_id_val,
+                        trigger_value,
+                        json.dumps(payload, ensure_ascii=False),
+                        int(time.time() * 1000),
+                    ))
+                    logger.info(
+                        "event=outbox_enqueue message_id=%s agent=%s trigger=%s",
+                        entity_id_val, agent_id_val, trigger_value,
+                    )
         entity_id = str(row.get(defn.id_field, res_id))
         result = self.get(entity, user_id, entity_id, params=params) or row
         if notify:
@@ -683,6 +783,77 @@ class SqlEntityStore(BaseStore):
             if k in fm:
                 result[k] = fm[k].serialize(result[k])
         return result
+
+    def _apply_defaults(self, defn: SqlEntityDef, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Fill schema-declared defaults for NOT NULL fields missing from `row`.
+
+        Purpose: eliminate the "silent 400 on missing NOT NULL" class of bugs
+        (see novaic /docs/roadmap/tickets/PR-33 §"no silent failure"). A field
+        declared ``nullable=False, default=<X>`` carries an explicit intent:
+        *if the caller did not provide this value, fill X*. Previously that
+        intent was only honored via a SQL ``DEFAULT`` clause at CREATE TABLE
+        time, which does NOT apply to existing tables and does NOT propagate
+        through generic CRUD callers that don't know per-entity semantics
+        (e.g. agent-runtime's ``gw.entity_create("messages", {...})``).
+
+        Scope (deliberately narrow to avoid behaviour change for existing
+        fields such as ``F.timestamp(auto=True)`` which are ``nullable=True``):
+
+            * Only fields with ``nullable=False`` AND ``default is not None``
+              AND whose name is NOT already present in ``row``.
+            * ``default="NOW"``  →  filled with :func:`_iso_now_utc`.
+            * Any other literal  →  filled verbatim.
+
+        Explicit ``None`` from the caller is left untouched (the caller has
+        stated an intent; we honour it and let the SQL layer fail loudly).
+        """
+        fm = defn.field_map
+        for f in defn.fields:
+            if f.nullable or f.default is None:
+                continue
+            if f.name in row:
+                continue
+            row[f.name] = _iso_now_utc() if f.default == "NOW" else f.default
+        return row
+
+    def _check_required(self, defn: SqlEntityDef, row: Dict[str, Any]) -> None:
+        """Raise ``ValueError`` listing every NOT-NULL, no-default, non-primary
+        field that the caller didn't provide.
+
+        Called right after :meth:`_apply_defaults` so this only fires for
+        fields the *schema* says are caller-must-provide (i.e. nullable=False
+        AND default is None). Those are business invariants — we'd rather
+        fail loudly at the Python layer with an actionable message than let
+        the write reach SQLite and surface as the opaque
+        ``IntegrityError: NOT NULL constraint failed: <table>.<col>``
+        (which an HTTP 400 hands back to the caller with no field attribution).
+
+        PR-33 §"no silent failure" motivation: the failure already happens,
+        but the caller gets *named* fields they forgot. Combined with
+        ``_apply_defaults`` this closes the loop:
+
+            * time-like defaults → filled
+            * business required → ValueError with field names
+            * nullable fields → None, SQL accepts
+
+        Crossing row ``None`` values: an explicit ``None`` is considered
+        "caller stated an intent (NULL)" and is *not* reported here —
+        ``_apply_defaults`` already documented that contract. SQL will then
+        raise the classic NOT NULL error for that case, which is loud enough
+        given the caller's deliberate None.
+        """
+        missing: List[str] = []
+        for f in defn.fields:
+            if f.nullable or f.primary or f.default is not None:
+                continue
+            if f.name in row:
+                continue
+            missing.append(f.name)
+        if missing:
+            raise ValueError(
+                f"missing required field(s) on entity='{defn.name}': "
+                f"{', '.join(missing)}"
+            )
 
     def _out(self, defn: SqlEntityDef, row: Dict[str, Any], *, include_hidden: bool = False) -> Dict[str, Any]:
         """DB row → Python dict (deserialize + strip hidden + compute has_* fields)."""
