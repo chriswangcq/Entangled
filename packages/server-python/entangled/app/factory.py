@@ -71,11 +71,13 @@ def create_app(config: ServiceConfig) -> FastAPI:
     from .health import router as health_router
     from .schema import router as schema_router
     from .crud import router as crud_router
+    from .outbox import router as outbox_router
     from .ws import ws_sync_handler
 
     app.include_router(health_router)
     app.include_router(schema_router)
     app.include_router(crud_router)
+    app.include_router(outbox_router)
     add_ws = getattr(app, "add_api_websocket_route", None) or app.add_websocket_route
     add_ws("/v1/sync", ws_sync_handler)
 
