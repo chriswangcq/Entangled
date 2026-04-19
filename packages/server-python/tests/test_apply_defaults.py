@@ -216,3 +216,104 @@ def test_upsert_fills_missing_required_default_on_insert() -> None:
     store = _make_store(_make_users_def())
     result = store.upsert("users", "", "u1", {"name": "Alice"})
     assert result["status"] == "pending"
+
+
+# ── _check_required: caller-must-provide fields ──────────────────────────────
+#
+# Companion to _apply_defaults. After the runtime fill runs, any field that is
+# still (a) NOT NULL, (b) non-primary, (c) has no default, and (d) missing from
+# the row must be attributed and reported loudly by name — rather than letting
+# the write reach SQLite and surfacing as
+#   IntegrityError: NOT NULL constraint failed: <table>.<col>
+# which the HTTP layer hands back as an opaque 400. See PR-35.
+
+
+def test_check_required_raises_on_missing_caller_required_field() -> None:
+    """messages.agent_id is NOT NULL with no default — caller must provide.
+    Missing it should raise ValueError naming the field, BEFORE SQL."""
+    store = _make_store(_make_messages_def())
+    with pytest.raises(ValueError) as ei:
+        store.append("messages", "", {
+            "id": "m1",
+            # agent_id omitted — the classic class-of-bug this guards against.
+            "type": "AGENT_REPLY",
+            "content": {"text": "hi"},
+        }, params={}, notify=False)
+    msg = str(ei.value)
+    assert "messages" in msg and "agent_id" in msg, msg
+
+
+def test_check_required_lists_all_missing_fields() -> None:
+    """Multiple missing fields are all reported in a single error (not just
+    the first one). This matters for caller ergonomics — fix once, not
+    once-per-SQL-roundtrip."""
+    store = _make_store(_make_messages_def())
+    with pytest.raises(ValueError) as ei:
+        store.append("messages", "", {
+            "id": "m1",
+            "content": {"text": "hi"},
+            # both agent_id AND type are missing
+        }, params={}, notify=False)
+    msg = str(ei.value)
+    assert "agent_id" in msg and "type" in msg, msg
+
+
+def test_check_required_passes_when_apply_defaults_filled_missing() -> None:
+    """Sanity: _check_required must NOT fire on fields that _apply_defaults
+    filled in (timestamp with default="NOW"). The guard only covers fields
+    the schema says the caller owns."""
+    store = _make_store(_make_messages_def())
+    result = store.append("messages", "", {
+        "id": "m1",
+        "agent_id": "a",
+        "type": "AGENT_REPLY",
+        "content": {"text": "hi"},
+        # timestamp missing — _apply_defaults fills it from default="NOW"
+    }, params={"agent_id": "a"}, notify=False)
+    assert result["id"] == "m1"
+    assert _ISO_Z_RE.match(result["timestamp"])
+
+
+def test_check_required_does_not_fire_on_explicit_none() -> None:
+    """An explicit ``None`` is a stated caller intent (write NULL). Per the
+    documented contract of _apply_defaults, we don't overwrite it; SQL will
+    then raise the classic NOT NULL error with the column name attached,
+    which is loud enough given the caller's deliberate None."""
+    store = _make_store(_make_messages_def())
+    # agent_id is present (value=None) → _check_required sees `in row` → pass.
+    # SQLite NOT NULL then surfaces — we only assert _check_required does NOT
+    # swallow this case into a ValueError, to keep the "caller intent" contract.
+    with pytest.raises(sqlite3.IntegrityError):
+        store.append("messages", "", {
+            "id": "m1",
+            "agent_id": None,
+            "type": "AGENT_REPLY",
+            "content": {"text": "hi"},
+        }, params={}, notify=False)
+
+
+def test_check_required_passes_on_upsert_too() -> None:
+    """Upsert's INSERT branch runs _check_required; missing caller-required
+    field must also raise there."""
+    store = _make_store(_make_messages_def())
+    with pytest.raises(ValueError) as ei:
+        store.upsert("messages", "", "m1", {
+            # agent_id & type missing on insert branch
+            "content": {"text": "hi"},
+        }, params={})
+    assert "agent_id" in str(ei.value) and "type" in str(ei.value)
+
+
+def test_check_required_noop_when_everything_provided() -> None:
+    """Happy path: all caller-required fields present → no raise, row lands."""
+    store = _make_store(_make_messages_def())
+    result = store.append("messages", "", {
+        "id": "m1",
+        "agent_id": "a",
+        "type": "AGENT_REPLY",
+        "content": {"text": "hi"},
+        "timestamp": "2026-04-19T20:50:00.000Z",
+    }, params={"agent_id": "a"}, notify=False)
+    assert result["id"] == "m1"
+    assert result["agent_id"] == "a"
+    assert result["timestamp"] == "2026-04-19T20:50:00.000Z"
