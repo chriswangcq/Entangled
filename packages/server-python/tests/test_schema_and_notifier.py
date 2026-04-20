@@ -21,6 +21,7 @@ def test_notifier_delta_includes_id_field(monkeypatch):
         id_field = "widget_id"
         op_log_size = 1000
         relations = []
+        user_scoped = True
 
     class FakeStore:
         def get_all_defs(self):
