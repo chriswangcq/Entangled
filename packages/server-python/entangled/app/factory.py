@@ -83,6 +83,7 @@ def create_app(config: ServiceConfig) -> FastAPI:
     from .message_state import router as message_state_router
     from .orphans import router as orphans_router
     from .state_transitions import router as state_transitions_router
+    from .subagent_state import router as subagent_state_router
     from .ws import ws_sync_handler
 
     app.include_router(health_router)
@@ -99,10 +100,19 @@ def create_app(config: ServiceConfig) -> FastAPI:
     app.include_router(orphans_router)
     # PR-31 — append-only history for message + subagent state machines.
     # Message transitions are populated co-transactionally inside
-    # message_state.transition; subagent transitions are POSTed here from
-    # Business. Both entity types share read endpoints so ops can
-    # reconstruct a full lifecycle in one curl.
+    # message_state.transition; the same property now holds for subagent
+    # transitions (PR-31b promoted the state machine server-side).
+    # Both entity types share read endpoints so ops can reconstruct a
+    # full lifecycle in one curl. The legacy POST /v1/state_transitions/
+    # subagent endpoint stays mounted for back-compat but Business no
+    # longer calls it — new writers go through the PR-31b router below.
     app.include_router(state_transitions_router)
+    # PR-31b — single chokepoint for subagents.status transitions.
+    # Business's transition() helper delegates to
+    # POST /v1/subagents/{agent_id}/{subagent_id}/transition, which does
+    # the status UPDATE + subagent_state_transitions INSERT in one
+    # global-lock transaction. Same shape as message_state_router.
+    app.include_router(subagent_state_router)
     add_ws = getattr(app, "add_api_websocket_route", None) or app.add_websocket_route
     add_ws("/v1/sync", ws_sync_handler)
 
