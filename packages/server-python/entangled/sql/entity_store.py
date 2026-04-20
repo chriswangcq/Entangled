@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..server.store import EntityStore as BaseStore
+from ..metrics import metric_inc
 from .entity_def import SqlEntityDef
 
 logger = logging.getLogger(__name__)
@@ -641,6 +642,16 @@ class SqlEntityStore(BaseStore):
                         json.dumps(payload, ensure_ascii=False),
                         int(time.time() * 1000),
                     ))
+                    # PR-32 — ``outbox_enqueued_total{trigger_type}``. One
+                    # counter bump per attempted enqueue. ON CONFLICT DO
+                    # NOTHING means a retried append with the same
+                    # message_id still increments — that over-counts
+                    # identity-level enqueues, but matches the "how many
+                    # times did the outbox write path fire" intent and
+                    # is cheaper than a post-INSERT SELECT CHANGES().
+                    # Ops who want "unique enqueued rows" can diff this
+                    # counter against message_outbox row count directly.
+                    metric_inc("outbox_enqueued_total", trigger_type=str(trigger_value))
                     logger.info(
                         "event=outbox_enqueue message_id=%s agent=%s trigger=%s",
                         entity_id_val, agent_id_val, trigger_value,

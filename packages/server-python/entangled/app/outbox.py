@@ -27,6 +27,17 @@ class ClaimedRow(BaseModel):
 class ClaimResponse(BaseModel):
     rows: list[ClaimedRow]
     count: int
+    # PR-32 (2026-04-21) — piggy-back outbox health signals on each claim
+    # response so the subscriber can publish ``outbox_backlog_count`` /
+    # ``outbox_lag_seconds`` gauges without a second round-trip. These
+    # count ``delivered_at IS NULL`` rows (i.e. the full pending set,
+    # including rows already locked by another worker) and take their
+    # oldest-row timestamp from ``created_at``, which is millisecond
+    # epoch. ``oldest_pending_age_ms=-1`` is the "no pending rows"
+    # sentinel so the subscriber can distinguish "backlog is clear"
+    # from "couldn't measure".
+    backlog_count: int = 0
+    oldest_pending_age_ms: int = -1
 
 class MarkDeliveredRequest(BaseModel):
     ids: list[int]
@@ -86,7 +97,35 @@ def claim_outbox(req: ClaimRequest, db=Depends(get_db), _: dict = Depends(verify
             created_at=row["created_at"],
         ))
 
-    return ClaimResponse(rows=out, count=len(out))
+    # PR-32 — compute backlog + oldest-age in the same lock window as
+    # the claim so subscriber-side metrics reflect a consistent
+    # snapshot (no double-count of rows that move between pending and
+    # claimed during this call). One extra scalar SELECT at the end of
+    # a claim transaction is negligible compared to the UPDATE.
+    backlog = 0
+    oldest_age_ms = -1
+    try:
+        stats_row = db.execute(
+            "SELECT COUNT(*) AS c, MIN(created_at) AS oldest "
+            "FROM message_outbox WHERE delivered_at IS NULL"
+        ).fetchone()
+        if stats_row is not None:
+            backlog = int(stats_row["c"] or 0)
+            oldest = stats_row["oldest"]
+            if oldest is not None and backlog > 0:
+                oldest_age_ms = max(0, now_ms - int(oldest))
+    except Exception:
+        # Never fail a claim because the backlog scalar failed — the
+        # subscriber can still make progress without a fresh gauge
+        # sample this tick.
+        pass
+
+    return ClaimResponse(
+        rows=out,
+        count=len(out),
+        backlog_count=backlog,
+        oldest_pending_age_ms=oldest_age_ms,
+    )
 
 @router.post("/mark_delivered", response_model=MarkAckResponse)
 def mark_delivered(req: MarkDeliveredRequest, db=Depends(get_db), _: dict = Depends(verify_service_or_user)):
