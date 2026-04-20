@@ -17,10 +17,12 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse
 
 from .config import ServiceConfig
 from .auth import configure_auth
 from .state import init_database, close_database, init_store
+from ..metrics import render_metrics
 from ..sql.persistence import ensure_sync_versions_table, load_all_sync_versions, make_version_bump_handler
 from ..sql.state_transitions import ensure_state_transitions_schema
 
@@ -113,6 +115,17 @@ def create_app(config: ServiceConfig) -> FastAPI:
     # the status UPDATE + subagent_state_transitions INSERT in one
     # global-lock transaction. Same shape as message_state_router.
     app.include_router(subagent_state_router)
+
+    # PR-32 — Prometheus exposition endpoint. Deliberately unauthenticated
+    # so ops can scrape without wiring service tokens into the scraper;
+    # bind the Entangled port to a private network interface if that's a
+    # concern. Body is small (tens of kB at steady state) and the render
+    # path holds the metrics lock only for microseconds — safe to hit on
+    # any interval. See ``entangled.metrics`` for the backing store.
+    @app.get("/metrics")
+    def metrics_endpoint():
+        return PlainTextResponse(render_metrics(), media_type="text/plain; version=0.0.4")
+
     add_ws = getattr(app, "add_api_websocket_route", None) or app.add_websocket_route
     add_ws("/v1/sync", ws_sync_handler)
 
