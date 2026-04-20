@@ -185,9 +185,48 @@ class SqlEntityStore(BaseStore):
                     attempts INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT,
                     locked_by TEXT,
-                    locked_until INTEGER
+                    locked_until INTEGER,
+                    permanent_failure INTEGER NOT NULL DEFAULT 0
                 )
             """)
+            # TD-6 (2026-04-21): additive migration for pre-existing DBs that
+            # still have the pre-``permanent_failure`` shape. SQLite lacks
+            # IF NOT EXISTS on ADD COLUMN, so we probe PRAGMA and swallow
+            # the dup error on a race. Kept inline rather than behind a
+            # migration framework because the refactor-era entry in
+            # technical-debt.md explicitly accepts "ALTER TABLE + probe"
+            # until schema churn justifies Alembic. The column's default
+            # is 0 so every legacy row acts as "never permanently failed"
+            # — combined with the existing ``attempts = 999999`` sentinel
+            # on poison rows, the claim filter still keeps them out.
+            cols = {
+                row["name"]
+                for row in self.db.execute("PRAGMA table_info(message_outbox)").fetchall()
+            }
+            if "permanent_failure" not in cols:
+                try:
+                    self.db.execute(
+                        "ALTER TABLE message_outbox "
+                        "ADD COLUMN permanent_failure INTEGER NOT NULL DEFAULT 0"
+                    )
+                except Exception as exc:
+                    # Race: another process just ADD COLUMN'd. Re-read and
+                    # assert the column is there before continuing; if the
+                    # error was something else we re-raise so the caller
+                    # sees a loud startup failure rather than a later
+                    # "column does not exist" surprise at claim time.
+                    cols = {
+                        row["name"]
+                        for row in self.db.execute(
+                            "PRAGMA table_info(message_outbox)"
+                        ).fetchall()
+                    }
+                    if "permanent_failure" not in cols:
+                        raise
+                    logger.debug(
+                        "[SqlEntityStore] permanent_failure add_column lost race: %s",
+                        exc,
+                    )
             self.db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_outbox_undelivered
                 ON message_outbox (delivered_at, locked_until, id)

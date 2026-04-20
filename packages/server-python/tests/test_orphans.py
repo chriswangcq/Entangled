@@ -62,7 +62,8 @@ def db():
             message_id TEXT NOT NULL UNIQUE,
             attempts INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
-            delivered_at INTEGER
+            delivered_at INTEGER,
+            permanent_failure INTEGER NOT NULL DEFAULT 0
         );
         """
     )
@@ -90,11 +91,14 @@ def _insert_msg(conn, mid: str, age_sec: float, *, lifecycle="pending",
     conn.commit()
 
 
-def _insert_outbox(conn, mid: str, *, attempts=0, last_error=None, delivered_at=None):
+def _insert_outbox(
+    conn, mid: str, *, attempts=0, last_error=None, delivered_at=None,
+    permanent_failure=0,
+):
     conn.execute(
-        "INSERT INTO message_outbox (message_id, attempts, last_error, delivered_at)"
-        " VALUES (?, ?, ?, ?)",
-        (mid, attempts, last_error, delivered_at),
+        "INSERT INTO message_outbox (message_id, attempts, last_error, delivered_at, permanent_failure)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (mid, attempts, last_error, delivered_at, permanent_failure),
     )
     conn.commit()
 
@@ -247,3 +251,38 @@ def test_limit_caps_returned_rows(db):
         _insert_msg(conn, f"m{i}", age_sec=100 + i)
     resp = query_orphans(fdb, min_age_sec=30, limit=3)
     assert resp.count == 3
+
+
+# ── TD-6: permanent_failure surfaces (no more 999999 sentinel) ───────────────
+
+def test_permanent_failure_flag_surfaces_through_orphan_view(db):
+    """TD-6 (2026-04-21): a subscriber's permanent mark_failed (no_owner /
+    bad_argument) used to spray ``attempts = 999999``; now it flips
+    ``permanent_failure = 1`` and keeps attempts truthful. HealthWorker's
+    PR-27 re-dispatch reads this flag to short-circuit to
+    PERMANENT_ORPHAN instead of retrying no-op forever."""
+    fdb, conn = db
+    _insert_msg(conn, "dead_on_arrival", age_sec=600)
+    _insert_outbox(
+        conn, "dead_on_arrival",
+        attempts=1,
+        last_error="no_owner: agent has no owner",
+        permanent_failure=1,
+    )
+    resp = query_orphans(fdb, min_age_sec=30)
+    assert resp.count == 1
+    r = resp.orphans[0]
+    assert r.outbox_permanent_failure is True
+    assert r.outbox_attempts == 1, (
+        "attempts must remain truthful; the 999999 sentinel is retired."
+    )
+
+
+def test_permanent_failure_default_false_when_outbox_missing(db):
+    """A pending message with no outbox row coalesces to permanent_failure=False
+    — missing row is already its own signal (outbox_attempts=0)."""
+    fdb, conn = db
+    _insert_msg(conn, "orphan_no_outbox", age_sec=120)
+    resp = query_orphans(fdb, min_age_sec=30)
+    assert resp.count == 1
+    assert resp.orphans[0].outbox_permanent_failure is False

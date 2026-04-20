@@ -57,13 +57,20 @@ def claim_outbox(req: ClaimRequest, db=Depends(get_db), _: dict = Depends(verify
     import time
     now_ms = int(time.time() * 1000)
 
-    # DLQ semantic: attempts < max_attempts ensures poison messages aren't infinitely claimed
+    # DLQ semantics:
+    #   * ``attempts < max_attempts`` — bog-standard retry budget.
+    #   * ``permanent_failure = 0`` — TD-6 (2026-04-21) replacement for the
+    #     old ``attempts = 999999`` sentinel. A permanent failure (no_owner,
+    #     bad_argument, etc.) flips the flag and keeps the real attempt
+    #     count intact, so orphan views show "died on attempt 1/5" instead
+    #     of a synthetic 999999 that hides the actual blast radius.
     sql = """
         UPDATE message_outbox
            SET locked_by = ?, locked_until = ?
          WHERE id IN (
              SELECT id FROM message_outbox
               WHERE delivered_at IS NULL
+                AND permanent_failure = 0
                 AND (locked_until IS NULL OR locked_until <= ?)
                 AND attempts < ?
               ORDER BY id
@@ -161,21 +168,31 @@ def mark_failed(req: MarkFailedRequest, db=Depends(get_db), _: dict = Depends(ve
         attempts = row["attempts"] + 1
 
         if req.permanent:
-            # Sentinel value 999999 drops the row from the claim query's
-            # `attempts < max_attempts` filter. See PR-26 TD about recording
-            # the real attempt count for observability.
-            attempts = 999999
+            # TD-6 (2026-04-21): keep ``attempts`` truthful and use the
+            # ``permanent_failure`` column to keep the row out of future
+            # claims. Previously we overwrote attempts with 999999, which
+            # lied on every orphan view and made "died after N retries"
+            # vs "died first try on no_owner" impossible to tell apart.
+            permanent_failure = 1
             locked_until = None
         else:
+            permanent_failure = 0
             locked_until = now_ms + (req.retry_delay_ms or 1000)
 
         sql = """
             UPDATE message_outbox
-               SET attempts = ?, last_error = ?, locked_by = NULL, locked_until = ?
+               SET attempts = ?,
+                   last_error = ?,
+                   locked_by = NULL,
+                   locked_until = ?,
+                   permanent_failure = CASE WHEN ? = 1 THEN 1 ELSE permanent_failure END
              WHERE id = ?
         """
 
         error_msg = f"{req.kind}: {req.error}"
-        cur = db.execute(sql, (attempts, error_msg, locked_until, req.id))
+        cur = db.execute(
+            sql,
+            (attempts, error_msg, locked_until, permanent_failure, req.id),
+        )
         updated = cur.rowcount
     return MarkAckResponse(updated=updated)

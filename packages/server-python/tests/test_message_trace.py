@@ -72,7 +72,8 @@ def db():
             attempts INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
             locked_by TEXT,
-            locked_until INTEGER
+            locked_until INTEGER,
+            permanent_failure INTEGER NOT NULL DEFAULT 0
         );
         """
     )
