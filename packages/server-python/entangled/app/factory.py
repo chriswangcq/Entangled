@@ -74,6 +74,7 @@ def create_app(config: ServiceConfig) -> FastAPI:
     from .outbox import router as outbox_router
     from .message_state import router as message_state_router
     from .orphans import router as orphans_router
+    from .state_transitions import router as state_transitions_router
     from .ws import ws_sync_handler
 
     app.include_router(health_router)
@@ -88,6 +89,12 @@ def create_app(config: ServiceConfig) -> FastAPI:
     # (orphan scan + re-dispatch in PR-27) and by Business's ops-facing
     # /internal/messages/orphaned proxy.
     app.include_router(orphans_router)
+    # PR-31 — append-only history for message + subagent state machines.
+    # Message transitions are populated co-transactionally inside
+    # message_state.transition; subagent transitions are POSTed here from
+    # Business. Both entity types share read endpoints so ops can
+    # reconstruct a full lifecycle in one curl.
+    app.include_router(state_transitions_router)
     add_ws = getattr(app, "add_api_websocket_route", None) or app.add_websocket_route
     add_ws("/v1/sync", ws_sync_handler)
 

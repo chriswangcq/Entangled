@@ -132,6 +132,14 @@ def store():
         """
     )
     db = FakeDatabase(conn)
+    # PR-31 (2026-04-15): ``message_state.transition`` now writes a row
+    # to ``message_state_transitions`` co-transactionally. Because this
+    # fixture deliberately skips ``store.ensure_schema`` (see docstring
+    # above), we must bring up the log table by hand — otherwise every
+    # successful transition in this file would OperationalError on the
+    # missing table.
+    from entangled.sql.state_transitions import ensure_state_transitions_schema
+    ensure_state_transitions_schema(db)
     store = SqlEntityStore(db=db)
     store.register(MESSAGES_DEF)
     return store, db, conn
