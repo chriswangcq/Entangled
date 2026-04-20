@@ -42,17 +42,20 @@ class _FakeDb:
 def db():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
-    # Minimal schema that matches the real JOIN columns. Keep in sync
-    # with novaic-business/business/schema_push.py::MESSAGES_DEF and
-    # entity_store._ensure_outbox_schema on column names / types.
+    # Schema mirrors the live chat_messages shape after PR-21:
+    #   * no user_id column (Business's MESSAGES_DEF uses sender only)
+    #   * created_at is TEXT 'YYYY-MM-DD HH:MM:SS' (SQLite datetime('now'))
+    #   * lifecycle_updated_at is INTEGER ms, NULL for pre-PR-21 rows that
+    #     were never touched by a transition()
+    # Keep in sync with novaic-business/business/schema_push.py::MESSAGES_DEF.
     conn.executescript(
         """
         CREATE TABLE chat_messages (
             id TEXT PRIMARY KEY,
             agent_id TEXT NOT NULL,
-            user_id TEXT,
-            created_at INTEGER NOT NULL,
-            lifecycle TEXT NOT NULL DEFAULT 'pending'
+            created_at TEXT NOT NULL,
+            lifecycle TEXT NOT NULL DEFAULT 'pending',
+            lifecycle_updated_at INTEGER
         );
         CREATE TABLE message_outbox (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,12 +70,22 @@ def db():
 
 
 def _insert_msg(conn, mid: str, age_sec: float, *, lifecycle="pending",
-                agent="a1", user="u1"):
-    now_ms = int(time.time() * 1000)
+                agent="a1", use_lifecycle_ts=True):
+    """Insert a row age_sec seconds in the past.
+
+    ``use_lifecycle_ts=True`` simulates the common case where something has
+    already transitioned the row (so lifecycle_updated_at is populated).
+    ``use_lifecycle_ts=False`` simulates a pre-PR-21 pending row where the
+    query has to fall back to strftime(created_at).
+    """
+    now_s = int(time.time())
+    past_s = now_s - int(age_sec)
+    created_at_iso = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(past_s))
+    lifecycle_ts = past_s * 1000 if use_lifecycle_ts else None
     conn.execute(
-        "INSERT INTO chat_messages (id, agent_id, user_id, created_at, lifecycle)"
+        "INSERT INTO chat_messages (id, agent_id, created_at, lifecycle, lifecycle_updated_at)"
         " VALUES (?, ?, ?, ?, ?)",
-        (mid, agent, user, now_ms - int(age_sec * 1000), lifecycle),
+        (mid, agent, created_at_iso, lifecycle, lifecycle_ts),
     )
     conn.commit()
 
@@ -213,6 +226,19 @@ def test_oldest_first_ordering(db):
     _insert_msg(conn, "mid", age_sec=120)
     resp = query_orphans(fdb, min_age_sec=30)
     assert [o.message_id for o in resp.orphans] == ["old", "mid", "new"]
+
+
+def test_fallback_to_created_at_when_lifecycle_updated_at_is_null(db):
+    """Pre-PR-21 rows that were never touched by transition() carry
+    lifecycle_updated_at=NULL. The orphan query must still see them via
+    the strftime(created_at) fallback — otherwise the oldest, most-stuck
+    messages in the system (exactly the ones we care about) disappear."""
+    fdb, conn = db
+    _insert_msg(conn, "ancient", age_sec=600, use_lifecycle_ts=False)
+    resp = query_orphans(fdb, min_age_sec=30)
+    assert resp.count == 1
+    assert resp.orphans[0].message_id == "ancient"
+    assert resp.orphans[0].severity == "crit"
 
 
 def test_limit_caps_returned_rows(db):
