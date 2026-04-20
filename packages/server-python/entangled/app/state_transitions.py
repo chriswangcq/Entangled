@@ -96,18 +96,25 @@ def record_subagent_transition(
     Not idempotent per row (we explicitly want a record of every retry),
     but the caller on the Business side only posts after a non-noop
     ``store.update`` so the volume matches real state changes.
+
+    Legacy HTTP shim (PR-31, pre-PR-31b). We wrap the append in a
+    ``transaction("global")`` here so this endpoint stays atomic on
+    its own — the ``append_subagent_transition`` helper is
+    transaction-agnostic (matches ``append_message_transition``) and
+    the PR-31b in-process caller opens its own outer transaction.
     """
-    append_subagent_transition(
-        db,
-        subagent_id=req.subagent_id,
-        agent_id=req.agent_id,
-        from_state=req.from_state,
-        to_state=req.to_state,
-        reason=req.reason,
-        actor=req.actor,
-        scope_id=req.scope_id,
-        metadata=req.metadata,
-    )
+    with db.transaction("global"):
+        append_subagent_transition(
+            db,
+            subagent_id=req.subagent_id,
+            agent_id=req.agent_id,
+            from_state=req.from_state,
+            to_state=req.to_state,
+            reason=req.reason,
+            actor=req.actor,
+            scope_id=req.scope_id,
+            metadata=req.metadata,
+        )
     return {"status": "ok"}
 
 

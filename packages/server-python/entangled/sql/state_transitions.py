@@ -162,34 +162,41 @@ def append_subagent_transition(
 ) -> None:
     """Append one row to ``subagent_state_transitions``.
 
-    Called from the HTTP endpoint ``POST /v1/state_transitions/subagent``;
-    the Business-side ``subagent_state.transition`` posts to that endpoint
-    after a successful ``store.update("subagents", ...)`` round-trip. This
-    means the log write is NOT co-transactional with the status write;
-    a process crash between the two would drop the history entry. That
-    is acceptable for PR-31's observability-only charter — the canonical
-    state remains ``subagents.status``; the log is a best-effort trail.
+    Transaction-agnostic (matches ``append_message_transition`` above):
+    caller is responsible for wrapping the call in a transaction when
+    co-transactional semantics are needed. PR-31b's
+    ``subagent_state.transition`` calls this from inside its own
+    ``transaction("global")``; the legacy HTTP shim in
+    ``entangled/app/state_transitions.py:record_subagent_transition``
+    wraps it in a local transaction since its caller (pre-PR-31b
+    Business code) expects the endpoint to be atomic on its own.
+
+    Previously this helper opened its own ``transaction("global")`` —
+    that worked fine for the HTTP-shim caller, but deadlocked the
+    PR-31b in-process caller (``subagent_state.transition`` already
+    held the same global write lock). Making the helper
+    transaction-agnostic is the same pattern the message_state
+    pair uses and avoids nested-write-lock hangs.
     """
-    with db.transaction("global"):
-        db.execute(
-            """
-            INSERT INTO subagent_state_transitions
-                (subagent_id, agent_id, from_state, to_state, reason,
-                 actor, scope_id, metadata_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                subagent_id,
-                agent_id,
-                from_state,
-                to_state,
-                reason or "",
-                actor or "",
-                scope_id,
-                json.dumps(metadata) if metadata else None,
-                created_at_ms if created_at_ms is not None else int(time.time() * 1000),
-            ),
-        )
+    db.execute(
+        """
+        INSERT INTO subagent_state_transitions
+            (subagent_id, agent_id, from_state, to_state, reason,
+             actor, scope_id, metadata_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            subagent_id,
+            agent_id,
+            from_state,
+            to_state,
+            reason or "",
+            actor or "",
+            scope_id,
+            json.dumps(metadata) if metadata else None,
+            created_at_ms if created_at_ms is not None else int(time.time() * 1000),
+        ),
+    )
 
 
 # ── Readers ───────────────────────────────────────────────────────────────────
