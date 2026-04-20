@@ -86,6 +86,129 @@ class StatesResponse(BaseModel):
     allowed: dict[str, list[str]]
 
 
+# ── PR-25 (2026-04-15) trace ─────────────────────────────────────────────────
+# Read-only view of one chat_messages row plus the associated outbox row.
+# Business's ``/internal/messages/{id}/trace`` composes this with Cortex
+# scope meta + Queue session state; keeping the join here (one round-trip,
+# direct DB access) means Business never has to learn the outbox schema.
+
+
+class MessageTraceRow(BaseModel):
+    message_id: str
+    agent_id: str
+    type: Optional[str] = None
+    sender: Optional[str] = None
+    timestamp: Optional[str] = Field(
+        None,
+        description="chat_messages.timestamp (TEXT, caller-supplied ISO).",
+    )
+    created_at_iso: Optional[str] = Field(
+        None,
+        description=(
+            "chat_messages.created_at — TEXT 'YYYY-MM-DD HH:MM:SS' UTC. "
+            "Kept as the original string so callers see exactly what SQLite "
+            "stored; numeric ms is in ``lifecycle_updated_at`` when set."
+        ),
+    )
+    lifecycle: str = Field(..., description="pending|claimed|consumed|orphaned|deduped")
+    claimed_by_scope: Optional[str] = None
+    lifecycle_updated_at: Optional[int] = Field(
+        None,
+        description=(
+            "ms since epoch; NULL for rows that were never transitioned "
+            "(legitimately pending since before PR-21 deploy or fresh)."
+        ),
+    )
+    # Outbox fields (all Optional — LEFT JOIN may miss, and that's a signal):
+    outbox_trigger_type: Optional[str] = None
+    outbox_created_at: Optional[int] = Field(
+        None, description="Outbox INSERT time (ms since epoch)."
+    )
+    outbox_delivered_at: Optional[int] = None
+    outbox_attempts: int = 0
+    outbox_last_error: Optional[str] = None
+
+
+class MessageTraceNotFound(Exception):
+    """Raised by ``query_message_trace`` so callers (FastAPI route + tests)
+    can map to their own error surface without catching a blanket
+    exception. Parallels ``MessageNotFound`` from the transition path."""
+
+
+def query_message_trace(db, message_id: str) -> MessageTraceRow:
+    """Pure-DB core for the trace read — factored out so unit tests can
+    drive it directly without standing up the FastAPI app / auth."""
+    sql = """
+        SELECT m.id                    AS message_id,
+               m.agent_id               AS agent_id,
+               m.type                   AS type,
+               m.sender                 AS sender,
+               m.timestamp              AS timestamp,
+               m.created_at             AS created_at_iso,
+               m.lifecycle              AS lifecycle,
+               m.claimed_by_scope       AS claimed_by_scope,
+               m.lifecycle_updated_at   AS lifecycle_updated_at,
+               o.trigger_type           AS outbox_trigger_type,
+               o.created_at             AS outbox_created_at,
+               o.delivered_at           AS outbox_delivered_at,
+               COALESCE(o.attempts, 0)  AS outbox_attempts,
+               o.last_error             AS outbox_last_error
+          FROM chat_messages m
+          LEFT JOIN message_outbox o ON o.message_id = m.id
+         WHERE m.id = ?
+    """
+    with db.transaction("global"):
+        row = db.execute(sql, (message_id,)).fetchone()
+    if row is None:
+        raise MessageTraceNotFound(message_id)
+    return MessageTraceRow(
+        message_id=row["message_id"],
+        agent_id=row["agent_id"],
+        type=row["type"],
+        sender=row["sender"],
+        timestamp=row["timestamp"],
+        created_at_iso=row["created_at_iso"],
+        lifecycle=row["lifecycle"] or "pending",
+        claimed_by_scope=row["claimed_by_scope"],
+        lifecycle_updated_at=row["lifecycle_updated_at"],
+        outbox_trigger_type=row["outbox_trigger_type"],
+        outbox_created_at=row["outbox_created_at"],
+        outbox_delivered_at=row["outbox_delivered_at"],
+        outbox_attempts=int(row["outbox_attempts"] or 0),
+        outbox_last_error=row["outbox_last_error"],
+    )
+
+
+@router.get("/{message_id}/trace", response_model=MessageTraceRow)
+def trace_message(
+    message_id: str,
+    db=Depends(get_db),
+    _: dict = Depends(verify_service_or_user),
+):
+    """PR-25 — one-hop read of chat_messages + message_outbox for ops trace.
+
+    Why here (not a generic entity GET)
+    -----------------------------------
+    * ``message_outbox`` is not a registered entity (intentionally — it's
+      a write-ahead queue, not user-facing data). A LEFT JOIN here keeps
+      Business from having to learn the outbox schema just to read one
+      row for trace.
+    * Single endpoint means Business's trace composition path and the
+      orphan scanner (PR-26) agree on column semantics.
+
+    404 semantics
+    -------------
+    Returns 404 only when the ``chat_messages`` row is missing — a row
+    with no outbox sibling surfaces as HTTP 200 with ``outbox_*=NULL/0``.
+    That combination is itself diagnostic: either the outbox co-insert
+    from PR-15 failed, or the message predates PR-14.
+    """
+    try:
+        return query_message_trace(db, message_id)
+    except MessageTraceNotFound as exc:
+        raise HTTPException(status_code=404, detail=f"message not found: {exc}")
+
+
 @router.post("/{message_id}/transition", response_model=TransitionResponse)
 def transition_message(
     message_id: str,
