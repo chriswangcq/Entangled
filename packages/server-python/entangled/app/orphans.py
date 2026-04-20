@@ -62,12 +62,13 @@ class OrphanRow(BaseModel):
     created_at: int = Field(
         ...,
         description=(
-            "ms since epoch. Derived from lifecycle_updated_at when present, "
-            "otherwise from chat_messages.created_at (TEXT ISO UTC) via "
-            "strftime('%s'). Two sources because the column backfill in "
-            "message_state.backfill_lifecycle only set lifecycle_updated_at "
-            "for rows that had a legacy signal — legitimately-pending rows "
-            "still carry NULL there."
+            "ms since epoch. Derived from lifecycle_updated_at when "
+            "non-NULL (i.e. the row has been through at least one "
+            "transition), otherwise from chat_messages.created_at "
+            "(TEXT ISO UTC) via strftime('%s'). Rows that have never "
+            "transitioned carry NULL in lifecycle_updated_at — that's "
+            "exactly the always-pending case the orphan view must "
+            "surface, so a single-source query would hide them."
         ),
     )
     age_seconds: float
@@ -76,10 +77,11 @@ class OrphanRow(BaseModel):
     outbox_attempts: int = Field(
         0,
         description=(
-            "0 when the outbox row is missing — which itself is a tell: "
-            "PR-15's co-transaction insert should make outbox and message "
-            "row appear together. A pending message with NULL outbox means "
-            "the message predates PR-15 or the co-insert failed."
+            "0 when the outbox row is missing — itself a tell, since "
+            "SqlEntityStore.append inserts the outbox row co-trans"
+            "actionally with the chat_messages row. A pending message "
+            "with a NULL outbox pair means the co-insert path was "
+            "bypassed or failed mid-transaction."
         ),
     )
     outbox_last_error: Optional[str] = None
@@ -94,12 +96,10 @@ class OrphanRow(BaseModel):
     outbox_permanent_failure: bool = Field(
         False,
         description=(
-            "TD-6 (2026-04-21) replacement for the attempts=999999 "
-            "sentinel. True means the subscriber gave up deliberately "
-            "(no_owner / bad_argument / etc.) and no amount of retrying "
-            "will help. HealthWorker's PR-27 re-dispatch path short-"
-            "circuits to PERMANENT_ORPHAN when this is true, regardless "
-            "of attempts count."
+            "True means the subscriber gave up deliberately (no_owner / "
+            "bad_argument / etc.) and retrying will not help. "
+            "HealthWorker's re-dispatch path short-circuits to "
+            "PERMANENT_ORPHAN on this flag, regardless of attempts count."
         ),
     )
 
@@ -127,12 +127,11 @@ def query_orphans(
     now_ms = int(time.time() * 1000)
     cutoff_ms = now_ms - min_age_sec * 1000
 
-    # Age basis is lifecycle_updated_at (INTEGER ms, set by every transition())
-    # when non-NULL, else derived from created_at (TEXT 'YYYY-MM-DD HH:MM:SS'
-    # in UTC, per SQLite's default datetime('now')). Two sources because
-    # backfill_lifecycle only populated lifecycle_updated_at for rows with a
-    # legacy signal (processed=1 OR claimed_by NOT NULL) — rows that were
-    # always-pending still carry NULL there, and forcing a single-source
+    # Age basis is lifecycle_updated_at (INTEGER ms, set by every
+    # transition()) when non-NULL, else derived from created_at (TEXT
+    # 'YYYY-MM-DD HH:MM:SS' in UTC, per SQLite's default datetime('now')).
+    # Two sources because always-pending rows have never transitioned
+    # and carry NULL in lifecycle_updated_at — forcing a single-source
     # query would hide them from the orphan view entirely.
     #
     # LEFT JOIN so messages with no outbox row still surface — that

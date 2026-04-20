@@ -186,10 +186,8 @@ def test_claim_and_mark_failed_permanent(client, db):
     assert res2.status_code == 200
     
     db_row = db.execute("SELECT * FROM message_outbox WHERE id = ?", (row_id,)).fetchone()
-    # TD-6 (2026-04-21): attempts stays truthful (just +1), permanent_failure
-    # flag is what keeps the row out of future claims. Pre-TD-6 this
-    # assertion was ``attempts >= 5`` because the code sprayed 999999 on
-    # the attempts column.
+    # attempts stays truthful (just +1); permanent_failure is what keeps
+    # the row out of future claims.
     assert db_row["attempts"] == 1
     assert db_row["permanent_failure"] == 1
     assert db_row["locked_by"] is None

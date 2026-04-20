@@ -134,22 +134,6 @@ class SqlEntityStore(BaseStore):
         # Auto-create outbox infrastructure if this entity uses it
         if getattr(entity_def, 'outbox_trigger_types', None):
             self._ensure_outbox_schema()
-        # PR-21 (2026-04-20) — one-shot lifecycle backfill for chat_messages.
-        # Runs on every ensure_schema call but is idempotent (only touches
-        # rows where lifecycle='pending' AND a legacy signal is set). We
-        # key off entity_def.table rather than entity_def.name so a repo
-        # using a different name for the same table still triggers the
-        # backfill. See entangled/sql/message_state.py::backfill_lifecycle
-        # for the WHERE-clause rationale.
-        if entity_def.table == "chat_messages" and "lifecycle" in {f.name for f in entity_def.fields}:
-            from .message_state import backfill_lifecycle, drop_legacy_message_columns
-            # Order matters: backfill reads ``processed`` / ``claimed_by``
-            # to derive lifecycle for any row still on the legacy signal,
-            # then drop_legacy_message_columns erases those columns. Once
-            # dropped, any remaining ``pending`` row stays ``pending`` —
-            # which is exactly what PR-30 wants.
-            backfill_lifecycle(self.db)
-            drop_legacy_message_columns(self.db)
 
     def ensure_all_schemas(self) -> None:
         """Run ensure_schema for all registered entities that have fields."""
@@ -189,44 +173,6 @@ class SqlEntityStore(BaseStore):
                     permanent_failure INTEGER NOT NULL DEFAULT 0
                 )
             """)
-            # TD-6 (2026-04-21): additive migration for pre-existing DBs that
-            # still have the pre-``permanent_failure`` shape. SQLite lacks
-            # IF NOT EXISTS on ADD COLUMN, so we probe PRAGMA and swallow
-            # the dup error on a race. Kept inline rather than behind a
-            # migration framework because the refactor-era entry in
-            # technical-debt.md explicitly accepts "ALTER TABLE + probe"
-            # until schema churn justifies Alembic. The column's default
-            # is 0 so every legacy row acts as "never permanently failed"
-            # — combined with the existing ``attempts = 999999`` sentinel
-            # on poison rows, the claim filter still keeps them out.
-            cols = {
-                row["name"]
-                for row in self.db.execute("PRAGMA table_info(message_outbox)").fetchall()
-            }
-            if "permanent_failure" not in cols:
-                try:
-                    self.db.execute(
-                        "ALTER TABLE message_outbox "
-                        "ADD COLUMN permanent_failure INTEGER NOT NULL DEFAULT 0"
-                    )
-                except Exception as exc:
-                    # Race: another process just ADD COLUMN'd. Re-read and
-                    # assert the column is there before continuing; if the
-                    # error was something else we re-raise so the caller
-                    # sees a loud startup failure rather than a later
-                    # "column does not exist" surprise at claim time.
-                    cols = {
-                        row["name"]
-                        for row in self.db.execute(
-                            "PRAGMA table_info(message_outbox)"
-                        ).fetchall()
-                    }
-                    if "permanent_failure" not in cols:
-                        raise
-                    logger.debug(
-                        "[SqlEntityStore] permanent_failure add_column lost race: %s",
-                        exc,
-                    )
             self.db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_outbox_undelivered
                 ON message_outbox (delivered_at, locked_until, id)

@@ -57,13 +57,11 @@ def claim_outbox(req: ClaimRequest, db=Depends(get_db), _: dict = Depends(verify
     import time
     now_ms = int(time.time() * 1000)
 
-    # DLQ semantics:
-    #   * ``attempts < max_attempts`` — bog-standard retry budget.
-    #   * ``permanent_failure = 0`` — TD-6 (2026-04-21) replacement for the
-    #     old ``attempts = 999999`` sentinel. A permanent failure (no_owner,
-    #     bad_argument, etc.) flips the flag and keeps the real attempt
-    #     count intact, so orphan views show "died on attempt 1/5" instead
-    #     of a synthetic 999999 that hides the actual blast radius.
+    # DLQ filter:
+    #   * ``attempts < max_attempts`` — retry budget.
+    #   * ``permanent_failure = 0`` — rows flagged by ``mark_failed`` with
+    #     ``permanent=True`` (no_owner, bad_argument, etc.) are permanently
+    #     excluded while keeping their real attempt count for observability.
     sql = """
         UPDATE message_outbox
            SET locked_by = ?, locked_until = ?
@@ -168,17 +166,16 @@ def mark_failed(req: MarkFailedRequest, db=Depends(get_db), _: dict = Depends(ve
         attempts = row["attempts"] + 1
 
         if req.permanent:
-            # TD-6 (2026-04-21): keep ``attempts`` truthful and use the
-            # ``permanent_failure`` column to keep the row out of future
-            # claims. Previously we overwrote attempts with 999999, which
-            # lied on every orphan view and made "died after N retries"
-            # vs "died first try on no_owner" impossible to tell apart.
             permanent_failure = 1
             locked_until = None
         else:
             permanent_failure = 0
             locked_until = now_ms + (req.retry_delay_ms or 1000)
 
+        # ``permanent_failure`` is sticky — once flagged it stays 1 even if
+        # a subsequent transient mark_failed lands. In practice the claim
+        # filter excludes permanent rows so they never reach another
+        # mark_failed, but the CASE keeps the invariant cheap.
         sql = """
             UPDATE message_outbox
                SET attempts = ?,
