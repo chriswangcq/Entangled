@@ -91,6 +91,17 @@ class OrphanRow(BaseModel):
             "transitioned). The runtime scanner surfaces these separately."
         ),
     )
+    outbox_permanent_failure: bool = Field(
+        False,
+        description=(
+            "TD-6 (2026-04-21) replacement for the attempts=999999 "
+            "sentinel. True means the subscriber gave up deliberately "
+            "(no_owner / bad_argument / etc.) and no amount of retrying "
+            "will help. HealthWorker's PR-27 re-dispatch path short-"
+            "circuits to PERMANENT_ORPHAN when this is true, regardless "
+            "of attempts count."
+        ),
+    )
 
 
 class OrphanListResponse(BaseModel):
@@ -139,7 +150,8 @@ def query_orphans(
                m.lifecycle       AS lifecycle,
                COALESCE(o.attempts, 0)         AS outbox_attempts,
                o.last_error                    AS outbox_last_error,
-               o.delivered_at                  AS outbox_delivered_at
+               o.delivered_at                  AS outbox_delivered_at,
+               COALESCE(o.permanent_failure, 0) AS outbox_permanent_failure
           FROM chat_messages m
           LEFT JOIN message_outbox o ON o.message_id = m.id
          WHERE m.lifecycle = 'pending'
@@ -176,6 +188,7 @@ def query_orphans(
             outbox_attempts=int(r["outbox_attempts"] or 0),
             outbox_last_error=r["outbox_last_error"],
             outbox_delivered_at=r["outbox_delivered_at"],
+            outbox_permanent_failure=bool(r["outbox_permanent_failure"] or 0),
         ))
 
     return OrphanListResponse(

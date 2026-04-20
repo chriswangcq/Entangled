@@ -56,7 +56,8 @@ def db():
             attempts INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
             locked_by TEXT,
-            locked_until INTEGER
+            locked_until INTEGER,
+            permanent_failure INTEGER NOT NULL DEFAULT 0
         )
     """)
     return db
@@ -158,10 +159,15 @@ def test_claim_and_mark_failed_permanent(client, db):
     assert res2.status_code == 200
     
     db_row = db.execute("SELECT * FROM message_outbox WHERE id = ?", (row_id,)).fetchone()
-    assert db_row["attempts"] >= 5 # Poisoned
+    # TD-6 (2026-04-21): attempts stays truthful (just +1), permanent_failure
+    # flag is what keeps the row out of future claims. Pre-TD-6 this
+    # assertion was ``attempts >= 5`` because the code sprayed 999999 on
+    # the attempts column.
+    assert db_row["attempts"] == 1
+    assert db_row["permanent_failure"] == 1
     assert db_row["locked_by"] is None
-    
-    # Should not be claimed again because attempts >= 5
+
+    # Should not be claimed again because permanent_failure = 1
     res3 = client.post("/v1/outbox/claim", json={"worker_id": "w2", "max_attempts": 5})
     assert res3.json()["count"] == 0
 
