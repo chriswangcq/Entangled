@@ -141,8 +141,14 @@ class SqlEntityStore(BaseStore):
         # backfill. See entangled/sql/message_state.py::backfill_lifecycle
         # for the WHERE-clause rationale.
         if entity_def.table == "chat_messages" and "lifecycle" in {f.name for f in entity_def.fields}:
-            from .message_state import backfill_lifecycle
+            from .message_state import backfill_lifecycle, drop_legacy_message_columns
+            # Order matters: backfill reads ``processed`` / ``claimed_by``
+            # to derive lifecycle for any row still on the legacy signal,
+            # then drop_legacy_message_columns erases those columns. Once
+            # dropped, any remaining ``pending`` row stays ``pending`` —
+            # which is exactly what PR-30 wants.
             backfill_lifecycle(self.db)
+            drop_legacy_message_columns(self.db)
 
     def ensure_all_schemas(self) -> None:
         """Run ensure_schema for all registered entities that have fields."""

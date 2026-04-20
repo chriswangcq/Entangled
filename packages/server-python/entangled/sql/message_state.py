@@ -231,6 +231,49 @@ def transition(
 
 # ── One-shot backfill ─────────────────────────────────────────────────────────
 
+# PR-30 (2026-04-15) — legacy chat_messages columns now strictly subsumed
+# by ``lifecycle`` / ``claimed_by_scope``. Listed here so the drop migration
+# stays explicit and the CI lint can reference the same constant.
+#   * processed  — replaced by lifecycle in ('claimed','consumed')
+#   * claimed_by — replaced by claimed_by_scope (Cortex scope_id)
+#   * claimed_at — never read since PR-21; lifecycle_updated_at carries the
+#                  last transition wall-clock
+#   * status     — pre-lifecycle dispatch state column; production rows
+#                  contain garbage values ('0' from accidental writes,
+#                  'sent' from the schema default)
+#
+# ``read`` is intentionally NOT in this list: it tracks user-visible read
+# receipts (unread badge), a separate concern from the dispatch lifecycle.
+LEGACY_COLUMNS: tuple[str, ...] = ("processed", "claimed_by", "claimed_at", "status")
+
+
+def drop_legacy_message_columns(db) -> list[str]:
+    """Idempotently DROP the four pre-PR-21 columns from ``chat_messages``.
+
+    Runs from ``ensure_schema`` after ``backfill_lifecycle`` (so the
+    backfill always sees the legacy signal before we erase it). Each
+    column is dropped under its own ``ALTER TABLE … DROP COLUMN`` —
+    safe and atomic on SQLite ≥ 3.35 (production runs 3.45).
+
+    Returns the list of column names that were actually dropped (empty
+    on a fresh DB or on the second call). Logged at INFO so the deploy
+    log shows whether the migration was a noop or did real work.
+    """
+    existing = {r["name"] for r in db.fetchall("PRAGMA table_info(chat_messages)")}
+    dropped: list[str] = []
+    with db.transaction("global"):
+        for col in LEGACY_COLUMNS:
+            if col in existing:
+                db.execute(f"ALTER TABLE chat_messages DROP COLUMN {col}")
+                dropped.append(col)
+    if dropped:
+        logger.info(
+            "message_state.drop_legacy_message_columns dropped %s",
+            ", ".join(dropped),
+        )
+    return dropped
+
+
 def backfill_lifecycle(db) -> int:
     """Set ``lifecycle`` / ``claimed_by_scope`` / ``lifecycle_updated_at`` for
     pre-PR-21 rows using legacy signals.
