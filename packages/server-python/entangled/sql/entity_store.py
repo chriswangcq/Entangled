@@ -113,13 +113,23 @@ class SqlEntityStore(BaseStore):
             return
         with self.db.transaction("global"):
             self.db.execute(entity_def.create_table_sql())
-            for idx_sql in entity_def.index_sqls():
-                self.db.execute(idx_sql)
+            # PR-21 (2026-04-20): ALTER MUST run before index_sqls.
+            # Previously the order was reversed, which silently worked for
+            # every prior migration because new columns happened to be
+            # index=False. The moment someone adds a new column with
+            # index=True (e.g. chat_messages.lifecycle), CREATE INDEX
+            # fires against the not-yet-added column and fails with
+            # ``no such column`` — the exception escapes ensure_schema,
+            # the ALTER never runs, and the table is left permanently
+            # half-migrated. Swap the order so every ALTER commits first
+            # and index creation always sees the final column set.
             existing = self.db.fetchall(f"PRAGMA table_info({entity_def.table})")
             existing_cols = [r["name"] for r in existing]
             for alter_sql in entity_def.alter_add_column_sqls(existing_cols):
                 logger.info("[SqlEntityStore] Migrating: %s", alter_sql)
                 self.db.execute(alter_sql)
+            for idx_sql in entity_def.index_sqls():
+                self.db.execute(idx_sql)
         # Auto-create outbox infrastructure if this entity uses it
         if getattr(entity_def, 'outbox_trigger_types', None):
             self._ensure_outbox_schema()
