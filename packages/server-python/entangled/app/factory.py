@@ -72,12 +72,17 @@ def create_app(config: ServiceConfig) -> FastAPI:
     from .schema import router as schema_router
     from .crud import router as crud_router
     from .outbox import router as outbox_router
+    from .message_state import router as message_state_router
     from .ws import ws_sync_handler
 
     app.include_router(health_router)
     app.include_router(schema_router)
     app.include_router(crud_router)
     app.include_router(outbox_router)
+    # PR-21 — single chokepoint for chat_messages.lifecycle transitions.
+    # All writes to the lifecycle column must route through this router;
+    # scripts/ci/lint_lifecycle.sh enforces that.
+    app.include_router(message_state_router)
     add_ws = getattr(app, "add_api_websocket_route", None) or app.add_websocket_route
     add_ws("/v1/sync", ws_sync_handler)
 

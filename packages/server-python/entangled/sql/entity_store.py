@@ -123,6 +123,16 @@ class SqlEntityStore(BaseStore):
         # Auto-create outbox infrastructure if this entity uses it
         if getattr(entity_def, 'outbox_trigger_types', None):
             self._ensure_outbox_schema()
+        # PR-21 (2026-04-20) — one-shot lifecycle backfill for chat_messages.
+        # Runs on every ensure_schema call but is idempotent (only touches
+        # rows where lifecycle='pending' AND a legacy signal is set). We
+        # key off entity_def.table rather than entity_def.name so a repo
+        # using a different name for the same table still triggers the
+        # backfill. See entangled/sql/message_state.py::backfill_lifecycle
+        # for the WHERE-clause rationale.
+        if entity_def.table == "chat_messages" and "lifecycle" in {f.name for f in entity_def.fields}:
+            from .message_state import backfill_lifecycle
+            backfill_lifecycle(self.db)
 
     def ensure_all_schemas(self) -> None:
         """Run ensure_schema for all registered entities that have fields."""
