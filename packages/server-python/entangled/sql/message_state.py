@@ -155,6 +155,12 @@ def transition(
     if to not in VALID_STATES:
         raise InvalidTransition(f"{to!r} is not a valid lifecycle state")
 
+    # Imported inside the function to avoid a circular import at module
+    # load time: ``state_transitions`` has no imports of its own, but
+    # ``entangled.sql.entity_store`` imports us transitively during
+    # ensure_schema wiring.
+    from .state_transitions import append_message_transition
+
     now_ms = int(time.time() * 1000)
     with db.transaction("global"):
         row = db.execute(
@@ -209,6 +215,21 @@ def transition(
              WHERE id = ?
             """,
             (to, scope_id, now_ms, message_id),
+        )
+        # PR-31: record the transition in the append-only log. Inside
+        # the same ``transaction("global")`` block so a log row only
+        # commits if the lifecycle UPDATE did — either both land or
+        # neither does. Self-loop noops (returned above) never reach
+        # this block, so the log stays signal-only.
+        append_message_transition(
+            db,
+            message_id=message_id,
+            from_state=cur_state,
+            to_state=to,
+            reason=reason,
+            actor="entangled",
+            scope_id=scope_id,
+            created_at_ms=now_ms,
         )
 
     logger.info(
