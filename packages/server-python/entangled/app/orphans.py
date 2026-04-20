@@ -58,8 +58,18 @@ DEFAULT_CRIT_AGE_SEC = 300
 class OrphanRow(BaseModel):
     message_id: str
     agent_id: str
-    user_id: Optional[str] = None
-    created_at: int = Field(..., description="ms since epoch")
+    user_id: Optional[str] = None  # chat_messages has no user_id column; kept for API stability, always null.
+    created_at: int = Field(
+        ...,
+        description=(
+            "ms since epoch. Derived from lifecycle_updated_at when present, "
+            "otherwise from chat_messages.created_at (TEXT ISO UTC) via "
+            "strftime('%s'). Two sources because the column backfill in "
+            "message_state.backfill_lifecycle only set lifecycle_updated_at "
+            "for rows that had a legacy signal — legitimately-pending rows "
+            "still carry NULL there."
+        ),
+    )
     age_seconds: float
     severity: str = Field(..., description="'warn' or 'crit'")
     lifecycle: str
@@ -106,15 +116,26 @@ def query_orphans(
     now_ms = int(time.time() * 1000)
     cutoff_ms = now_ms - min_age_sec * 1000
 
+    # Age basis is lifecycle_updated_at (INTEGER ms, set by every transition())
+    # when non-NULL, else derived from created_at (TEXT 'YYYY-MM-DD HH:MM:SS'
+    # in UTC, per SQLite's default datetime('now')). Two sources because
+    # backfill_lifecycle only populated lifecycle_updated_at for rows with a
+    # legacy signal (processed=1 OR claimed_by NOT NULL) — rows that were
+    # always-pending still carry NULL there, and forcing a single-source
+    # query would hide them from the orphan view entirely.
+    #
     # LEFT JOIN so messages with no outbox row still surface — that
     # combination is itself suspicious (see OrphanRow.outbox_attempts doc).
-    # Reminder: SQLite sorts NULL first under ASC; we need oldest-first on
-    # created_at which is NOT NULL, so no NULLS FIRST/LAST dance needed.
+    # chat_messages has no user_id column (Business's schema uses sender),
+    # so we project NULL and keep the field for API stability.
     sql = """
         SELECT m.id              AS message_id,
                m.agent_id        AS agent_id,
-               m.user_id         AS user_id,
-               m.created_at      AS created_at,
+               NULL              AS user_id,
+               COALESCE(
+                   m.lifecycle_updated_at,
+                   CAST(strftime('%s', m.created_at) AS INTEGER) * 1000
+               )                 AS created_at,
                m.lifecycle       AS lifecycle,
                COALESCE(o.attempts, 0)         AS outbox_attempts,
                o.last_error                    AS outbox_last_error,
@@ -122,8 +143,11 @@ def query_orphans(
           FROM chat_messages m
           LEFT JOIN message_outbox o ON o.message_id = m.id
          WHERE m.lifecycle = 'pending'
-           AND m.created_at < ?
-         ORDER BY m.created_at ASC
+           AND COALESCE(
+                   m.lifecycle_updated_at,
+                   CAST(strftime('%s', m.created_at) AS INTEGER) * 1000
+               ) < ?
+         ORDER BY 4 ASC
          LIMIT ?
     """
     with db.transaction("global"):
