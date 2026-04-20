@@ -230,6 +230,37 @@ def test_unknown_target_state_rejected_fast(store):
         transition(db, "m1", to="bogus")
 
 
+def test_self_transition_is_idempotent_noop(store):
+    """PR-23: transition(to=current) returns noop=True without error.
+    Subscribers (PR-22) and scope_end (PR-23) both get retried; the
+    retry must not blow up with InvalidTransition."""
+    _, db, conn = store
+    _insert(conn, "m1", lifecycle="claimed", claimed_by_scope="sc-1")
+    result = transition(db, "m1", to="claimed", scope_id="sc-1", reason="retry")
+    assert result["noop"] is True
+    assert result["from"] == "claimed"
+    assert result["to"] == "claimed"
+    assert result["scope_id"] == "sc-1"
+    # Row untouched (lifecycle_updated_at NOT bumped on a noop so
+    # PR-25 trace doesn't see a phantom transition timestamp).
+    row = conn.execute(
+        "SELECT lifecycle, claimed_by_scope, lifecycle_updated_at "
+        "FROM chat_messages WHERE id='m1'"
+    ).fetchone()
+    assert row["lifecycle"] == "claimed"
+    assert row["claimed_by_scope"] == "sc-1"
+    assert row["lifecycle_updated_at"] is None
+
+
+def test_self_transition_noop_preserves_existing_scope(store):
+    """When the retry omits scope_id, noop still returns the stored one."""
+    _, db, conn = store
+    _insert(conn, "m2", lifecycle="consumed", claimed_by_scope="sc-2")
+    result = transition(db, "m2", to="consumed")
+    assert result["noop"] is True
+    assert result["scope_id"] == "sc-2"
+
+
 def test_missing_message_raises_not_found(store):
     _, db, _ = store
     with pytest.raises(MessageNotFound, match="message not found"):

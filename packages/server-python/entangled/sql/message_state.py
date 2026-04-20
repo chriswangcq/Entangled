@@ -164,6 +164,31 @@ def transition(
         if row is None:
             raise MessageNotFound(f"message not found: {message_id}")
         cur_state = row["lifecycle"] or "pending"
+
+        # PR-23 (2026-04-20) idempotency: ``current == to`` is a no-op, not
+        # an InvalidTransition. Rationale: PR-22 (subscriber claimed) and
+        # PR-23 (scope_end consumed) both get retried — subscriber on
+        # outbox redelivery, scope_end on saga re-entry. Treating the
+        # re-invocation as an error forces every caller to wrap in
+        # try/InvalidTransition/pass, which defeats the point of the
+        # single entry-point. The allowed-transitions table still rejects
+        # genuinely invalid paths (e.g. consumed -> claimed); we only
+        # short-circuit the self-loop here.
+        if cur_state == to:
+            logger.info(
+                "message_state %s: %s -> %s noop scope=%s reason=%s",
+                message_id, cur_state, to,
+                scope_id or "-", reason or "-",
+            )
+            return {
+                "message_id": message_id,
+                "from": cur_state,
+                "to": to,
+                "scope_id": scope_id or row["claimed_by_scope"],
+                "reason": reason,
+                "noop": True,
+            }
+
         if to not in ALLOWED_TRANSITIONS.get(cur_state, set()):
             raise InvalidTransition(
                 f"{cur_state} -> {to} not allowed for message {message_id}"
@@ -200,6 +225,7 @@ def transition(
         "to": to,
         "scope_id": scope_id,
         "reason": reason,
+        "noop": False,
     }
 
 
