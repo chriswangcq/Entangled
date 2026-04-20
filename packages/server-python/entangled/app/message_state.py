@@ -66,6 +66,11 @@ class TransitionResponse(BaseModel):
     to: str
     scope_id: Optional[str] = None
     reason: str = ""
+    # PR-23 idempotency flag — True when current == to so the caller can
+    # distinguish "I did nothing because you already transitioned" from
+    # "I just moved the state". Useful for debouncing metrics
+    # (``subscriber_transition_total{result=noop}`` vs ``{result=ok}``).
+    noop: bool = False
 
     class Config:
         populate_by_name = True
@@ -106,6 +111,7 @@ def transition_message(
         to=result["to"],
         scope_id=result["scope_id"],
         reason=result["reason"],
+        noop=result.get("noop", False),
     )
 
 
