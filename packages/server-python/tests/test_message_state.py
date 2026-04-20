@@ -105,12 +105,35 @@ MESSAGES_DEF = SqlEntityDef(
 
 @pytest.fixture
 def store():
+    """Hand-rolls the chat_messages schema so legacy columns survive into
+    the test body. We deliberately skip ``store.ensure_schema`` here —
+    PR-30's ``drop_legacy_message_columns`` runs from inside that hook
+    and would erase ``processed``/``claimed_by``/``status`` before any
+    test could insert a legacy row to drive backfill.
+    """
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE chat_messages (
+            id        TEXT PRIMARY KEY,
+            agent_id  TEXT NOT NULL,
+            type      TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            read      INTEGER DEFAULT 0,
+            claimed_by TEXT,
+            claimed_at TEXT,
+            processed INTEGER DEFAULT 0,
+            status    TEXT DEFAULT 'sent',
+            lifecycle TEXT DEFAULT 'pending',
+            claimed_by_scope TEXT,
+            lifecycle_updated_at INTEGER
+        );
+        """
+    )
     db = FakeDatabase(conn)
     store = SqlEntityStore(db=db)
     store.register(MESSAGES_DEF)
-    store.ensure_schema(MESSAGES_DEF)
     return store, db, conn
 
 
@@ -349,14 +372,58 @@ def test_backfill_is_idempotent(store):
     assert second == 0  # second run finds nothing to do
 
 
-def test_ensure_schema_triggers_backfill_on_chat_messages(store):
-    """End-to-end: inserting legacy rows and then calling ensure_schema
-    again (simulating a service restart after PR-21 deploy) does run
-    the backfill — no manual migration scripts required."""
+def test_ensure_schema_runs_backfill_then_drops_legacy_columns(store):
+    """End-to-end: simulating a PR-30 deploy on a database that still
+    carries pre-PR-21 ``processed=1`` rows. ``ensure_schema`` must:
+      1. Backfill the row's lifecycle from the legacy signal.
+      2. Drop the legacy columns afterward so future writers can't
+         resurrect the dual-column drift.
+    Doing both in one hook means a single restart fully migrates the
+    database without an out-of-band script."""
+    from entangled.sql.message_state import LEGACY_COLUMNS
+
     store_obj, db, conn = store
     _insert(conn, "m1", processed=1, lifecycle="pending")
     store_obj.ensure_schema(MESSAGES_DEF)
+
     row = conn.execute(
         "SELECT lifecycle FROM chat_messages WHERE id='m1'"
     ).fetchone()
     assert row["lifecycle"] == "consumed"
+
+    cols = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(chat_messages)"
+    ).fetchall()}
+    for legacy in LEGACY_COLUMNS:
+        assert legacy not in cols, f"{legacy} should have been dropped"
+
+
+def test_drop_legacy_message_columns_is_idempotent(store):
+    """Second call after legacy columns are gone must be a noop, not
+    a SQL error — PR-30 runs from ensure_schema on every restart."""
+    from entangled.sql.message_state import (
+        LEGACY_COLUMNS,
+        drop_legacy_message_columns,
+    )
+
+    _, db, conn = store
+    first = drop_legacy_message_columns(db)
+    assert sorted(first) == sorted(LEGACY_COLUMNS)
+    second = drop_legacy_message_columns(db)
+    assert second == []  # nothing left to drop
+
+
+def test_drop_legacy_preserves_lifecycle_and_read_columns(store):
+    """``read`` and the lifecycle columns must survive the drop —
+    PR-30 explicitly scopes itself to the dispatch-state quartet."""
+    from entangled.sql.message_state import drop_legacy_message_columns
+
+    _, db, conn = store
+    _insert(conn, "m1", read=1, lifecycle="claimed")
+    drop_legacy_message_columns(db)
+
+    row = conn.execute(
+        "SELECT id, read, lifecycle FROM chat_messages WHERE id='m1'"
+    ).fetchone()
+    assert row["read"] == 1
+    assert row["lifecycle"] == "claimed"
