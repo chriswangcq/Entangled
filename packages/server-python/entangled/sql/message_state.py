@@ -253,19 +253,36 @@ def drop_legacy_message_columns(db) -> list[str]:
     Runs from ``ensure_schema`` after ``backfill_lifecycle`` (so the
     backfill always sees the legacy signal before we erase it). Each
     column is dropped under its own ``ALTER TABLE … DROP COLUMN`` —
-    safe and atomic on SQLite ≥ 3.35 (production runs 3.45).
+    safe on SQLite ≥ 3.35 (production runs 3.45), *provided there are
+    no user indexes on the column*. Pre-PR-30 schemas declared
+    ``status`` with ``index=True`` (left over from pre-PR-21 dispatch
+    polling), which materialised as ``idx_chat_messages_status`` in
+    ``sqlite_master``. SQLite refuses DROP COLUMN while such an index
+    exists, and the refusal leaves the preceding DROPs committed (DDL
+    auto-commits per statement), so we must drop stale indexes first.
 
     Returns the list of column names that were actually dropped (empty
     on a fresh DB or on the second call). Logged at INFO so the deploy
     log shows whether the migration was a noop or did real work.
     """
     existing = {r["name"] for r in db.fetchall("PRAGMA table_info(chat_messages)")}
+
+    # Pre-emptively drop any user-created index whose name matches the
+    # legacy-column convention ``idx_chat_messages_{col}``. Entangled
+    # creates indexes via ``CREATE INDEX IF NOT EXISTS`` from the entity
+    # spec; once PR-30 removes the fields from the spec, the indexes
+    # become orphans that block the column drop. ``DROP INDEX IF EXISTS``
+    # is cheap and idempotent.
+    for col in LEGACY_COLUMNS:
+        if col in existing:
+            idx_name = f"idx_chat_messages_{col}"
+            db.execute(f"DROP INDEX IF EXISTS {idx_name}")
+
     dropped: list[str] = []
-    with db.transaction("global"):
-        for col in LEGACY_COLUMNS:
-            if col in existing:
-                db.execute(f"ALTER TABLE chat_messages DROP COLUMN {col}")
-                dropped.append(col)
+    for col in LEGACY_COLUMNS:
+        if col in existing:
+            db.execute(f"ALTER TABLE chat_messages DROP COLUMN {col}")
+            dropped.append(col)
     if dropped:
         logger.info(
             "message_state.drop_legacy_message_columns dropped %s",
