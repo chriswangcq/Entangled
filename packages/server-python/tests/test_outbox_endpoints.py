@@ -38,6 +38,28 @@ class FakeDatabase:
         cur = self._conn.execute(sql, params)
         return [dict(r) for r in cur.fetchall()]
 
+    class _Tx:
+        """Minimal context manager matching the shape Entangled's real
+        ``Database.transaction(name)`` returns. In prod it's the
+        global FIFO serialization lock (see PR-17 claim_outbox); for
+        tests we just need a no-op context that commits on exit so
+        route code written as ``with db.transaction("global"): ...``
+        doesn't AttributeError. The historical TD of "FakeDatabase
+        lacks .transaction()" is what this closes."""
+
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            if exc_type is None:
+                self._conn.commit()
+
+    def transaction(self, *_a, **_kw):
+        return self._Tx(self._conn)
+
 @pytest.fixture
 def db():
     conn = sqlite3.connect(":memory:", check_same_thread=False)
@@ -73,7 +95,12 @@ def test_claim_empty(client):
         "worker_id": "w1"
     })
     assert res.status_code == 200
-    assert res.json() == {"rows": [], "count": 0}
+    body = res.json()
+    assert body["rows"] == []
+    assert body["count"] == 0
+    # PR-32 piggy-back signals: no pending rows → backlog 0, -1 sentinel.
+    assert body["backlog_count"] == 0
+    assert body["oldest_pending_age_ms"] == -1
 
 def test_claim_and_mark_delivered(client, db):
     # Insert a message
