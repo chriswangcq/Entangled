@@ -22,6 +22,7 @@ from .config import ServiceConfig
 from .auth import configure_auth
 from .state import init_database, close_database, init_store
 from ..sql.persistence import ensure_sync_versions_table, load_all_sync_versions, make_version_bump_handler
+from ..sql.state_transitions import ensure_state_transitions_schema
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,13 @@ def create_app(config: ServiceConfig) -> FastAPI:
 
         # 2. Sync version persistence table
         ensure_sync_versions_table(db)
+
+        # 2b. PR-31 state-transition log tables. Dynamic schema registration
+        # via POST /v1/schema/register only covers SqlEntityDef-backed tables;
+        # the append-only history tables are independent of that flow and
+        # must be created eagerly at startup so the first transition() call
+        # never races a missing table.
+        ensure_state_transitions_schema(db)
 
         # 3. EntityStore
         store = init_store(db=db)
