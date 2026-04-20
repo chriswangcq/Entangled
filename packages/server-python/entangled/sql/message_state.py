@@ -1,14 +1,10 @@
-"""PR-21 (2026-04-20) — chat_messages lifecycle state machine.
+"""chat_messages lifecycle state machine (PR-21).
 
 Why this module exists
 ----------------------
-Pre-PR-21 the "where is this message in its processing?" question required
-reading five columns (`read`, `processed`, `claimed_by`, `claimed_at`,
-`status`) and reconstructing the intent from the combination. The
-"hihi" incident (see docs/roadmap/tickets/PR-21-message-lifecycle-enum.md)
-hit a state where those five columns disagreed with each other and there
-was no single place to point at and say "fix the rule here". This module
-is that single place.
+This module is the single place that owns ``chat_messages.lifecycle``.
+Every wake-related question ("is this in a saga?", "done?", "orphaned?")
+reads that one column; every write goes through ``transition()`` below.
 
 Rules (state diagram)
 ---------------------
@@ -27,14 +23,13 @@ Single write entrypoint
 Business / runtime / subscriber code MUST NOT ``UPDATE chat_messages SET
 lifecycle = ...`` directly. The supported surfaces are:
 
-* In-process (tests, migrations, Entangled internals): ``transition()``
-  below.
+* In-process (tests, Entangled internals): ``transition()`` below.
 * Out-of-process (every other service): ``POST /v1/messages/{id}/transition``
   on the Entangled HTTP API, implemented by ``entangled/app/message_state.py``
   which just wraps ``transition()``.
 
 ``scripts/ci/lint_lifecycle.sh`` enforces the ban on raw UPDATEs outside
-the allowlist (this module, the app-side router, tests, migrations).
+the allowlist (this module, the app-side router, tests).
 
 Observability
 -------------
@@ -42,20 +37,6 @@ Each transition logs one line
     ``message_state <id>: <from> -> <to> scope=<scope> reason=<reason>``
 which is grep-able alongside every other scope_id-tagged line in the
 system, so a single grep reconstructs the full lifecycle of a message.
-Metrics hook is intentionally left as a TODO — Entangled has no
-``metrics`` module yet (confirmed 2026-04-20); PR-26 adds one and at that
-point this module is one line away from emitting
-``message_transitions_total{from,to}``.
-
-Migration
----------
-Pre-PR-21 rows default to ``lifecycle='pending'`` via the column default.
-The idempotent backfill query lives in ``backfill_lifecycle()`` below and
-is invoked once from ``SqlEntityStore.ensure_schema`` when it notices the
-``chat_messages.lifecycle`` column is freshly added. Re-running the
-backfill is safe: it only touches rows where ``lifecycle='pending'`` AND
-one of the legacy signals (``processed=1`` or ``claimed_by IS NOT NULL``)
-is set — a fresh pending row never matches both branches.
 """
 
 from __future__ import annotations
@@ -250,111 +231,3 @@ def transition(
     }
 
 
-# ── One-shot backfill ─────────────────────────────────────────────────────────
-
-# PR-30 (2026-04-15) — legacy chat_messages columns now strictly subsumed
-# by ``lifecycle`` / ``claimed_by_scope``. Listed here so the drop migration
-# stays explicit and the CI lint can reference the same constant.
-#   * processed  — replaced by lifecycle in ('claimed','consumed')
-#   * claimed_by — replaced by claimed_by_scope (Cortex scope_id)
-#   * claimed_at — never read since PR-21; lifecycle_updated_at carries the
-#                  last transition wall-clock
-#   * status     — pre-lifecycle dispatch state column; production rows
-#                  contain garbage values ('0' from accidental writes,
-#                  'sent' from the schema default)
-#
-# ``read`` is intentionally NOT in this list: it tracks user-visible read
-# receipts (unread badge), a separate concern from the dispatch lifecycle.
-LEGACY_COLUMNS: tuple[str, ...] = ("processed", "claimed_by", "claimed_at", "status")
-
-
-def drop_legacy_message_columns(db) -> list[str]:
-    """Idempotently DROP the four pre-PR-21 columns from ``chat_messages``.
-
-    Runs from ``ensure_schema`` after ``backfill_lifecycle`` (so the
-    backfill always sees the legacy signal before we erase it). Each
-    column is dropped under its own ``ALTER TABLE … DROP COLUMN`` —
-    safe on SQLite ≥ 3.35 (production runs 3.45), *provided there are
-    no user indexes on the column*. Pre-PR-30 schemas declared
-    ``status`` with ``index=True`` (left over from pre-PR-21 dispatch
-    polling), which materialised as ``idx_chat_messages_status`` in
-    ``sqlite_master``. SQLite refuses DROP COLUMN while such an index
-    exists, and the refusal leaves the preceding DROPs committed (DDL
-    auto-commits per statement), so we must drop stale indexes first.
-
-    Returns the list of column names that were actually dropped (empty
-    on a fresh DB or on the second call). Logged at INFO so the deploy
-    log shows whether the migration was a noop or did real work.
-    """
-    existing = {r["name"] for r in db.fetchall("PRAGMA table_info(chat_messages)")}
-
-    # Pre-emptively drop any user-created index whose name matches the
-    # legacy-column convention ``idx_chat_messages_{col}``. Entangled
-    # creates indexes via ``CREATE INDEX IF NOT EXISTS`` from the entity
-    # spec; once PR-30 removes the fields from the spec, the indexes
-    # become orphans that block the column drop. ``DROP INDEX IF EXISTS``
-    # is cheap and idempotent.
-    for col in LEGACY_COLUMNS:
-        if col in existing:
-            idx_name = f"idx_chat_messages_{col}"
-            db.execute(f"DROP INDEX IF EXISTS {idx_name}")
-
-    dropped: list[str] = []
-    for col in LEGACY_COLUMNS:
-        if col in existing:
-            db.execute(f"ALTER TABLE chat_messages DROP COLUMN {col}")
-            dropped.append(col)
-    if dropped:
-        logger.info(
-            "message_state.drop_legacy_message_columns dropped %s",
-            ", ".join(dropped),
-        )
-    return dropped
-
-
-def backfill_lifecycle(db) -> int:
-    """Set ``lifecycle`` / ``claimed_by_scope`` / ``lifecycle_updated_at`` for
-    pre-PR-21 rows using legacy signals.
-
-    Idempotent: the WHERE clause ensures only rows still showing the
-    column default (``lifecycle='pending'``) AND carrying a legacy signal
-    (``processed=1`` OR ``claimed_by IS NOT NULL``) are touched. A row
-    written fresh after PR-21 deploy is legitimately ``pending`` with no
-    legacy fields, so it's left alone.
-
-    Returns
-    -------
-    int
-        Rows updated (for logging).
-
-    Called from
-    -----------
-    ``SqlEntityStore.ensure_schema`` — exactly once per deploy, right
-    after ``ALTER TABLE chat_messages ADD COLUMN lifecycle`` would have
-    run. Safe to call more than once.
-    """
-    now_ms = int(time.time() * 1000)
-    with db.transaction("global"):
-        cur = db.execute(
-            """
-            UPDATE chat_messages
-               SET lifecycle = CASE
-                       WHEN processed = 1 THEN 'consumed'
-                       WHEN claimed_by IS NOT NULL THEN 'claimed'
-                       ELSE lifecycle
-                   END,
-                   claimed_by_scope = COALESCE(claimed_by_scope, claimed_by),
-                   lifecycle_updated_at = COALESCE(lifecycle_updated_at, ?)
-             WHERE lifecycle = 'pending'
-               AND (processed = 1 OR claimed_by IS NOT NULL)
-            """,
-            (now_ms,),
-        )
-        updated = cur.rowcount if hasattr(cur, "rowcount") else 0
-    if updated:
-        logger.info(
-            "message_state.backfill_lifecycle migrated %s rows "
-            "(processed=1 -> consumed, claimed_by set -> claimed)",
-            updated,
-        )
-    return updated

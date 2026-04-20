@@ -253,13 +253,12 @@ def test_limit_caps_returned_rows(db):
     assert resp.count == 3
 
 
-# ── TD-6: permanent_failure surfaces (no more 999999 sentinel) ───────────────
+# ── permanent_failure surfaces ────────────────────────────────────────────────
 
 def test_permanent_failure_flag_surfaces_through_orphan_view(db):
-    """TD-6 (2026-04-21): a subscriber's permanent mark_failed (no_owner /
-    bad_argument) used to spray ``attempts = 999999``; now it flips
-    ``permanent_failure = 1`` and keeps attempts truthful. HealthWorker's
-    PR-27 re-dispatch reads this flag to short-circuit to
+    """A subscriber's permanent mark_failed (no_owner / bad_argument)
+    flips ``permanent_failure = 1`` and keeps attempts truthful.
+    HealthWorker's re-dispatch reads this flag to short-circuit to
     PERMANENT_ORPHAN instead of retrying no-op forever."""
     fdb, conn = db
     _insert_msg(conn, "dead_on_arrival", age_sec=600)
@@ -273,9 +272,7 @@ def test_permanent_failure_flag_surfaces_through_orphan_view(db):
     assert resp.count == 1
     r = resp.orphans[0]
     assert r.outbox_permanent_failure is True
-    assert r.outbox_attempts == 1, (
-        "attempts must remain truthful; the 999999 sentinel is retired."
-    )
+    assert r.outbox_attempts == 1, "attempts must remain truthful"
 
 
 def test_permanent_failure_default_false_when_outbox_missing(db):
