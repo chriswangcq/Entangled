@@ -158,14 +158,10 @@ class SqlEntityStore(BaseStore):
         # Ensure outbox table exists if any entity uses outbox triggers
         if any(getattr(d, 'outbox_trigger_types', None) for d in self._defs.values()):
             self._ensure_outbox_schema()
-        # PR-31 (2026-04-15): append-only state transition log tables.
-        # Tables are NOT registered entities (no Sync / subscription);
-        # they persist the event stream already emitted by the
-        # ``transition()`` functions in ``message_state.py`` and (via
-        # HTTP) ``novaic-business/business/internal/subagent_state.py``.
-        # See entangled/sql/state_transitions.py for the full charter.
-        from .state_transitions import ensure_state_transitions_schema
-        ensure_state_transitions_schema(self.db)
+        # NOTE: PR-31 state-transition log tables are created eagerly in
+        # app.factory.lifespan (not here) — ensure_all_schemas has no live
+        # caller at runtime, and Entangled schema registration is driven
+        # dynamically via POST /v1/schema/register by upstream services.
 
     def _ensure_outbox_schema(self) -> None:
         """Idempotent creation of the message_outbox infrastructure table.
