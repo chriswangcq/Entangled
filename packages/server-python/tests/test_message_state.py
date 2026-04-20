@@ -413,6 +413,43 @@ def test_drop_legacy_message_columns_is_idempotent(store):
     assert second == []  # nothing left to drop
 
 
+def test_drop_legacy_removes_stale_indexes(store):
+    """Pre-PR-30 schemas had ``F.text("status", index=True)`` which
+    materialised as ``idx_chat_messages_status`` in sqlite_master.
+    Once PR-30 removes the field, the index becomes an orphan — and
+    SQLite refuses ``DROP COLUMN`` while the index still references it,
+    *silently leaving the preceding drops committed* (DDL auto-commits
+    per statement). The helper MUST pre-emptively drop the stale index.
+
+    Reproduces the 2026-04-20 prod incident where the first three
+    columns were dropped and ``status`` survived because of this
+    exact interaction.
+    """
+    from entangled.sql.message_state import (
+        LEGACY_COLUMNS,
+        drop_legacy_message_columns,
+    )
+
+    _, db, conn = store
+    conn.execute("CREATE INDEX idx_chat_messages_status ON chat_messages(status)")
+    conn.execute("CREATE INDEX idx_chat_messages_claimed_by ON chat_messages(claimed_by)")
+    conn.commit()
+
+    dropped = drop_legacy_message_columns(db)
+    assert sorted(dropped) == sorted(LEGACY_COLUMNS), (
+        "all four legacy columns must drop, including those with a user "
+        "index attached (pre-PR-30 schemas declared status/claimed_by "
+        "with index=True)"
+    )
+
+    indexes = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' "
+        "AND tbl_name='chat_messages'"
+    ).fetchall()}
+    assert "idx_chat_messages_status" not in indexes
+    assert "idx_chat_messages_claimed_by" not in indexes
+
+
 def test_drop_legacy_preserves_lifecycle_and_read_columns(store):
     """``read`` and the lifecycle columns must survive the drop —
     PR-30 explicitly scopes itself to the dispatch-state quartet."""
