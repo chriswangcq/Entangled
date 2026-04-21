@@ -1,16 +1,24 @@
-"""PR-40 regression — ID-fallback must not use scope-key when it is not the
-primary key.
+"""PR-40 regression — id-fallback removed, fail-fast when caller omits id.
 
-Root-cause summary (see ``docs/roadmap/tickets/PR-40-*`` in the novaic repo):
-``SqlEntityStore._sql_create`` / ``append`` used to fall back to
-``params[key_params[0]]`` as ``id`` whenever the caller omitted ``id``. That is
-correct for **singleton-per-scope** entities (``id_field == key_params[0]``,
-e.g. ``agent-tools``), but for **stream/list** entities
-(``id_field != key_params[0]``, e.g. ``messages``) every second insert
-collides on ``UNIQUE constraint failed``.
+Historical context (see ``docs/roadmap/tickets/PR-40-*`` in the novaic repo):
+``SqlEntityStore._sql_create`` / ``append`` used to have a two-step fallback
+when the caller omitted ``id``:
 
-PR-40 narrows the fallback to ``defn.key_params[0] == defn.id_field``;
-otherwise the id is minted from ``uuid.uuid4().hex``.
+  (a) coerce ``params[key_params[0]]`` into the primary key;
+  (b) else mint ``uuid.uuid4().hex``.
+
+Both variants violated "no silent failure":
+
+  (a) for stream entities (``messages``, ``subagents``, ``agent-memory`` —
+      ``id_field != key_params[0]``) the scope key became the primary key
+      and every second insert collided on ``UNIQUE constraint failed``.
+      Prod symptom: ``chat_reply`` stuck after one reply.
+  (b) silent uuid minting hid "caller forgot to mint an id" bugs forever.
+
+PR-40 drops the whole fallback. Singleton entities still work because the
+``row[id_field] = params[key_params[0]]`` copy happens *earlier*, via the
+scope-key-copy loop, and the caller's intent (``id_field == key_params[0]``)
+is explicit in the schema definition.
 """
 import sqlite3
 
@@ -21,7 +29,7 @@ from entangled.sql.entity_def import SqlEntityDef
 from entangled.sql.field_def import F
 
 
-# ── Fake DB plumbing (copied shape from test_outbox_insert.py) ─────────────
+# ── Fake DB plumbing (shape copied from test_outbox_insert.py) ─────────────
 
 
 class _FakeDatabase:
@@ -63,7 +71,8 @@ def _make_store():
 # ── Entity defs exercising the four shapes ────────────────────────────────
 
 
-# (1) stream entity: id_field="id" ≠ key_params[0]="agent_id" — PR-40 target
+# (1) stream entity: id_field="id" ≠ key_params[0]="agent_id".
+#     Caller MUST mint id; omitting raises ValueError.
 STREAM_DEF = SqlEntityDef(
     name="messages",
     table="chat_messages_t40",
@@ -81,7 +90,9 @@ STREAM_DEF = SqlEntityDef(
 )
 
 
-# (2) singleton entity: id_field=="agent_id"==key_params[0] — fallback still valid
+# (2) singleton entity: id_field=="agent_id"==key_params[0].
+#     Scope-key-copy loop fills row[id_field] from params → fallback never
+#     fires → no ValueError. Caller can continue to omit id in payload.
 SINGLETON_DEF = SqlEntityDef(
     name="agent-tools",
     table="agent_tools_t40",
@@ -95,7 +106,7 @@ SINGLETON_DEF = SqlEntityDef(
 )
 
 
-# (3) INTEGER autoincrement id — fallback always bypassed
+# (3) INTEGER autoincrement id: is_auto_int branch short-circuits.
 AUTOINT_DEF = SqlEntityDef(
     name="exec-logs",
     table="exec_logs_t40",
@@ -122,42 +133,71 @@ def store():
 # ── Tests ──────────────────────────────────────────────────────────────────
 
 
-def test_stream_entity_gets_unique_uuid_not_scope_key(store):
-    """Two appends without ``id``: both rows must get a uuid hex, neither
-    equals the scope-key, and they differ from each other.
+def test_stream_entity_without_id_raises_value_error(store):
+    """PR-40: stream entity with no ``id`` in payload must fail-fast.
 
-    Pre-PR-40 this test would fail on the second append with
-    ``sqlite3.IntegrityError: UNIQUE constraint failed: chat_messages_t40.id``.
+    Before PR-40 this call would either (a) use ``agent_id`` as the primary
+    key (UNIQUE collision on next insert) or (b) mint a silent uuid. Both
+    behaviors violated "no silent failure".
     """
     agent_id = "415f6cfd4e5b4a04911b66cb8ab2cad7"
+
+    with pytest.raises(ValueError) as excinfo:
+        store.append(
+            "messages",
+            "",
+            {"type": "AGENT_REPLY", "timestamp": "2026-04-21T00:00:00Z"},
+            params={"agent_id": agent_id},
+            notify=False,
+        )
+    msg = str(excinfo.value)
+    assert "missing required 'id'" in msg
+    assert "entity='messages'" in msg
+    assert "PR-40" in msg, "error must reference the decision for future grep-ability"
+
+
+def test_stream_entity_with_caller_minted_id_succeeds(store):
+    """Caller-minted id is the ONLY correct way for stream entities."""
+    agent_id = "agent-happy-path"
 
     r1 = store.append(
         "messages",
         "",
-        {"type": "AGENT_REPLY", "timestamp": "2026-04-21T00:00:00Z"},
+        {
+            "id": "msg-001",
+            "type": "AGENT_REPLY",
+            "timestamp": "2026-04-21T00:00:00Z",
+        },
         params={"agent_id": agent_id},
         notify=False,
     )
     r2 = store.append(
         "messages",
         "",
-        {"type": "AGENT_REPLY", "timestamp": "2026-04-21T00:00:01Z"},
+        {
+            "id": "msg-002",
+            "type": "AGENT_REPLY",
+            "timestamp": "2026-04-21T00:00:01Z",
+        },
         params={"agent_id": agent_id},
         notify=False,
     )
-
-    assert r1["id"] != agent_id, "scope-key must NOT be used as primary key"
+    assert r1["id"] == "msg-001"
+    assert r2["id"] == "msg-002"
+    assert r1["id"] != agent_id
     assert r2["id"] != agent_id
-    assert r1["id"] != r2["id"], "each append must mint a fresh id"
-    assert len(r1["id"]) == 32, "uuid4().hex is 32 chars"
-    assert len(r2["id"]) == 32
 
 
 def test_singleton_entity_still_uses_scope_key_as_id(store):
-    """``agent-tools`` has id_field==key_params[0]=='agent_id' — the fallback
-    is intentional here (one row per agent). Must keep working."""
-    agent_id = "agent-singleton-xyz"
+    """``agent-tools`` has ``id_field == key_params[0] == 'agent_id'``.
 
+    The scope-key-copy loop at the top of ``_sql_create`` / ``append``
+    fills ``row['agent_id']`` from params BEFORE the id-check. So even
+    though the caller's payload omits ``id``, ``res_id`` is already truthy
+    and the PR-40 fail-fast guard does not fire. This test locks in that
+    we did NOT break singleton semantics.
+    """
+    agent_id = "agent-singleton-xyz"
     row = store.create(
         "agent-tools",
         "",
@@ -165,36 +205,12 @@ def test_singleton_entity_still_uses_scope_key_as_id(store):
         params={"agent_id": agent_id},
         notify=False,
     )
-
     assert row["agent_id"] == agent_id
-    # id_field *is* agent_id for this entity, so the stored id equals agent_id
-    assert row.get("agent_id") == agent_id
-
-
-def test_caller_provided_id_wins_over_fallback(store):
-    """Explicit ``id`` in payload is always respected, regardless of
-    key_params shape."""
-    agent_id = "agent-explicit"
-    explicit_id = "msg-explicit-123"
-
-    r = store.append(
-        "messages",
-        "",
-        {
-            "id": explicit_id,
-            "type": "USER_MESSAGE",
-            "timestamp": "2026-04-21T00:00:00Z",
-        },
-        params={"agent_id": agent_id},
-        notify=False,
-    )
-
-    assert r["id"] == explicit_id
 
 
 def test_integer_autoincrement_id_unaffected(store):
-    """INTEGER id entities take the ``is_auto_int`` branch before reaching the
-    fallback logic; scope-key coercion must never apply."""
+    """INTEGER id takes the ``is_auto_int`` branch before the fail-fast
+    guard. Caller continues to omit id; SQLite auto-assigns via rowid."""
     agent_id = "agent-autoint"
 
     r1 = store.append(
@@ -211,8 +227,26 @@ def test_integer_autoincrement_id_unaffected(store):
         params={"agent_id": agent_id},
         notify=False,
     )
-
     assert isinstance(r1["id"], int)
     assert isinstance(r2["id"], int)
     assert r2["id"] > r1["id"]
-    assert r1["id"] != agent_id  # trivially true — different types — but explicit
+
+
+def test_error_message_names_the_entity_and_field(store):
+    """Regression guard for the error shape — ops / on-call grep this
+    string when triaging a new "caller forgot id" bug."""
+    with pytest.raises(ValueError) as excinfo:
+        store.append(
+            "messages",
+            "",
+            {"type": "USER_MESSAGE", "timestamp": "2026-04-21T00:00:00Z"},
+            params={"agent_id": "some-agent"},
+            notify=False,
+        )
+    msg = str(excinfo.value)
+    # Format contract: must contain id_field name AND entity name AND
+    # mention that Entangled does NOT mint ids (so the reader doesn't go
+    # looking for a broken uuid fallback).
+    assert "id" in msg
+    assert "messages" in msg
+    assert "does not mint" in msg.lower()
