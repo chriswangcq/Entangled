@@ -14,7 +14,6 @@ import inspect
 import json
 import logging
 import time
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -368,24 +367,32 @@ class SqlEntityStore(BaseStore):
         is_auto_int = id_f_def and id_f_def.kind.name == "INTEGER"
         res_id = row.get(defn.id_field, "")
         if not res_id and not is_auto_int:
-            # Only fall back to scope-key when it IS the primary key
-            # (singleton-per-key entities: agent-tools, agent-state,
-            # agent-binding — where id_field == key_params[0]). For stream/
-            # list entities where id_field != key_params[0] (messages,
-            # subagents, agent-memory, ...), using the scope key as primary
-            # key guarantees a UNIQUE collision on the second insert.
-            # See PR-40.
-            if (
-                params
-                and defn.key_params
-                and defn.key_params[0] == defn.id_field
-            ):
-                res_id = params.get(defn.key_params[0], "")
-                if res_id:
-                    row[defn.id_field] = res_id
-            if not res_id:
-                res_id = uuid.uuid4().hex
-                row[defn.id_field] = res_id
+            # PR-40 (no silent failure): this path previously had a
+            # two-step fallback — (a) coerce ``params[key_params[0]]``
+            # into the primary key, then (b) mint ``uuid.uuid4().hex``.
+            # Both steps violate fail-fast:
+            #   (a) for stream entities (``messages`` / ``subagents`` /
+            #       ``agent-memory`` — ``id_field != key_params[0]``)
+            #       coerced the scope key into a primary key and
+            #       collided UNIQUE on every second insert (prod
+            #       symptom: ``chat_reply`` stuck after one reply);
+            #   (b) silent uuid minting hid "caller forgot to mint an
+            #       id" bugs forever — the insert succeeded but the
+            #       caller's own id-tracking logic was wrong.
+            # Singleton entities (``id_field == key_params[0]``, e.g.
+            # ``agent-tools`` / ``agent-state`` / ``agent-binding``)
+            # already populate ``row[id_field]`` above via the
+            # scope-key-copy loop, so they reach this point with
+            # ``res_id`` already truthy and do NOT trip this guard.
+            # Stream/list entities MUST provide their own id (see
+            # ``business/message_actions._store_add_message``,
+            # ``gateway/files/registry.py:register_file``, etc.).
+            raise ValueError(
+                f"missing required '{defn.id_field}' on entity="
+                f"'{defn.name}': caller must provide a value. "
+                f"Entangled does not mint ids for non-auto-int "
+                f"primary keys (PR-40 fail-fast)."
+            )
 
         self._apply_defaults(defn, row)
         self._check_required(defn, row)
@@ -584,21 +591,15 @@ class SqlEntityStore(BaseStore):
         is_auto_int = id_f_def and id_f_def.kind.name == "INTEGER"
         res_id = row.get(defn.id_field, "")
         if not res_id and not is_auto_int:
-            # Same guard as _sql_create — see PR-40 rationale. Stream
-            # entities (messages, subagents, agent-memory) have
-            # id_field != key_params[0]; falling back to scope-key
-            # collides UNIQUE on every subsequent insert.
-            if (
-                params
-                and defn.key_params
-                and defn.key_params[0] == defn.id_field
-            ):
-                res_id = params.get(defn.key_params[0], "")
-                if res_id:
-                    row[defn.id_field] = res_id
-            if not res_id:
-                res_id = uuid.uuid4().hex
-                row[defn.id_field] = res_id
+            # Same fail-fast guard as _sql_create — see PR-40 rationale
+            # there. Stream entities (``messages`` / ``subagents`` /
+            # ``agent-memory``) MUST provide their own id.
+            raise ValueError(
+                f"missing required '{defn.id_field}' on entity="
+                f"'{defn.name}': caller must provide a value. "
+                f"Entangled does not mint ids for non-auto-int "
+                f"primary keys (PR-40 fail-fast)."
+            )
         lock_id = res_id or (params.get(defn.key_params[0], "") if params and defn.key_params else "") or "auto"
         self._apply_defaults(defn, row)
         self._check_required(defn, row)
