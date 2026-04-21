@@ -368,7 +368,18 @@ class SqlEntityStore(BaseStore):
         is_auto_int = id_f_def and id_f_def.kind.name == "INTEGER"
         res_id = row.get(defn.id_field, "")
         if not res_id and not is_auto_int:
-            if params and defn.key_params:
+            # Only fall back to scope-key when it IS the primary key
+            # (singleton-per-key entities: agent-tools, agent-state,
+            # agent-binding — where id_field == key_params[0]). For stream/
+            # list entities where id_field != key_params[0] (messages,
+            # subagents, agent-memory, ...), using the scope key as primary
+            # key guarantees a UNIQUE collision on the second insert.
+            # See PR-40.
+            if (
+                params
+                and defn.key_params
+                and defn.key_params[0] == defn.id_field
+            ):
                 res_id = params.get(defn.key_params[0], "")
                 if res_id:
                     row[defn.id_field] = res_id
@@ -573,7 +584,15 @@ class SqlEntityStore(BaseStore):
         is_auto_int = id_f_def and id_f_def.kind.name == "INTEGER"
         res_id = row.get(defn.id_field, "")
         if not res_id and not is_auto_int:
-            if params and defn.key_params:
+            # Same guard as _sql_create — see PR-40 rationale. Stream
+            # entities (messages, subagents, agent-memory) have
+            # id_field != key_params[0]; falling back to scope-key
+            # collides UNIQUE on every subsequent insert.
+            if (
+                params
+                and defn.key_params
+                and defn.key_params[0] == defn.id_field
+            ):
                 res_id = params.get(defn.key_params[0], "")
                 if res_id:
                     row[defn.id_field] = res_id
