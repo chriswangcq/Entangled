@@ -68,6 +68,10 @@ MESSAGES_DEF = SqlEntityDef(
         F.json("metadata", default="{}"),
         F.text("timestamp", nullable=False),
         F.int_("read", default=0),
+        # PR-41 mirror of the real MESSAGES_DEF so the lifecycle-at-
+        # insert logic in entity_store.append has a column to write.
+        F.text("lifecycle", default="pending"),
+        F.int_("lifecycle_updated_at"),
     ],
     outbox_trigger_types={
         "USER_MESSAGE": "user_message",
@@ -165,6 +169,95 @@ def test_duplicate_outbox_insert_silent(store):
         "SELECT COUNT(*) as cnt FROM message_outbox WHERE message_id = ?", ("msg-dup",)
     )
     assert count["cnt"] == 1
+
+
+# ── PR-41: born-consumed for non-trigger types ────────────────────────────────
+
+def test_trigger_type_keeps_pending_lifecycle(store):
+    """Regression guard for PR-41's write-side rule. A ``USER_MESSAGE``
+    must stay ``lifecycle='pending'`` at insert — subscribers rely on
+    picking it up from there. If PR-41's logic accidentally clamped
+    everything to consumed, the whole main path would break."""
+    store.append("messages", "", {
+        "id": "msg-trigger",
+        "agent_id": "agent-abc",
+        "type": "USER_MESSAGE",
+        "content": "{}",
+        "metadata": "{}",
+        "timestamp": "2026-04-21T00:00:00Z",
+        "read": 0,
+    }, params={"agent_id": "agent-abc"}, notify=False)
+
+    row = store.db.fetchone(
+        "SELECT lifecycle, lifecycle_updated_at FROM chat_messages WHERE id = ?",
+        ("msg-trigger",),
+    )
+    assert row["lifecycle"] == "pending"
+    # lifecycle_updated_at stays NULL until transition() flips it.
+    assert row["lifecycle_updated_at"] is None
+
+
+def test_non_trigger_type_born_consumed(store):
+    """PR-41 (2026-04-21) — an ``AGENT_REPLY`` has no registered
+    subscriber, so it must NOT enter the pending state. If it did,
+    PR-26's orphan scanner + PR-27's RECOVERED re-dispatch would
+    pick it up at the 5-minute mark and wake the agent in a self-
+    loop. Fix: stamp ``lifecycle='consumed'`` at INSERT time."""
+    store.append("messages", "", {
+        "id": "msg-reply",
+        "agent_id": "agent-abc",
+        "type": "AGENT_REPLY",
+        "content": json.dumps({"text": "hi"}),
+        "metadata": "{}",
+        "timestamp": "2026-04-21T00:00:01Z",
+        "read": 0,
+    }, params={"agent_id": "agent-abc"}, notify=False)
+
+    row = store.db.fetchone(
+        "SELECT lifecycle, lifecycle_updated_at FROM chat_messages WHERE id = ?",
+        ("msg-reply",),
+    )
+    assert row["lifecycle"] == "consumed", (
+        "non-trigger types must be born consumed to avoid orphan-scan "
+        "false positives (PR-41 self-loop fix)"
+    )
+    # lifecycle_updated_at stamped with the insert wall clock — orphan
+    # scan's COALESCE prefers this column, so a stray query that still
+    # matched pending rows would see a fresh timestamp anyway.
+    assert row["lifecycle_updated_at"] is not None
+    assert row["lifecycle_updated_at"] > 0
+
+    # No outbox row — reinforces "no consumer exists" invariant.
+    outbox = store.db.fetchone(
+        "SELECT * FROM message_outbox WHERE message_id = ?", ("msg-reply",),
+    )
+    assert outbox is None
+
+
+def test_caller_provided_lifecycle_is_not_overridden(store):
+    """Respect caller intent. If someone explicitly sets
+    ``lifecycle='pending'`` on an AGENT_REPLY (backfill scripts,
+    tests, someone debugging the orphan path on purpose), PR-41 must
+    NOT silently rewrite it to consumed — that would hide the bug
+    the caller is trying to reproduce.
+
+    The gate is ``"lifecycle" not in data`` — only rewrite when the
+    caller said nothing about it."""
+    store.append("messages", "", {
+        "id": "msg-explicit",
+        "agent_id": "agent-abc",
+        "type": "AGENT_REPLY",
+        "content": "{}",
+        "metadata": "{}",
+        "timestamp": "2026-04-21T00:00:02Z",
+        "read": 0,
+        "lifecycle": "pending",
+    }, params={"agent_id": "agent-abc"}, notify=False)
+
+    row = store.db.fetchone(
+        "SELECT lifecycle FROM chat_messages WHERE id = ?", ("msg-explicit",),
+    )
+    assert row["lifecycle"] == "pending"
 
 
 def test_subagent_send_extracts_subagent_id(store):

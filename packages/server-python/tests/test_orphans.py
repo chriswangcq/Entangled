@@ -14,7 +14,11 @@ import time
 
 import pytest
 
-from entangled.app.orphans import query_orphans, DEFAULT_CRIT_AGE_SEC
+from entangled.app.orphans import (
+    query_orphans,
+    DEFAULT_CRIT_AGE_SEC,
+    ORPHAN_ELIGIBLE_TYPES,
+)
 
 
 class _FakeDb:
@@ -48,11 +52,17 @@ def db():
     #   * lifecycle_updated_at is INTEGER ms, NULL for pre-PR-21 rows that
     #     were never touched by a transition()
     # Keep in sync with novaic-business/business/schema_push.py::MESSAGES_DEF.
+    # PR-41 (2026-04-21) — schema mirrors live ``chat_messages`` which has a
+    # ``type`` column (USER_MESSAGE / AGENT_REPLY / SUBAGENT_SEND / ...).
+    # The orphan query filters ``type IN ORPHAN_ELIGIBLE_TYPES``, so tests
+    # that don't care about type default to ``USER_MESSAGE`` (first entry
+    # of the tuple) — see ``_insert_msg`` default.
     conn.executescript(
         """
         CREATE TABLE chat_messages (
             id TEXT PRIMARY KEY,
             agent_id TEXT NOT NULL,
+            type TEXT NOT NULL,
             created_at TEXT NOT NULL,
             lifecycle TEXT NOT NULL DEFAULT 'pending',
             lifecycle_updated_at INTEGER
@@ -71,22 +81,25 @@ def db():
 
 
 def _insert_msg(conn, mid: str, age_sec: float, *, lifecycle="pending",
-                agent="a1", use_lifecycle_ts=True):
+                agent="a1", use_lifecycle_ts=True, type="USER_MESSAGE"):
     """Insert a row age_sec seconds in the past.
 
     ``use_lifecycle_ts=True`` simulates the common case where something has
     already transitioned the row (so lifecycle_updated_at is populated).
     ``use_lifecycle_ts=False`` simulates a pre-PR-21 pending row where the
     query has to fall back to strftime(created_at).
+
+    ``type`` defaults to USER_MESSAGE so existing tests (which predate
+    PR-41's type filter) keep passing without per-test updates.
     """
     now_s = int(time.time())
     past_s = now_s - int(age_sec)
     created_at_iso = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(past_s))
     lifecycle_ts = past_s * 1000 if use_lifecycle_ts else None
     conn.execute(
-        "INSERT INTO chat_messages (id, agent_id, created_at, lifecycle, lifecycle_updated_at)"
-        " VALUES (?, ?, ?, ?, ?)",
-        (mid, agent, created_at_iso, lifecycle, lifecycle_ts),
+        "INSERT INTO chat_messages (id, agent_id, type, created_at, lifecycle, lifecycle_updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (mid, agent, type, created_at_iso, lifecycle, lifecycle_ts),
     )
     conn.commit()
 
@@ -283,3 +296,83 @@ def test_permanent_failure_default_false_when_outbox_missing(db):
     resp = query_orphans(fdb, min_age_sec=30)
     assert resp.count == 1
     assert resp.orphans[0].outbox_permanent_failure is False
+
+
+# ── PR-41: type filter ────────────────────────────────────────────────────────
+
+def test_agent_reply_never_appears_in_orphan_view(db):
+    """PR-41 (2026-04-21) — ``AGENT_REPLY`` has no outbox consumer, so a
+    pending ``AGENT_REPLY`` row is not "stuck awaiting dispatch"; it's
+    just a historical artefact (pre-PR-41 rows or someone else's bug).
+    Including it in the orphan view caused HealthWorker's RECOVERED
+    re-dispatch to fire every 5 minutes on every reply — the exact
+    self-loop this ticket fixes."""
+    fdb, conn = db
+    _insert_msg(conn, "reply_old", age_sec=DEFAULT_CRIT_AGE_SEC + 100,
+                type="AGENT_REPLY")
+    resp = query_orphans(fdb, min_age_sec=30)
+    assert resp.count == 0, (
+        "pending AGENT_REPLY must not surface — it has no dispatch "
+        "consumer and reporting it creates the wake self-loop"
+    )
+
+
+def test_unknown_message_type_never_appears_in_orphan_view(db):
+    """Forward compatibility: new message types added without updating
+    outbox_trigger_types must also be filtered out. The type allow-list
+    is explicit (``ORPHAN_ELIGIBLE_TYPES``) rather than a "not in
+    blocklist" check, so new types fail-closed."""
+    fdb, conn = db
+    _insert_msg(conn, "unknown", age_sec=600, type="SYSTEM_HINT_FUTURE")
+    resp = query_orphans(fdb, min_age_sec=30)
+    assert resp.count == 0
+
+
+@pytest.mark.parametrize("t", list(ORPHAN_ELIGIBLE_TYPES))
+def test_trigger_types_still_surface(db, t):
+    """Regression guard: every type in the eligibility list must still
+    surface — the type filter tightens scope without breaking the
+    main path."""
+    fdb, conn = db
+    _insert_msg(conn, f"stuck_{t}", age_sec=600, type=t)
+    resp = query_orphans(fdb, min_age_sec=30)
+    assert resp.count == 1
+    assert resp.orphans[0].message_id == f"stuck_{t}"
+
+
+def test_mixed_types_only_eligible_returned(db):
+    """End-to-end: orphans of mixed types land in the DB; only trigger
+    types come back."""
+    fdb, conn = db
+    _insert_msg(conn, "user_stuck", age_sec=600, type="USER_MESSAGE")
+    _insert_msg(conn, "reply_stuck", age_sec=600, type="AGENT_REPLY")
+    _insert_msg(conn, "spawn_stuck", age_sec=600, type="SPAWN_SUBAGENT")
+    _insert_msg(conn, "send_stuck", age_sec=600, type="SUBAGENT_SEND")
+    resp = query_orphans(fdb, min_age_sec=30)
+    assert {o.message_id for o in resp.orphans} == {
+        "user_stuck", "spawn_stuck", "send_stuck",
+    }
+
+
+def test_orphan_eligible_types_matches_messages_def():
+    """PR-41 sync check. The tuple in ``orphans.py`` MUST mirror
+    ``MESSAGES_DEF.outbox_trigger_types`` in
+    ``novaic-business/business/schema_push.py``. Drift here is the
+    same bug class PR-41 exists to fix.
+
+    We import the Business def lazily so the Entangled test suite is
+    still runnable without the novaic-business package installed
+    (CI matrix some environments don't pull it). Skip — don't fail —
+    if the import isn't available; ``scripts/ci/lint_outbox_trigger_sync.sh``
+    is the hard gate at the repo level."""
+    try:
+        from business.schema_push import MESSAGES_DEF  # type: ignore
+    except Exception:
+        pytest.skip("novaic-business not importable in this env")
+    expected = tuple(sorted(MESSAGES_DEF.outbox_trigger_types.keys()))
+    actual = tuple(sorted(ORPHAN_ELIGIBLE_TYPES))
+    assert expected == actual, (
+        f"ORPHAN_ELIGIBLE_TYPES ({actual}) is out of sync with "
+        f"MESSAGES_DEF.outbox_trigger_types ({expected}). "
+        "Update orphans.py to match."
+    )

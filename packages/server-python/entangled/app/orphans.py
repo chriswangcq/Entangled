@@ -54,6 +54,33 @@ router = APIRouter(prefix="/v1/orphans", tags=["Orphans"])
 DEFAULT_WARN_AGE_SEC = 30
 DEFAULT_CRIT_AGE_SEC = 300
 
+# PR-41 (2026-04-21) — orphan eligibility by message type.
+#
+# Only message types that have a registered wake-triggering consumer
+# can legitimately be stuck "pending". For every other type
+# (``AGENT_REPLY``, ``SYSTEM_NOTE``, future additions) there is no
+# subscriber that would ever move the row off ``lifecycle='pending'``,
+# so including them in the orphan view produced the 5-minute
+# self-loop that motivated this ticket (HealthWorker → RECOVERED →
+# new AGENT_REPLY → pending again → ...).
+#
+# Authoritative source: ``novaic-business/business/schema_push.py
+# ::MESSAGES_DEF.outbox_trigger_types``. Keep this tuple in sync —
+# CI hook ``scripts/ci/lint_outbox_trigger_sync.sh`` fails the build
+# if they drift.
+#
+# Paired with the write-side ``consumed``-at-insert fix in
+# ``entangled/sql/entity_store.py::append``; either alone would
+# prevent the self-loop, both together ensure that (a) new rows
+# can't ever enter the orphan view with a non-trigger type, and
+# (b) pre-existing pending rows from before the write-side fix
+# are filtered out here.
+ORPHAN_ELIGIBLE_TYPES: tuple[str, ...] = (
+    "USER_MESSAGE",
+    "SUBAGENT_SEND",
+    "SPAWN_SUBAGENT",
+)
+
 
 class OrphanRow(BaseModel):
     message_id: str
@@ -138,7 +165,12 @@ def query_orphans(
     # combination is itself suspicious (see OrphanRow.outbox_attempts doc).
     # chat_messages has no user_id column (Business's schema uses sender),
     # so we project NULL and keep the field for API stability.
-    sql = """
+    # PR-41 (2026-04-21) — restrict to trigger types. See
+    # ``ORPHAN_ELIGIBLE_TYPES`` above for rationale. Generated via
+    # placeholders to keep this compatible with parameterised execute
+    # regardless of tuple length.
+    type_placeholders = ",".join("?" for _ in ORPHAN_ELIGIBLE_TYPES)
+    sql = f"""
         SELECT m.id              AS message_id,
                m.agent_id        AS agent_id,
                NULL              AS user_id,
@@ -154,6 +186,7 @@ def query_orphans(
           FROM chat_messages m
           LEFT JOIN message_outbox o ON o.message_id = m.id
          WHERE m.lifecycle = 'pending'
+           AND m.type IN ({type_placeholders})
            AND COALESCE(
                    m.lifecycle_updated_at,
                    CAST(strftime('%s', m.created_at) AS INTEGER) * 1000
@@ -162,7 +195,10 @@ def query_orphans(
          LIMIT ?
     """
     with db.transaction("global"):
-        rows = db.execute(sql, (cutoff_ms, limit)).fetchall()
+        rows = db.execute(
+            sql,
+            (*ORPHAN_ELIGIBLE_TYPES, cutoff_ms, limit),
+        ).fetchall()
 
     orphans: list[OrphanRow] = []
     warn = crit = 0
