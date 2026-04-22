@@ -136,9 +136,15 @@ def _insert(conn, msg_id: str, **overrides):
 def test_allowed_transitions_matches_rfc():
     """Any change to this map must also update
     docs/roadmap/tickets/PR-21-message-lifecycle-enum.md; drift between
-    the two is exactly how the orphan scanner would start missing rows."""
+    the two is exactly how the orphan scanner would start missing rows.
+
+    PR-47 (2026-04-23) added the reason-gated ``pending → consumed``
+    edge for HealthWorker age-cap and one-shot migrations; the edge is
+    in the matrix but a secondary reason-allow-list guards its use
+    (see ``test_pending_consumed_requires_admin_reason``).
+    """
     assert ALLOWED_TRANSITIONS == {
-        "pending":   {"claimed", "deduped"},
+        "pending":   {"claimed", "deduped", "consumed"},
         "claimed":   {"consumed", "orphaned"},
         "consumed":  set(),
         "orphaned":  {"claimed"},
@@ -190,7 +196,6 @@ def test_full_transition_path(store, path):
 @pytest.mark.parametrize(
     "current,to",
     [
-        ("pending", "consumed"),   # skipped claimed
         ("pending", "orphaned"),   # can't orphan what wasn't claimed
         ("consumed", "claimed"),   # terminal
         ("consumed", "orphaned"),  # terminal
@@ -207,6 +212,59 @@ def test_invalid_transitions_rejected(store, current, to):
         "SELECT lifecycle FROM chat_messages WHERE id='m1'"
     ).fetchone()
     assert row["lifecycle"] == current  # unchanged on failure
+
+
+# ── PR-47: pending → consumed reason gate ────────────────────────────────
+
+def test_pending_consumed_requires_admin_reason(store):
+    """The edge is in ``ALLOWED_TRANSITIONS``, but a caller that passes
+    an arbitrary ``reason`` (or ``None``) must be rejected.
+
+    Rationale: normal dispatch traverses ``pending → claimed → consumed``;
+    only HealthWorker age-cap and one-shot migrations are allowed to
+    skip the middle. Reason-gating keeps that contract from rotting.
+    """
+    _, db, conn = store
+    _insert(conn, "m_noreason")
+
+    with pytest.raises(InvalidTransition) as exc:
+        transition(db, "m_noreason", to="consumed")
+    assert "age_cap" in str(exc.value)  # helpful error message
+
+    # Still pending — no write happened.
+    row = conn.execute(
+        "SELECT lifecycle FROM chat_messages WHERE id='m_noreason'"
+    ).fetchone()
+    assert row["lifecycle"] == "pending"
+
+
+def test_pending_consumed_rejects_unrelated_reason(store):
+    """Any reason not in the allow-list is rejected — even plausible-
+    looking ones like ``"subscriber_dispatch"`` (that's the reason
+    normal dispatch uses on ``claimed → consumed``; it has no business
+    on the admin short-circuit)."""
+    _, db, conn = store
+    _insert(conn, "m_bad")
+    with pytest.raises(InvalidTransition):
+        transition(db, "m_bad", to="consumed", reason="subscriber_dispatch")
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["age_cap", "pr47_ancient_pending_cleanup"],
+)
+def test_pending_consumed_accepts_admin_reasons(store, reason):
+    """Both allow-list entries must work end-to-end. Parametrised so
+    adding a third allow-list entry forces a deliberate test update.
+    """
+    _, db, conn = store
+    _insert(conn, f"m_{reason}")
+    result = transition(db, f"m_{reason}", to="consumed", reason=reason)
+    assert result["to"] == "consumed"
+    row = conn.execute(
+        f"SELECT lifecycle FROM chat_messages WHERE id='m_{reason}'"
+    ).fetchone()
+    assert row["lifecycle"] == "consumed"
 
 
 def test_unknown_target_state_rejected_fast(store):
