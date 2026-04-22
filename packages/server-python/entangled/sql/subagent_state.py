@@ -98,13 +98,43 @@ VALID_STATES: frozenset[str] = frozenset(ALLOWED_TRANSITIONS.keys())
 # Columns a transition caller is permitted to set alongside ``status``. This
 # mirrors the union of ``extra`` dicts built by the Business-side helpers
 # (``mark_sleeping``, ``mark_failed``, …). Any other key in the caller's
-# ``extra`` dict is silently dropped before the UPDATE — that keeps a future
+# ``extra`` dict is dropped before the UPDATE — that keeps a future
 # column-rename on Business from blowing up an in-flight transition.
+#
+# Observability note (PR-53, 2026-04-25)
+# --------------------------------------
+# Prior to PR-53 dropped keys were silent. That turned out to cost us PR-42
+# (``handoff_notes``), PR-45 (``historical_summary``) and PR-43 Wave A
+# (``last_scope_id`` / ``last_scope_archived_at``) all at once: Business-side
+# ``internal_update_entity`` force-routes any ``subagents`` PATCH containing
+# ``status`` through :func:`transition`, so the additive continuity columns
+# that the runtime handlers piggyback on the terminal ``sleeping`` flip
+# landed here — and silently evaporated. Nothing in prod logs, every unit
+# test green (the handler layer mocked the Business client), ``subagents``
+# rows left NULL, continuity chain broken for every wake.
+#
+# PR-53 does two things to make that class of bug impossible:
+#   1. Expand the allowlist to cover the known terminal-flip continuity
+#      columns (``historical_summary``, ``last_scope_id``,
+#      ``last_scope_archived_at``). The ``subagents`` SqlEntityDef owns
+#      these columns and the generic ``entity_store.update_where`` path
+#      accepts them — forcing the state-machine path to honor the same
+#      columns restores the symmetry callers were assuming.
+#   2. WARN on every dropped key inside :func:`transition` so the next
+#      unlisted column shows up in ``business.log`` within minutes of the
+#      first write attempt, instead of hiding behind a green test.
 EXTRA_ALLOWLIST: frozenset[str] = frozenset({
     "need_rest",
     "progress",
     "error",
     "result",
+    # PR-45 (2026-04-22): summary written alongside terminal sleeping
+    # flip so the next wake's continuity resolver has material to quote.
+    "historical_summary",
+    # PR-43 Wave A (2026-04-24): root-scope chain pointer + its archive
+    # time, piggybacked on the terminal sleeping/completed flip.
+    "last_scope_id",
+    "last_scope_archived_at",
 })
 
 
@@ -193,6 +223,7 @@ def transition(
     # Narrow ``extra`` down to the allowlist before opening the transaction
     # so a bad caller can't widen the lock scope while we deliberate.
     clean_extra: Dict[str, Any] = {}
+    dropped: list[str] = []
     if extra:
         for key, value in extra.items():
             if key == "status":
@@ -201,6 +232,24 @@ def transition(
                 raise InvalidTransition("extra must not contain 'status'; use `to`")
             if key in EXTRA_ALLOWLIST:
                 clean_extra[key] = value
+            else:
+                dropped.append(key)
+
+    # PR-53 (2026-04-25): surface silent drops. Before PR-53 an unlisted key
+    # (e.g. ``historical_summary`` before PR-45 landed) would vanish with
+    # zero log output — we'd only notice when users complained about
+    # broken continuity. The WARN gives on-call a single grep to find
+    # "Business meant to write column X but Entangled didn't accept it"
+    # regressions within one write attempt. We log once per call (keys
+    # joined) to avoid log amplification in the noop-self-loop case.
+    if dropped:
+        logger.warning(
+            "subagent_state extra_dropped subagent=%s agent=%s to=%s dropped_keys=%s "
+            "reason=%s actor=%s — add to EXTRA_ALLOWLIST or use generic entity_store.update",
+            subagent_id, agent_id, to,
+            ",".join(sorted(dropped)),
+            reason or "-", actor or "-",
+        )
 
     with db.transaction("global"):
         row = db.execute(
