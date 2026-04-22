@@ -84,6 +84,7 @@ def create_app(config: ServiceConfig) -> FastAPI:
     from .outbox import router as outbox_router
     from .message_state import router as message_state_router
     from .orphans import router as orphans_router
+    from .stuck_claimed import router as stuck_claimed_router
     from .state_transitions import router as state_transitions_router
     from .subagent_state import router as subagent_state_router
     from .ws import ws_sync_handler
@@ -100,6 +101,12 @@ def create_app(config: ServiceConfig) -> FastAPI:
     # (orphan scan + re-dispatch in PR-27) and by Business's ops-facing
     # /internal/messages/orphaned proxy.
     app.include_router(orphans_router)
+    # PR-51 Part 2 (2026-04-23) — stuck-claimed listing endpoint.
+    # Companion to /v1/orphans but for the other half of the lifecycle
+    # ladder: rows that got claimed but never moved to consumed. Consumed
+    # by HealthWorker's claimed-age scan and by Business's ops-facing
+    # /internal/messages/stuck-claimed proxy.
+    app.include_router(stuck_claimed_router)
     # PR-31 — append-only history for message + subagent state machines.
     # Message transitions are populated co-transactionally inside
     # message_state.transition; the same property now holds for subagent
