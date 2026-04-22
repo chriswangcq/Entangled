@@ -14,9 +14,16 @@ Rules (state diagram)
        │          │
        │          └──▶ orphaned ──▶ claimed   (recovery re-claim)
        │
-       └──▶ deduped  (idempotency winner's duplicates)
+       ├──▶ deduped  (idempotency winner's duplicates)
+       │
+       └──▶ consumed  (admin short-circuit only — PR-47 age-cap)
 
     consumed, deduped: terminal (no outbound transitions)
+
+    The direct ``pending → consumed`` edge is reason-gated to a small
+    allow-list (see ``_PENDING_CONSUMED_REASON_ALLOWLIST`` below) so that
+    only HealthWorker age-cap and one-shot migration scripts can use it.
+    Normal dispatch MUST still traverse ``pending → claimed → consumed``.
 
 Single write entrypoint
 -----------------------
@@ -55,12 +62,27 @@ logger = logging.getLogger(__name__)
 # that touches every existing row in that state, so in practice this
 # mapping is append-only.
 ALLOWED_TRANSITIONS: Dict[str, set[str]] = {
-    "pending":   {"claimed", "deduped"},
+    "pending":   {"claimed", "deduped", "consumed"},
     "claimed":   {"consumed", "orphaned"},
     "consumed":  set(),   # terminal — message reached a scope and ran
     "orphaned":  {"claimed"},   # HealthWorker recovery can re-claim
     "deduped":   set(),   # terminal — idempotency duplicate, never dispatched
 }
+# Direct ``pending → consumed`` is admissible only for administrative
+# short-circuits (PR-47: HealthWorker age-cap, one-shot cleanup of
+# ancient ``pending`` rows). Normal dispatch MUST go through
+# ``pending → claimed → consumed``. We enforce the "admin-only" half
+# via ``reason`` whitelisting below rather than a separate state to
+# keep the lifecycle graph finite and the migration story trivial.
+_PENDING_CONSUMED_REASON_ALLOWLIST: frozenset[str] = frozenset({
+    # HealthWorker: orphan past ``MAX_RECOVERY_AGE_SEC``. See
+    # ``novaic-agent-runtime/task_queue/workers/health_worker.py``.
+    "age_cap",
+    # One-shot SQL migration that retired the 2026-04 ``pending`` pool
+    # left behind by the PR-41 regression. Kept in the allow-list so
+    # replays of the migration script don't trip the guard.
+    "pr47_ancient_pending_cleanup",
+})
 
 VALID_STATES: frozenset[str] = frozenset(ALLOWED_TRANSITIONS.keys())
 
@@ -180,6 +202,19 @@ def transition(
             raise InvalidTransition(
                 f"{cur_state} -> {to} not allowed for message {message_id}"
             )
+
+        # PR-47 (2026-04-23) — ``pending -> consumed`` is admissible only
+        # for administrative short-circuits (age-cap, one-shot cleanup).
+        # Without this guard, a caller that forgets to ``claimed`` first
+        # could silently burn a message that a subscriber is racing to
+        # claim. Reason-gating keeps the state graph expressive without
+        # forking a new state.
+        if cur_state == "pending" and to == "consumed":
+            if reason not in _PENDING_CONSUMED_REASON_ALLOWLIST:
+                raise InvalidTransition(
+                    f"pending -> consumed requires reason in "
+                    f"{sorted(_PENDING_CONSUMED_REASON_ALLOWLIST)!r}, got {reason!r}"
+                )
 
         # COALESCE(?, claimed_by_scope) lets callers omit scope_id on
         # transitions that don't change ownership (e.g. consumed, deduped
