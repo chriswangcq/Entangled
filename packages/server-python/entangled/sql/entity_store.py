@@ -395,6 +395,7 @@ class SqlEntityStore(BaseStore):
             )
 
         self._apply_defaults(defn, row)
+        self._stamp_consumed_if_non_trigger(defn, data, row)
         self._check_required(defn, row)
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
@@ -602,55 +603,7 @@ class SqlEntityStore(BaseStore):
             )
         lock_id = res_id or (params.get(defn.key_params[0], "") if params and defn.key_params else "") or "auto"
         self._apply_defaults(defn, row)
-        # PR-41 (2026-04-21) — non-trigger types born `consumed`.
-        # Rationale: the outbox co-insert below only fires for
-        # ``type in defn.outbox_trigger_types``. For any other type
-        # (e.g. ``AGENT_REPLY`` in ``chat_messages``) there is no
-        # subscriber / consumer that will ever move the row off the
-        # default ``lifecycle='pending'``. PR-26's orphan scanner
-        # then picks them up at the crit threshold (300s by default)
-        # and PR-27 re-dispatches them with TriggerType.RECOVERED —
-        # causing the "agent wakes up every 5 minutes for no reason"
-        # self-loop that motivated this ticket.
-        #
-        # Fix: at INSERT time, if (a) this entity uses outbox, (b) the
-        # row's type is not a trigger type, and (c) the caller didn't
-        # explicitly set lifecycle themselves, stamp lifecycle=consumed
-        # directly. This is NOT a state-machine transition (no prior
-        # state existed) so ALLOWED_TRANSITIONS is not violated and
-        # PR-31's transition log correctly stays empty — nothing
-        # transitioned, the row was born in a terminal state.
-        #
-        # The CHECK constraint (``lifecycle IN
-        # ('pending','claimed','consumed','orphaned','deduped')``)
-        # permits 'consumed' as a valid initial value.
-        #
-        # Belt-and-suspenders: ``entangled/app/orphans.py`` also
-        # filters by type at read time. Either alone would prevent
-        # the self-loop; both together ensure that future non-trigger
-        # types added without touching this code path still can't
-        # orphan-loop.
-        # The ``lifecycle`` column is declared nullable=True in the live
-        # schema (see ``MESSAGES_DEF`` in novaic-business), so
-        # ``_apply_defaults`` does NOT populate it — the column's
-        # SQL-level ``DEFAULT 'pending'`` does the work at INSERT
-        # time instead. That means ``row`` won't contain a lifecycle
-        # key unless either the caller set it or this patch sets it.
-        # The gating condition is therefore ``"lifecycle" not in
-        # data`` (caller didn't state intent); we then override the
-        # would-be DB default by putting 'consumed' into ``row``
-        # explicitly so it rides the INSERT statement.
-        _lifecycle_col = defn.field_map.get("lifecycle") if defn.fields else None
-        if (
-            defn.outbox_trigger_types
-            and _lifecycle_col is not None
-            and "lifecycle" not in data
-        ):
-            _msg_type = row.get("type", "")
-            if _msg_type and _msg_type not in defn.outbox_trigger_types:
-                row["lifecycle"] = "consumed"
-                if "lifecycle_updated_at" in defn.field_map:
-                    row["lifecycle_updated_at"] = int(time.time() * 1000)
+        self._stamp_consumed_if_non_trigger(defn, data, row)
         self._check_required(defn, row)
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
@@ -910,6 +863,68 @@ class SqlEntityStore(BaseStore):
                 continue
             row[f.name] = _iso_now_utc() if f.default == "NOW" else f.default
         return row
+
+    def _stamp_consumed_if_non_trigger(
+        self,
+        defn: SqlEntityDef,
+        data: Dict[str, Any],
+        row: Dict[str, Any],
+    ) -> None:
+        """PR-41 (2026-04-21 / amend 2026-04-22) — non-trigger types born
+        ``lifecycle='consumed'``.
+
+        The outbox co-insert in :meth:`append` only fires for
+        ``row["type"] in defn.outbox_trigger_types``. For any other type
+        (e.g. ``AGENT_REPLY`` in ``chat_messages``) there is no subscriber
+        that will ever move the row off the SQL default ``lifecycle='pending'``.
+        PR-26's orphan scanner picks them up at the crit threshold (300 s)
+        and PR-27 re-dispatches them with ``TriggerType.RECOVERED`` —
+        causing the self-wake loop that motivated this ticket.
+
+        **Initial PR-41 (2026-04-21)** only patched :meth:`append`. Prod
+        kept self-waking because the runtime's ``chat_reply`` tool uses
+        ``gw.entity_create("messages", {...})`` — which lands in
+        :meth:`_sql_create`, not :meth:`append` — and skipped the gate
+        entirely. The original AGENT_REPLY ``d8f43c8934b1`` captured on
+        prod at ``2026-04-22 03:04:02`` was born ``lifecycle='pending'``
+        even with the shipped fix, proving the asymmetry. The amend
+        extracts the gate into this helper and calls it from both write
+        paths so future callers can't repeat the bug.
+
+        Gating:
+
+            * ``defn`` must declare ``outbox_trigger_types`` (message-bus entity)
+            * ``lifecycle`` must be a declared column on this entity
+            * caller did NOT set ``lifecycle`` in ``data`` (explicit intent wins)
+            * ``row["type"]`` is truthy AND is not in ``outbox_trigger_types``
+              (there is no consumer that will transition it)
+
+        This is NOT a state-machine transition — there is no prior state,
+        the row is born in its terminal state. ``ALLOWED_TRANSITIONS`` is
+        not violated and PR-31's transitions log correctly stays empty
+        for these rows. The CHECK constraint accepts ``'consumed'`` as a
+        valid initial value.
+
+        Belt-and-suspenders: ``entangled/app/orphans.py`` also filters by
+        type at read time. Either alone would prevent the self-loop; both
+        together ensure that future non-trigger types added without
+        touching this code path still can't orphan-loop.
+        """
+        lifecycle_col = defn.field_map.get("lifecycle") if defn.fields else None
+        if not (
+            defn.outbox_trigger_types
+            and lifecycle_col is not None
+            and "lifecycle" not in data
+        ):
+            return
+        msg_type = row.get("type", "")
+        if not msg_type:
+            return
+        if msg_type in defn.outbox_trigger_types:
+            return
+        row["lifecycle"] = "consumed"
+        if "lifecycle_updated_at" in defn.field_map:
+            row["lifecycle_updated_at"] = int(time.time() * 1000)
 
     def _check_required(self, defn: SqlEntityDef, row: Dict[str, Any]) -> None:
         """Raise ``ValueError`` listing every NOT-NULL, no-default, non-primary
