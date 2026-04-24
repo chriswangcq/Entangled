@@ -115,11 +115,9 @@ VALID_STATES: frozenset[str] = frozenset(ALLOWED_TRANSITIONS.keys())
 #
 # PR-53 does two things to make that class of bug impossible:
 #   1. Expand the allowlist to cover the known terminal-flip continuity
-#      columns (``historical_summary``, ``last_scope_id``,
-#      ``last_scope_archived_at``). The ``subagents`` SqlEntityDef owns
-#      these columns and the generic ``entity_store.update_where`` path
-#      accepts them — forcing the state-machine path to honor the same
-#      columns restores the symmetry callers were assuming.
+#      columns. After PR-55 the only surviving continuity column on
+#      this path is ``last_scope_id`` + ``last_scope_archived_at``;
+#      ``historical_summary`` was retired (removed 2026-04-23).
 #   2. WARN on every dropped key inside :func:`transition` so the next
 #      unlisted column shows up in ``business.log`` within minutes of the
 #      first write attempt, instead of hiding behind a green test.
@@ -128,9 +126,12 @@ EXTRA_ALLOWLIST: frozenset[str] = frozenset({
     "progress",
     "error",
     "result",
-    # PR-45 (2026-04-22): summary written alongside terminal sleeping
-    # flip so the next wake's continuity resolver has material to quote.
-    "historical_summary",
+    # PR-55 (2026-04-23): ``historical_summary`` retired from the
+    # allowlist along with its producer/consumer path. The column still
+    # exists on ``subagents`` (tolerant migration) but no live caller
+    # should write to it via the state-machine path. If a stale
+    # runtime still passes it, the WARN on dropped keys (below) will
+    # surface that before any correctness impact.
     # PR-43 Wave A (2026-04-24): root-scope chain pointer + its archive
     # time, piggybacked on the terminal sleeping/completed flip.
     "last_scope_id",

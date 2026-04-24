@@ -210,32 +210,16 @@ def test_unknown_target_status_rejected(db):
         transition(db, "s1", "a1", to="not-a-status", reason="r", actor="a")
 
 
-# ── PR-53: continuity columns must pass through EXTRA_ALLOWLIST ─────────────
+# ── PR-53 / PR-55: continuity columns must pass through EXTRA_ALLOWLIST ──
 #
 # Before PR-53, Business-side ``internal_update_entity`` force-routed any
 # ``subagents`` PATCH containing ``status`` through ``subagent_state.transition``,
 # which intersected ``extra`` with a 4-key allowlist and silently dropped
-# anything else. That took out PR-42 (``handoff_notes``), PR-45
-# (``historical_summary``) and PR-43 Wave A (``last_scope_id`` /
-# ``last_scope_archived_at``) in one go — continuity never worked for a
-# single wake on prod. These tests lock the fix: the three columns land
-# in the UPDATE, and unlisted keys still get dropped *with* a WARN.
-
-def test_transition_writes_historical_summary(db):
-    """PR-45: summary piggybacks on the terminal ``awake -> sleeping`` flip."""
-    _insert_subagent(db, status="awake")
-
-    transition(
-        db, "s1", "a1", to="sleeping", reason="rest", actor="runtime",
-        extra={"historical_summary": "user asked the time; replied 22:36."},
-    )
-
-    row = db.fetchone(
-        "SELECT status, historical_summary FROM subagents WHERE subagent_id='s1'"
-    )
-    assert row["status"] == "sleeping"
-    assert row["historical_summary"] == "user asked the time; replied 22:36."
-
+# anything else. That took out ``last_scope_id`` / ``last_scope_archived_at``
+# on every terminal rest transition. PR-53 expanded the allowlist; PR-55
+# retired the ``handoff_notes`` / ``historical_summary`` half of the
+# continuity surface (no live producer), leaving ``last_scope_id`` as
+# the sole surviving piggybacked column.
 
 def test_transition_writes_last_scope_fields(db):
     """PR-43 Wave A: root-scope chain pointer + its archive time."""
@@ -264,32 +248,60 @@ def test_continuity_fields_are_in_allowlist():
     """Defensive unit: if someone deletes an entry from EXTRA_ALLOWLIST
     during a future refactor, this test flips red immediately instead of
     continuity silently breaking in prod the next wake."""
-    for key in ("historical_summary", "last_scope_id", "last_scope_archived_at"):
+    for key in ("last_scope_id", "last_scope_archived_at"):
         assert key in EXTRA_ALLOWLIST, (
             f"{key!r} dropped from EXTRA_ALLOWLIST — "
             "runtime handlers and PR-43 Wave A/B/C will regress silently"
         )
 
 
+def test_retired_historical_summary_is_dropped(db, caplog):
+    """PR-55 (2026-04-23): ``historical_summary`` left the allowlist with
+    the field's retirement. If a stale caller still passes it, the
+    transition must drop the key (with a WARN) rather than fail the
+    UPDATE or silently land a write that no consumer reads."""
+    import logging
+
+    _insert_subagent(db, status="awake")
+
+    with caplog.at_level(logging.WARNING, logger="entangled.sql.subagent_state"):
+        transition(
+            db, "s1", "a1", to="sleeping", reason="rest", actor="runtime",
+            extra={
+                "historical_summary": "stale-ignored",
+                "last_scope_id": "scope-xyz",
+            },
+        )
+
+    row = db.fetchone(
+        "SELECT status, historical_summary, last_scope_id "
+        "FROM subagents WHERE subagent_id='s1'"
+    )
+    assert row["status"] == "sleeping"
+    assert row["historical_summary"] is None
+    assert row["last_scope_id"] == "scope-xyz"
+    warns = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("historical_summary" in m for m in warns), warns
+
+
 def test_self_loop_also_writes_continuity_fields(db):
-    """The saga can fire a no-op ``sleeping -> sleeping`` when a wake aborted
-    early but we still want the summary update to land. The self-loop branch
-    goes through ``_apply_extras`` rather than ``_apply_status_and_extras``;
-    PR-53 checks both paths honor the same allowlist."""
+    """The saga can fire a no-op ``sleeping -> sleeping`` when a wake
+    aborted early but we still want the last_scope_id update to land.
+    The self-loop branch goes through ``_apply_extras`` rather than
+    ``_apply_status_and_extras``; PR-53 checks both paths honor the
+    same allowlist."""
     _insert_subagent(db, status="sleeping")
 
     transition(
         db, "s1", "a1", to="sleeping", reason="retry", actor="recovery",
         extra={
-            "historical_summary": "retry wrote fresh summary",
             "last_scope_id": "scope-xyz",
         },
     )
 
     row = db.fetchone(
-        "SELECT historical_summary, last_scope_id FROM subagents WHERE subagent_id='s1'"
+        "SELECT last_scope_id FROM subagents WHERE subagent_id='s1'"
     )
-    assert row["historical_summary"] == "retry wrote fresh summary"
     assert row["last_scope_id"] == "scope-xyz"
 
 
@@ -325,7 +337,7 @@ def test_allowlisted_extras_do_not_emit_warn(db, caplog):
     with caplog.at_level(logging.WARNING, logger="entangled.sql.subagent_state"):
         transition(
             db, "s1", "a1", to="sleeping", reason="rest", actor="runtime",
-            extra={"historical_summary": "ok", "last_scope_id": "s", "need_rest": 0},
+            extra={"last_scope_id": "s", "need_rest": 0},
         )
 
     warns = [r for r in caplog.records if r.levelno >= logging.WARNING]
