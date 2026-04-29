@@ -28,8 +28,6 @@ from ..server.ws_handler import (
     PUSH_QUEUE_MAX_SIZE,
     SYNC_CONTRACT_VERSION,
     handle_action,
-    handle_load_more,
-    handle_request,
     handle_entangle,
     handle_disentangle,
 )
@@ -82,7 +80,7 @@ class _WsSender:
 
 
 def _normalize_incoming_msg(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Accept requestId (camelCase) or request_id for load_more / request."""
+    """Accept requestId (camelCase) or request_id."""
     m = dict(raw)
     rid = m.get("request_id") or m.get("requestId")
     if rid is not None:
@@ -194,16 +192,12 @@ async def ws_sync_handler(websocket: WebSocket):
             last_activity = time.monotonic()
             msg_type = data.get("type")
 
-            if msg_type in ("entangle", "subscribe"):
+            if msg_type == "entangle":
                 await handle_entangle(sender, store, user_id, client_id, data)
-            elif msg_type in ("disentangle", "unsubscribe"):
+            elif msg_type == "disentangle":
                 handle_disentangle(client_id, data, store=store)
             elif msg_type == "action":
                 await handle_action(sender, store, user_id, client_id, _normalize_incoming_msg(data))
-            elif msg_type == "request":
-                await handle_request(sender, store, user_id, _normalize_incoming_msg(data))
-            elif msg_type == "load_more":
-                await handle_load_more(sender, store, user_id, _normalize_incoming_msg(data))
             elif msg_type == "ping":
                 await sender.send_json({"type": "pong"})
             elif msg_type in ("pong", "heartbeat"):

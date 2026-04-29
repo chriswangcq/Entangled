@@ -8,8 +8,8 @@
 //!     "/data/entangled",
 //! ).await;
 //!
-//! // Subscribe to an entity
-//! client.subscribe("todos", None).await;
+//! // Entangle an entity
+//! client.entangle("todos", None).await;
 //!
 //! // Read from local cache
 //! let todos = client.get_list("todos", None);
@@ -28,7 +28,7 @@
 //! // Host feeds incoming sync frames
 //! client.handle_sync_frame(frame_value);
 //!
-//! // Host sends subscribe/unsubscribe through its own WS
+//! // Host sends entangle/disentangle through its own WS
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -171,11 +171,11 @@ impl EntangledClient {
         Ok(())
     }
 
-    // ── Subscribe / Unsubscribe ──────────────────────────────────────────────
+    // ── Entangle / Disentangle ───────────────────────────────────────────────
 
-    /// Subscribe to an entity. In standalone mode, this sends a WS message.
+    /// Entangle an entity. In standalone mode, this sends a WS message.
     #[cfg(feature = "transport")]
-    pub async fn subscribe(&self, entity: &str, params: Option<Value>) {
+    pub async fn entangle(&self, entity: &str, params: Option<Value>) {
         let key = match &params {
             Some(p) => {
                 let map = p.as_object().cloned().unwrap_or_default();
@@ -191,15 +191,15 @@ impl EntangledClient {
         };
 
         if let Some(ref t) = self.transport {
-            t.subscribe(entity, params, version).await;
+            t.entangle(entity, params, version).await;
         }
     }
 
-    /// Unsubscribe from an entity.
+    /// Disentangle an entity.
     #[cfg(feature = "transport")]
-    pub async fn unsubscribe(&self, entity: &str, params: Option<Value>) {
+    pub async fn disentangle(&self, entity: &str, params: Option<Value>) {
         if let Some(ref t) = self.transport {
-            t.unsubscribe(entity, params).await;
+            t.disentangle(entity, params).await;
         }
     }
 

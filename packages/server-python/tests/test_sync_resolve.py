@@ -31,6 +31,7 @@ def test_stream_first_subscribe_head_n():
         fetch_data_fn=_fetch_factory(rows),
         sync_type="stream",
         default_stream_depth=50,
+        exists_before_fn=lambda _oldest_id: True,
     )
     assert out["mode"] == "head_n"
     assert out["hasMore"] is True
@@ -64,11 +65,12 @@ def test_stream_op_log_gap_uses_head_n_not_full_snapshot():
         fetch_data_fn=fetch_data,
         sync_type="stream",
         default_stream_depth=50,
+        exists_before_fn=lambda _oldest_id: True,
     )
     assert out["mode"] == "head_n"
     assert len(out["data"]) <= 50
     assert None not in limits_seen, "stream snapshot path must never omit limit"
-    assert limits_seen and limits_seen[0] == DEFAULT_STREAM_HEAD_DEPTH + 1
+    assert limits_seen and limits_seen[0] == DEFAULT_STREAM_HEAD_DEPTH
 
 
 def test_effective_depth_prefers_client_over_entity_default():
@@ -82,6 +84,7 @@ def test_effective_depth_prefers_client_over_entity_default():
         fetch_data_fn=_fetch_factory(rows),
         sync_type="stream",
         default_stream_depth=99,
+        exists_before_fn=lambda _oldest_id: True,
     )
     assert len(out["data"]) == 10
     assert out["hasMore"] is True
@@ -98,6 +101,7 @@ def test_depth_clamped_to_max():
         fetch_data_fn=_fetch_factory(rows),
         sync_type="stream",
         default_stream_depth=50,
+        exists_before_fn=lambda _oldest_id: True,
     )
     assert len(out["data"]) == MAX_STREAM_HEAD_DEPTH
 

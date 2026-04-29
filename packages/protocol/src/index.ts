@@ -2,7 +2,7 @@
  * @entangled/protocol — Shared WS protocol types.
  *
  * This package defines the wire format between Server ↔ Client.
- * The sync model is Git-like: subscribe = clone/pull, delta = pack,
+ * The sync model is Git-like: entangle = clone/pull, delta = pack,
  * version/head = commit pointer.
  */
 
@@ -13,7 +13,7 @@ export interface EntitySchema {
   name: string;
   /** Key params for scoping, e.g. ["project_id"] */
   keyParams: string[];
-  /** Push events this entity subscribes to */
+  /** Push events this entity entangles with */
   pushEvents: string[];
   /** Sync mode hint: "list" (mutable CRUD) or "stream" (append-only) */
   syncType: 'list' | 'stream';
@@ -46,11 +46,11 @@ export interface SyncOp {
   requestId?: string;
 }
 
-// ── Subscribe / Unsubscribe (Client → Server) ────────────────────────────
+// ── Entangle / Disentangle (Client → Server) ─────────────────────────────
 
 /** Client → Server: establish entanglement */
-export interface SubscribeFrame {
-  type: 'subscribe';
+export interface EntangleFrame {
+  type: 'entangle';
   entity: string;
   params?: Record<string, string>;
   /** Client's last known version (null = first subscribe, like git clone) */
@@ -62,8 +62,8 @@ export interface SubscribeFrame {
 }
 
 /** Client → Server: break entanglement */
-export interface UnsubscribeFrame {
-  type: 'unsubscribe';
+export interface DisentangleFrame {
+  type: 'disentangle';
   entity: string;
   params?: Record<string, string>;
 }
@@ -133,13 +133,6 @@ export interface EntangledMethodArgs {
 }
 
 // ── WS Frame Types ────────────────────────────────────────────────────────
-
-export interface RequestFrame {
-  type: 'request';
-  request_id: string;
-  action: 'entity';
-  data: EntityRequest;
-}
 
 export interface ResponseFrame {
   type: 'response';

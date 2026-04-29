@@ -74,7 +74,7 @@ class SqlEntityStore(BaseStore):
     # ── Registration & Schema ─────────────────────────────────────────────
 
     def register(self, entity_def: SqlEntityDef) -> None:
-        """Register entity definition and bind SQL fallback operations.
+        """Register entity definition and bind canonical SQL operations.
 
         All fn pointers are registered so that both:
           - SqlEntityStore's overridden methods (list, list_stream, etc.) work

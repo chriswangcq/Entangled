@@ -64,8 +64,6 @@ pub struct SyncFrame {
     pub version: u64,
 
     /// Primary key field name (e.g. "id", "model_id"). Sent by server.
-    /// If absent, client uses `default_id_field_for_entity` (build-time generated from
-    /// `generated_entity_id_fields.json`; sync via `scripts/sync_entity_id_fields.sh`).
     pub id_field: Option<String>,
 
     // snapshot / head_n
@@ -77,9 +75,6 @@ pub struct SyncFrame {
     pub base_version: Option<u64>,
     pub ops: Option<Vec<SyncOp>>,
 }
-
-/// Re-export for callers that use `push::default_id_field_for_entity`.
-pub use crate::id_field::default_id_field_for_entity;
 
 /// Minimum advertised `syncContractVersion` where snapshot/head_n frames MUST carry `idField`.
 pub const SYNC_CONTRACT_V2_MIN: u32 = 2;
@@ -96,24 +91,18 @@ pub fn process_sync_with_contract(
     frame: &SyncFrame,
     sync_contract_version: u32,
 ) -> Option<EntityChanged> {
-    if sync_contract_version >= SYNC_CONTRACT_V2_MIN
-        && frame.id_field.is_none()
-        && matches!(frame.mode.as_str(), "snapshot" | "head_n")
-    {
+    if frame.id_field.is_none() && matches!(frame.mode.as_str(), "snapshot" | "head_n") {
         tracing::error!(
             target: "entangled_sync_contract",
             entity = %frame.entity,
             mode = %frame.mode,
             contract_version = sync_contract_version,
             metric = "sync_frame_missing_id_field_v2",
-            "Sync Contract v2: snapshot/head_n missing idField (using default_id_field fallback)"
+            "sync frame missing idField; refusing snapshot/head_n frame"
         );
+        return None;
     }
 
-    let id_field = frame
-        .id_field
-        .as_deref()
-        .unwrap_or_else(|| default_id_field_for_entity(&frame.entity));
     let key = match &frame.params {
         Some(p) => CacheKey::new(&frame.entity, p),
         None => CacheKey::new_empty(&frame.entity),
@@ -122,6 +111,7 @@ pub fn process_sync_with_contract(
     match frame.mode.as_str() {
         "snapshot" => {
             let data = frame.data.as_ref()?;
+            let id_field = frame.id_field.as_deref()?;
             cache.apply_snapshot(&key, data, frame.version, id_field, false);
             cache.set_subscribed(&key, true);
 
@@ -140,6 +130,7 @@ pub fn process_sync_with_contract(
 
         "head_n" => {
             let data = frame.data.as_ref()?;
+            let id_field = frame.id_field.as_deref()?;
             cache.apply_snapshot(&key, data, frame.version, id_field, frame.has_more);
 
             tracing::info!(

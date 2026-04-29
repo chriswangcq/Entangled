@@ -56,6 +56,7 @@ def test_resolve_sync_snapshot_stream_head_n():
         fetch,
         sync_type="stream",
         default_stream_depth=2,
+        exists_before_fn=lambda _oldest_id: False,
         data_order="desc",
         id_field="id",
     )

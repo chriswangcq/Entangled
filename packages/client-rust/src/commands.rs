@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::cache::{Cache, CacheKey};
-use crate::push::{default_id_field_for_entity, process_sync_with_contract, SyncFrame};
+use crate::push::{process_sync_with_contract, SyncFrame};
 use crate::schema::SchemaRegistry;
 
 // ── Subscription Registry (ref-counted, Rust-owned) ─────────────────────
@@ -128,7 +128,7 @@ unsafe impl Send for EntangledState {}
 unsafe impl Sync for EntangledState {}
 
 impl EntangledState {
-    /// Create with in-memory cache (fallback).
+    /// Create with in-memory cache for tests and embedded callers.
     pub fn new() -> Self {
         Self {
             registry: Arc::new(std::sync::RwLock::new(SchemaRegistry::new())),
@@ -301,7 +301,7 @@ pub async fn entity_prepend_page(
     let id_field = id_field
         .as_deref()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| default_id_field_for_entity(&entity));
+        .ok_or_else(|| "entity_prepend_page requires id_field".to_string())?;
     let count = cache.prepend_older(&key, &items, has_more, id_field);
 
     tracing::info!(
@@ -311,4 +311,3 @@ pub async fn entity_prepend_page(
 
     Ok(count)
 }
-
