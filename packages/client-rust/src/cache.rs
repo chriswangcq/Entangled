@@ -571,8 +571,8 @@ impl Cache {
     /// Apply delta ops (git pull fast-forward).
     /// Returns false if base_version doesn't match (need re-sync).
     ///
-    /// Also cleans up matching pending_ops by request_id when the server
-    /// confirms a mutation (the delta op carries the original request_id).
+    /// Apply server-confirmed stream deltas to the local read-model cache.
+    /// Legacy pending_ops is no longer active and is dropped during init.
     pub fn apply_delta(&self, key: &CacheKey, base_version: u64, ops: &[SyncOp], new_version: u64) -> bool {
         let meta = self.get_meta(key);
         if base_version != meta.version {
