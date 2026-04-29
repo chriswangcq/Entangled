@@ -52,7 +52,7 @@ PUSH_QUEUE_MAX_SIZE = 1000       # Backpressure: drop oldest when full
 HEARTBEAT_INTERVAL_S = 30        # Server → client heartbeat interval
 HEARTBEAT_TIMEOUT_S = 90         # Close connection if no message in this time
 
-# Sync Contract: advertised on WS schema push; REST mirrors via gateway.entity.sync_contract (same int).
+# Sync Contract: advertised on direct Entangled WS schema push.
 SYNC_CONTRACT_VERSION = 2
 
 

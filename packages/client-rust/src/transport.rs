@@ -30,6 +30,12 @@ mod ws {
             params: Option<Value>,
             #[serde(skip_serializing_if = "Option::is_none")]
             version: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            before_id: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            limit: Option<u32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            request_id: Option<String>,
         },
         /// Break entity entanglement.
         Disentangle {
@@ -75,6 +81,17 @@ mod ws {
             let msg_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match msg_type {
                 "sync" => InMsg::Sync(val),
+                "error" => InMsg::Ack {
+                    request_id: val
+                        .get("request_id")
+                        .or_else(|| val.get("requestId"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    success: false,
+                    data: None,
+                    error: val.get("error").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                },
                 "ack" => InMsg::Ack {
                     request_id: val.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                     success: val.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -150,7 +167,15 @@ mod ws {
                 entity: entity.to_string(),
                 params,
                 version,
+                before_id: None,
+                limit: None,
+                request_id: None,
             }).await;
+        }
+
+        /// Host-facing alias used by embedded App sync bridge.
+        pub async fn subscribe(&self, entity: &str, params: Option<Value>, version: Option<u64>) {
+            self.entangle(entity, params, version).await;
         }
 
         /// Send a disentangle frame.
@@ -159,6 +184,11 @@ mod ws {
                 entity: entity.to_string(),
                 params,
             }).await;
+        }
+
+        /// Host-facing alias used by embedded App sync bridge.
+        pub async fn unsubscribe(&self, entity: &str, params: Option<Value>) {
+            self.disentangle(entity, params).await;
         }
 
         /// Send a first-class action (mutation) and wait for ack.
@@ -193,6 +223,37 @@ mod ws {
             }
         }
 
+        /// Request an older page for stream entities.
+        pub async fn send_load_more(
+            &self,
+            entity: &str,
+            params: Option<Value>,
+            before_id: Option<String>,
+            limit: u32,
+        ) -> Result<Value, String> {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let mut rx = self.response_tx.subscribe();
+
+            self.send(&OutMsg::Entangle {
+                entity: entity.to_string(),
+                params,
+                version: None,
+                before_id,
+                limit: Some(limit),
+                request_id: Some(request_id.clone()),
+            }).await;
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Ok((rid, result))) if rid == request_id => return result,
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(_)) => return Err("Channel closed".into()),
+                    Err(_) => return Err("load_more timeout (15s)".into()),
+                }
+            }
+        }
+
         /// Take the sync frame receiver (can only be called once).
         pub async fn take_sync_receiver(&self) -> Option<mpsc::UnboundedReceiver<Value>> {
             self.sync_rx.lock().await.take()
@@ -201,6 +262,11 @@ mod ws {
         /// Listen to connection state changes.
         pub fn subscribe_connection_state(&self) -> broadcast::Receiver<bool> {
             self.connected_tx.subscribe()
+        }
+
+        /// Listen to server push events such as the initial schema frame.
+        pub fn subscribe_push(&self) -> broadcast::Receiver<(String, Option<Value>)> {
+            self.push_tx.subscribe()
         }
 
         /// Start the connection loop (blocking — run in a spawned task).
@@ -325,7 +391,25 @@ mod ws {
 
                 match InMsg::parse(&text) {
                     InMsg::Sync(val) => {
-                        let _ = sync_tx.send(val);
+                        let request_id = val
+                            .get("request_id")
+                            .or_else(|| val.get("requestId"))
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from);
+                        if let Some(request_id) = request_id {
+                            let payload = serde_json::json!({
+                                "entries": val.get("data").cloned().unwrap_or(Value::Array(vec![])),
+                                "has_more": val.get("hasMore")
+                                    .or_else(|| val.get("has_more"))
+                                    .cloned()
+                                    .unwrap_or(Value::Bool(false)),
+                                "success": true,
+                            });
+                            let _ = self.response_tx.send((request_id, Ok(payload)));
+                        } else {
+                            let _ = sync_tx.send(val);
+                        }
                     }
                     InMsg::Ack { request_id, success, data, error } => {
                         let result = if !success {
