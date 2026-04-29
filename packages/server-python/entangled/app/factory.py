@@ -112,9 +112,8 @@ def create_app(config: ServiceConfig) -> FastAPI:
     # message_state.transition; the same property now holds for subagent
     # transitions (PR-31b promoted the state machine server-side).
     # Both entity types share read endpoints so ops can reconstruct a
-    # full lifecycle in one curl. The legacy POST /v1/state_transitions/
-    # subagent endpoint stays mounted for back-compat but Business no
-    # longer calls it — new writers go through the PR-31b router below.
+    # full lifecycle in one curl. Subagent transition writes now go through
+    # the PR-31b router below.
     app.include_router(state_transitions_router)
     # PR-31b — single chokepoint for subagents.status transitions.
     # Business's transition() helper delegates to
