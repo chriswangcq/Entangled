@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::cache::{Cache, CacheKey};
 use crate::push::{process_sync_with_contract, SyncFrame};
-use crate::schema::SchemaRegistry;
+use crate::schema::{EntitySchema, SchemaRegistry};
 
 // ── Subscription Registry (ref-counted, Rust-owned) ─────────────────────
 
@@ -118,8 +118,9 @@ pub struct EntangledState {
     pub registry: Arc<std::sync::RwLock<SchemaRegistry>>,
     pub cache: Arc<Cache>,
     pub subscriptions: Arc<std::sync::RwLock<SubscriptionRegistry>>,
-    /// Highest server-advertised Sync Contract version (schema REST push / WS `schema` push / Tauri command).
+    /// Highest server-advertised Sync Contract version from direct Entangled WS `schema` push.
     pub sync_contract_version: Arc<AtomicU32>,
+    pub schema_notify: Arc<tokio::sync::Notify>,
 }
 
 // Safety: Cache is strictly Send+Sync thanks to r2d2::Pool.
@@ -135,6 +136,7 @@ impl EntangledState {
             cache: Arc::new(Cache::new_in_memory()),
             subscriptions: Arc::new(std::sync::RwLock::new(SubscriptionRegistry::new())),
             sync_contract_version: Arc::new(AtomicU32::new(0)),
+            schema_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -146,6 +148,7 @@ impl EntangledState {
             cache: Arc::new(Cache::new(&db_path)),
             subscriptions: Arc::new(std::sync::RwLock::new(SubscriptionRegistry::new())),
             sync_contract_version: Arc::new(AtomicU32::new(0)),
+            schema_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -159,6 +162,7 @@ impl EntangledState {
             cache: Arc::new(Cache::new(&db_path)),
             subscriptions: Arc::new(std::sync::RwLock::new(SubscriptionRegistry::new())),
             sync_contract_version: Arc::new(AtomicU32::new(0)),
+            schema_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -187,6 +191,58 @@ impl EntangledState {
 
     pub fn get_sync_contract_version(&self) -> u32 {
         self.sync_contract_version.load(Ordering::Acquire)
+    }
+
+    pub fn register_schema(&self, entities: Vec<EntitySchema>, sync_contract_version: u32) {
+        let count = entities.len();
+        {
+            let mut registry = self.registry.write().unwrap();
+            registry.register_all(entities);
+        }
+        self.set_sync_contract_version(sync_contract_version);
+        self.schema_notify.notify_waiters();
+        tracing::info!(
+            target: "entangled_schema",
+            count,
+            sync_contract_version,
+            "registered schema from direct Entangled WS"
+        );
+    }
+
+    pub fn schema_snapshot(&self) -> (Vec<EntitySchema>, u32) {
+        let rows = self.registry.read().unwrap().all();
+        (rows, self.get_sync_contract_version())
+    }
+
+    pub async fn wait_schema_snapshot(
+        &self,
+        timeout_ms: u64,
+    ) -> Result<(Vec<EntitySchema>, u32), String> {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(timeout_ms.max(1));
+        loop {
+            let (rows, version) = self.schema_snapshot();
+            if !rows.is_empty() {
+                return Ok((rows, version));
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "Entangled schema not registered after {}ms",
+                    timeout_ms
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            if tokio::time::timeout(remaining, self.schema_notify.notified())
+                .await
+                .is_err()
+            {
+                return Err(format!(
+                    "Entangled schema not registered after {}ms",
+                    timeout_ms
+                ));
+            }
+        }
     }
 }
 
