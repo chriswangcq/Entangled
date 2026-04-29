@@ -32,7 +32,7 @@ def _pk_value_from_row(row: Optional[dict], id_field: str) -> Optional[str]:
     return str(v)
 
 
-# Fallback when client and EntityDef both omit a stream window (keep in sync with typical sync_limit).
+# Default stream window when neither client depth nor EntityDef sync_limit is set.
 DEFAULT_STREAM_HEAD_DEPTH: int = 50
 # Hard cap to avoid accidental huge LIMIT from bad client input.
 MAX_STREAM_HEAD_DEPTH: int = 10_000
@@ -111,10 +111,6 @@ class SyncState:
 
     def disentangle(self, client_id: str) -> None:
         self.subscribers.pop(client_id, None)
-
-    # Backward-compat aliases
-    subscribe = entangle
-    unsubscribe = disentangle
 
 
 class SyncStateSnapshot:
@@ -226,11 +222,6 @@ class SyncRegistry:
             if key in self._states:
                 self._states[key].disentangle(client_id)
 
-    # Backward-compat aliases
-    subscribe = entangle
-    unsubscribe = disentangle
-    unsubscribe_all = disentangle_all
-
     def record_op(
         self,
         entity: str,
@@ -264,9 +255,6 @@ class SyncRegistry:
         params = _normalize_params(params)
         state = self.get_state(entity, params)
         return list(state.subscribers.keys())
-
-    # Backward-compat alias
-    get_subscribed_clients = get_entangled_clients
 
     def reset(self) -> None:
         """Clear all state (for testing)."""
@@ -311,40 +299,30 @@ def _stream_head_n_sync(
     """
     Bounded sync for stream entities.
 
-    If ``exists_before_fn`` is provided, fetches exactly ``d`` rows and uses
+    Requires ``exists_before_fn``. It fetches exactly ``d`` rows and uses
     cursor-based ``SELECT EXISTS(...)`` to determine ``hasMore`` precisely.
-    Otherwise falls back to N+1 detection (fetch d+1, compare count).
 
     Data is always normalized to ASC (oldest first) before sending to clients.
     The ``data_order`` parameter declares the order returned by ``fetch_data_fn``.
     """
     d = _effective_stream_depth(depth, default_stream_depth)
 
-    if exists_before_fn:
-        # Cursor-based: fetch exactly d items, then EXISTS check on oldest
-        data = fetch_data_fn(limit=d)
-        # Normalize to ASC (oldest first) for client consumption
-        if data_order == "desc":
-            data = data[::-1]
-        # Now data is ASC: data[0] = oldest, data[-1] = newest
-        if len(data) < d:
-            has_more = False
-        else:
-            oldest = data[0] if data else None
-            oldest_id = _pk_value_from_row(oldest, id_field)
-            has_more = exists_before_fn(oldest_id) if oldest_id else False
-        items = data
+    if not exists_before_fn:
+        raise RuntimeError("stream sync requires exists_before_fn")
+
+    # Cursor-based: fetch exactly d items, then EXISTS check on oldest
+    data = fetch_data_fn(limit=d)
+    # Normalize to ASC (oldest first) for client consumption
+    if data_order == "desc":
+        data = data[::-1]
+    # Now data is ASC: data[0] = oldest, data[-1] = newest
+    if len(data) < d:
+        has_more = False
     else:
-        # Fallback: N+1 (for generic Entangled hosts without exists_before_fn)
-        data = fetch_data_fn(limit=d + 1)
-        has_more = len(data) > d
-        if data_order == "desc":
-            # Keep the newest `d` items (data[:d] since DESC), then reverse to ASC
-            items = data[:d] if has_more else data
-            items = items[::-1]
-        else:
-            # ASC: keep the oldest `d` items (drop the extra newest one)
-            items = data[:d] if has_more else data
+        oldest = data[0] if data else None
+        oldest_id = _pk_value_from_row(oldest, id_field)
+        has_more = exists_before_fn(oldest_id) if oldest_id else False
+    items = data
 
     logger.debug(
         "[Entangled] head_n (%s): depth=%d rows=%d hasMore=%s order=%s",
@@ -386,10 +364,8 @@ def resolve_sync(
         sync_type: ``"list"`` or ``"stream"``.
         default_stream_depth: Entity schema default (``EntityDef.sync_limit``) when
             ``depth`` is omitted or invalid; None uses ``DEFAULT_STREAM_HEAD_DEPTH``.
-        exists_before_fn: Optional host callback ``(oldest_id: str) -> bool`` for
-            cursor-based ``hasMore`` detection. When provided, stream sync fetches
-            exactly ``depth`` rows and uses ``SELECT EXISTS(...)`` to check for older
-            rows — precise and efficient. Without it, falls back to N+1 detection.
+        exists_before_fn: Required for stream sync. Callback
+            ``(oldest_id: str) -> bool`` for cursor-based ``hasMore`` detection.
         data_order: The ordering of data returned by ``fetch_data_fn``.
             ``"desc"`` = newest first (default), ``"asc"`` = oldest first.
             The sync engine normalizes all output to ASC before sending to clients.

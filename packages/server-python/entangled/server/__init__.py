@@ -36,10 +36,8 @@ from .sync import (
 from .ws_handler import (
     create_ws_handler,
     WsSender,
-    handle_subscribe,
-    handle_unsubscribe,
-    handle_load_more,
-    handle_request,
+    handle_entangle,
+    handle_disentangle,
 )
 from .notifier import (
     notify_entity_change,
@@ -71,10 +69,8 @@ __all__ = [
     # WS handler
     "create_ws_handler",
     "WsSender",
-    "handle_subscribe",
-    "handle_unsubscribe",
-    "handle_load_more",
-    "handle_request",
+    "handle_entangle",
+    "handle_disentangle",
     # Notifier / push port (C.1)
     "notify_entity_change",
     "reset_state",
@@ -84,4 +80,3 @@ __all__ = [
     "get_sync_push_port",
     "set_sync_push_port",
 ]
-

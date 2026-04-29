@@ -41,7 +41,7 @@ def test_notifier_delta_includes_id_field(monkeypatch):
         pushed.append(payload)
 
     notifier.register_client("c1", "u1", push_fn)
-    registry.subscribe("c1", "widgets", None)
+    registry.entangle("c1", "widgets", None)
 
     notifier.notify_entity_change("u1", "widgets", "created", entity_id="w1", data={"widget_id": "w1"})
 

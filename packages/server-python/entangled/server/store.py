@@ -234,14 +234,8 @@ class EntityStore(EntityStoreProtocol):
         self._check_access(defn, user_id, "list", params=params)
         if not defn.list_fn:
             raise NotImplementedError(f"{entity} does not support list")
-        # Try to pass limit if the list_fn supports it
         if limit is not None:
-            try:
-                return defn.list_fn(self, user_id, params or {}, limit=limit)
-            except TypeError:
-                # list_fn doesn't accept limit — fallback to full list + slice
-                data = defn.list_fn(self, user_id, params or {})
-                return data[:limit] if len(data) > limit else data
+            return defn.list_fn(self, user_id, params or {}, limit=limit)
         return defn.list_fn(self, user_id, params or {})
 
     def list_stream(
@@ -256,20 +250,18 @@ class EntityStore(EntityStoreProtocol):
     ) -> List[Dict[str, Any]]:
         """Cursor-based backward pagination for stream entities.
 
-        If the EntityDef provides a list_stream_fn, delegates to it.
-        Otherwise falls back to list() with limit (no cursor support).
+        Requires the EntityDef to provide a list_stream_fn.
         """
         defn = self.get_def(entity)
         self._check_access(defn, user_id, "list_stream", params=params)
-        if defn.list_stream_fn:
-            return defn.list_stream_fn(
-                self, user_id, params or {},
-                before_id=before_id,
-                after_id=after_id,
-                limit=limit,
-            )
-        # Fallback: no cursor, just list with limit
-        return self.list(entity, user_id, params=params, limit=limit)
+        if not defn.list_stream_fn:
+            raise NotImplementedError(f"{entity} does not support list_stream")
+        return defn.list_stream_fn(
+            self, user_id, params or {},
+            before_id=before_id,
+            after_id=after_id,
+            limit=limit,
+        )
 
     def exists_before(
         self,
@@ -281,13 +273,12 @@ class EntityStore(EntityStoreProtocol):
     ) -> bool:
         """Check if older items exist before the given cursor ID (for hasMore).
 
-        If the EntityDef provides exists_before_fn, delegates to it.
-        Otherwise returns False (unknown — caller falls back to len-based heuristic).
+        Requires the EntityDef to provide exists_before_fn.
         """
         defn = self.get_def(entity)
-        if defn.exists_before_fn:
-            return defn.exists_before_fn(self, user_id, oldest_id, params or {})
-        return False
+        if not defn.exists_before_fn:
+            raise NotImplementedError(f"{entity} does not support exists_before")
+        return defn.exists_before_fn(self, user_id, oldest_id, params or {})
 
 
     def get(
