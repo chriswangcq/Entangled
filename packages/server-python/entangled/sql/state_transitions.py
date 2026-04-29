@@ -164,19 +164,15 @@ def append_subagent_transition(
 
     Transaction-agnostic (matches ``append_message_transition`` above):
     caller is responsible for wrapping the call in a transaction when
-    co-transactional semantics are needed. PR-31b's
-    ``subagent_state.transition`` calls this from inside its own
-    ``transaction("global")``; the legacy HTTP shim in
-    ``entangled/app/state_transitions.py:record_subagent_transition``
-    wraps it in a local transaction since its caller (pre-PR-31b
-    Business code) expects the endpoint to be atomic on its own.
+    co-transactional semantics are needed. ``subagent_state.transition``
+    calls this from inside its own ``transaction("global")``.
 
     Previously this helper opened its own ``transaction("global")`` —
-    that worked fine for the HTTP-shim caller, but deadlocked the
-    PR-31b in-process caller (``subagent_state.transition`` already
-    held the same global write lock). Making the helper
-    transaction-agnostic is the same pattern the message_state
-    pair uses and avoids nested-write-lock hangs.
+    that worked fine for external callers, but deadlocked the in-process
+    caller (``subagent_state.transition`` already held the same global
+    write lock). Making the helper transaction-agnostic is the same
+    pattern the message_state pair uses and avoids nested-write-lock
+    hangs.
     """
     db.execute(
         """

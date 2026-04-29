@@ -2,24 +2,16 @@
 
 Why this module exists
 ----------------------
-PR-28 put the subagent status state machine behind a single
-``transition()`` function in ``novaic-business/business/internal/
-subagent_state.py``. That helper does validation + idempotent self-loop
-+ ``store.update("subagents", ...)`` (HTTP PATCH to Entangled) + a
-separate HTTP POST to ``/v1/state_transitions/subagent`` to persist the
-history row.
+PR-28 originally put the subagent status state machine behind a Business
+helper. That split validation, status writes, and transition history
+across multiple process calls.
 
 Three consequences:
 
-* **Three HTTP round-trips per transition** (GET for current status,
-  PATCH for the write, POST for the log).
-* **Not co-transactional.** A crash between the PATCH and the POST
-  silently drops a history row — acceptable for PR-31's observability
-  charter but not ideal now that the log is being promoted to
-  authoritative ops data (see PR-31c).
-* **State rules live in two repos.** Any change to ``ALLOWED`` in
-  Business should be mirrored in whatever calls the HTTP endpoint —
-  a shape that historically drifted (see PR-28 ticket discussion).
+* **Multiple HTTP round-trips per transition.**
+* **Not co-transactional.** A crash between the status update and
+  history write could silently drop a history row.
+* **State rules lived in two repos.** That shape historically drifted.
 
 This module is the server-side twin of message_state: a single
 ``transition()`` that runs under ``db.transaction("global")`` and does

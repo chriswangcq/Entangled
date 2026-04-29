@@ -2,12 +2,10 @@
 
 The message_state_transitions table is populated co-transactionally by
 ``entangled.sql.message_state.transition`` (the function is in-process
-and owns the DB). The subagent_state_transitions table cannot be
-populated that way — subagent transitions happen in the Business
-process, which talks to Entangled only over HTTP. This router gives
-Business a narrow endpoint to POST a transition row, plus generic GET
-history endpoints so ops can reconstruct the full lifecycle of either
-entity type in one call.
+and owns the DB). Subagent transition rows are written by
+``entangled.sql.subagent_state.transition`` in the same transaction as
+the status update. This router exposes GET history endpoints so ops can
+reconstruct the full lifecycle of either entity type in one call.
 
 Error mapping mirrors the rest of Entangled's app routers: missing
 entity → 404 (nothing to show), malformed body → 400 (pydantic), all
@@ -25,10 +23,9 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from ..sql.state_transitions import (
-    append_subagent_transition,
     list_message_transitions,
     list_subagent_transitions,
 )
@@ -36,25 +33,6 @@ from .auth import verify_service_or_user
 from .state import get_db
 
 router = APIRouter(prefix="/v1/state_transitions", tags=["StateTransitions"])
-
-
-class SubagentTransitionRecord(BaseModel):
-    """Payload accepted by ``POST /v1/state_transitions/subagent``.
-
-    Mirrors the argument shape of
-    ``entangled.sql.state_transitions.append_subagent_transition``.
-    Business calls this after a successful ``store.update("subagents",
-    ..., {"status": ...})`` — see ``business/internal/subagent_state.py``.
-    """
-
-    subagent_id: str = Field(..., description="subagents.subagent_id")
-    agent_id: Optional[str] = Field(None, description="Owning agent; logged for filtering.")
-    from_state: str
-    to_state: str
-    reason: str = ""
-    actor: str = ""
-    scope_id: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
 
 
 class TransitionRow(BaseModel):
@@ -83,39 +61,6 @@ class TransitionHistoryResponse(BaseModel):
 
     count: int
     rows: List[TransitionRow]
-
-
-@router.post("/subagent", status_code=201)
-def record_subagent_transition(
-    req: SubagentTransitionRecord,
-    db=Depends(get_db),
-    _: dict = Depends(verify_service_or_user),
-) -> Dict[str, str]:
-    """Append one row to ``subagent_state_transitions``.
-
-    Not idempotent per row (we explicitly want a record of every retry),
-    but the caller on the Business side only posts after a non-noop
-    ``store.update`` so the volume matches real state changes.
-
-    Legacy HTTP shim (PR-31, pre-PR-31b). We wrap the append in a
-    ``transaction("global")`` here so this endpoint stays atomic on
-    its own — the ``append_subagent_transition`` helper is
-    transaction-agnostic (matches ``append_message_transition``) and
-    the PR-31b in-process caller opens its own outer transaction.
-    """
-    with db.transaction("global"):
-        append_subagent_transition(
-            db,
-            subagent_id=req.subagent_id,
-            agent_id=req.agent_id,
-            from_state=req.from_state,
-            to_state=req.to_state,
-            reason=req.reason,
-            actor=req.actor,
-            scope_id=req.scope_id,
-            metadata=req.metadata,
-        )
-    return {"status": "ok"}
 
 
 @router.get("/subagent/{subagent_id}", response_model=TransitionHistoryResponse)
