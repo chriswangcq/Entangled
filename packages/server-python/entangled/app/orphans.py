@@ -78,7 +78,6 @@ DEFAULT_CRIT_AGE_SEC = 300
 ORPHAN_ELIGIBLE_TYPES: tuple[str, ...] = (
     "USER_MESSAGE",
     "SUBAGENT_SEND",
-    "SPAWN_SUBAGENT",
 )
 
 
