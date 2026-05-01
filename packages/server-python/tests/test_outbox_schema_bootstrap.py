@@ -63,7 +63,6 @@ MESSAGES_DEF = SqlEntityDef(
     outbox_trigger_types={
         "USER_MESSAGE": "user_message",
         "SUBAGENT_SEND": "subagent_send",
-        "SPAWN_SUBAGENT": "spawn_subagent",
     },
 )
 

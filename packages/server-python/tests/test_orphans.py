@@ -346,11 +346,11 @@ def test_mixed_types_only_eligible_returned(db):
     fdb, conn = db
     _insert_msg(conn, "user_stuck", age_sec=600, type="USER_MESSAGE")
     _insert_msg(conn, "reply_stuck", age_sec=600, type="AGENT_REPLY")
-    _insert_msg(conn, "spawn_stuck", age_sec=600, type="SPAWN_SUBAGENT")
+    _insert_msg(conn, "internal_stuck", age_sec=600, type="INTERNAL_ONLY")
     _insert_msg(conn, "send_stuck", age_sec=600, type="SUBAGENT_SEND")
     resp = query_orphans(fdb, min_age_sec=30)
     assert {o.message_id for o in resp.orphans} == {
-        "user_stuck", "spawn_stuck", "send_stuck",
+        "user_stuck", "send_stuck",
     }
 
 
