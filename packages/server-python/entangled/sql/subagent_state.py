@@ -13,10 +13,10 @@ Three consequences:
   history write could silently drop a history row.
 * **State rules lived in two repos.** That shape historically drifted.
 
-This module is the server-side twin of message_state: a single
-``transition()`` that runs under ``db.transaction("global")`` and does
-the SELECT, UPDATE, and log append atomically. Business's helper
-becomes a thin client that delegates here, which gives us:
+This module provides a single ``transition()`` that runs under
+``db.transaction("global")`` and does the SELECT, UPDATE, and log append
+atomically. Business's helper becomes a thin client that delegates here,
+which gives us:
 
 * **1 HTTP round-trip per transition.**
 * **Atomicity.** Either the ``subagents.status`` UPDATE and the

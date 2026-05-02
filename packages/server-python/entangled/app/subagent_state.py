@@ -1,7 +1,6 @@
-"""PR-31b (2026-04-15) — HTTP surface for subagent status transitions.
+"""HTTP surface for subagent status transitions.
 
-Mirrors ``entangled/app/message_state.py``. Business's
-``novaic-business/business/internal/subagent_state.py`` now delegates
+Business's ``novaic-business/business/internal/subagent_state.py`` delegates
 every non-noop transition here; see the module docstring of
 ``entangled/sql/subagent_state.py`` for the rationale.
 

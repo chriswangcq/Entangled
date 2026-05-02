@@ -13,12 +13,10 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..server.store import EntityStore as BaseStore
-from ..metrics import metric_inc
 from .entity_def import SqlEntityDef
 
 logger = logging.getLogger(__name__)
@@ -60,7 +58,6 @@ class SqlEntityStore(BaseStore):
     def __init__(self, db=None):
         super().__init__([])
         self._db = db
-        self._outbox_schema_ensured = False
 
     @property
     def db(self):
@@ -130,55 +127,16 @@ class SqlEntityStore(BaseStore):
                 self.db.execute(alter_sql)
             for idx_sql in entity_def.index_sqls():
                 self.db.execute(idx_sql)
-        # Auto-create outbox infrastructure if this entity uses it
-        if getattr(entity_def, 'outbox_trigger_types', None):
-            self._ensure_outbox_schema()
 
     def ensure_all_schemas(self) -> None:
         """Run ensure_schema for all registered entities that have fields."""
         for defn in self._defs.values():
             if defn.fields:
                 self.ensure_schema(defn)
-        # Ensure outbox table exists if any entity uses outbox triggers
-        if any(getattr(d, 'outbox_trigger_types', None) for d in self._defs.values()):
-            self._ensure_outbox_schema()
         # NOTE: PR-31 state-transition log tables are created eagerly in
         # app.factory.lifespan (not here) — ensure_all_schemas has no live
         # caller at runtime, and Entangled schema registration is driven
         # dynamically via POST /v1/schema/register by upstream services.
-
-    def _ensure_outbox_schema(self) -> None:
-        """Idempotent creation of the message_outbox infrastructure table.
-
-        This table is NOT a registered entity — it is an internal
-        changefeed mechanism used by the dispatch subscriber (PR-15/16).
-        """
-        if self._outbox_schema_ensured:
-            return
-        with self.db.transaction("global"):
-            self.db.execute("""
-                CREATE TABLE IF NOT EXISTS message_outbox (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    message_id TEXT NOT NULL UNIQUE,
-                    agent_id TEXT NOT NULL,
-                    trigger_type TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    delivered_at INTEGER,
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT,
-                    locked_by TEXT,
-                    locked_until INTEGER,
-                    permanent_failure INTEGER NOT NULL DEFAULT 0
-                )
-            """)
-            self.db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_outbox_undelivered
-                ON message_outbox (delivered_at, locked_until, id)
-                WHERE delivered_at IS NULL
-            """)
-        self._outbox_schema_ensured = True
-        logger.info("[SqlEntityStore] message_outbox schema ensured")
 
     def get_def(self, entity: str) -> SqlEntityDef:
         defn = self._defs.get(entity)
@@ -395,7 +353,6 @@ class SqlEntityStore(BaseStore):
             )
 
         self._apply_defaults(defn, row)
-        self._stamp_consumed_if_non_trigger(defn, data, row)
         self._check_required(defn, row)
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
@@ -603,7 +560,6 @@ class SqlEntityStore(BaseStore):
             )
         lock_id = res_id or (params.get(defn.key_params[0], "") if params and defn.key_params else "") or "auto"
         self._apply_defaults(defn, row)
-        self._stamp_consumed_if_non_trigger(defn, data, row)
         self._check_required(defn, row)
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
@@ -613,56 +569,6 @@ class SqlEntityStore(BaseStore):
             if is_auto_int and cur.lastrowid:
                 row[defn.id_field] = cur.lastrowid
                 res_id = str(cur.lastrowid)
-            # Co-transaction outbox insert
-            if defn.outbox_trigger_types:
-                msg_type = row.get("type", "")
-                trigger_value = defn.outbox_trigger_types.get(msg_type)
-                if trigger_value:
-                    entity_id_val = str(row.get(defn.id_field, res_id))
-                    agent_id_val = row.get("agent_id", "")
-                    # metadata may be a JSON string from _in(); decode for payload
-                    raw_meta = row.get("metadata")
-                    if isinstance(raw_meta, str):
-                        try:
-                            meta_dict = json.loads(raw_meta)
-                        except (json.JSONDecodeError, TypeError):
-                            meta_dict = {}
-                    else:
-                        meta_dict = raw_meta or {}
-                    payload = {
-                        "message_ids": [entity_id_val],
-                        "metadata": meta_dict,
-                    }
-                    # Extract subagent_id from metadata if present
-                    sub_id = meta_dict.get("target_subagent_id") or meta_dict.get("subagent_id")
-                    if sub_id:
-                        payload["subagent_id"] = sub_id
-                    self.db.execute("""
-                        INSERT INTO message_outbox
-                            (message_id, agent_id, trigger_type, payload_json, created_at)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(message_id) DO NOTHING
-                    """, (
-                        entity_id_val,
-                        agent_id_val,
-                        trigger_value,
-                        json.dumps(payload, ensure_ascii=False),
-                        int(time.time() * 1000),
-                    ))
-                    # PR-32 — ``outbox_enqueued_total{trigger_type}``. One
-                    # counter bump per attempted enqueue. ON CONFLICT DO
-                    # NOTHING means a retried append with the same
-                    # message_id still increments — that over-counts
-                    # identity-level enqueues, but matches the "how many
-                    # times did the outbox write path fire" intent and
-                    # is cheaper than a post-INSERT SELECT CHANGES().
-                    # Ops who want "unique enqueued rows" can diff this
-                    # counter against message_outbox row count directly.
-                    metric_inc("outbox_enqueued_total", trigger_type=str(trigger_value))
-                    logger.info(
-                        "event=outbox_enqueue message_id=%s agent=%s trigger=%s",
-                        entity_id_val, agent_id_val, trigger_value,
-                    )
         entity_id = str(row.get(defn.id_field, res_id))
         result = self.get(entity, user_id, entity_id, params=params) or row
         if notify:
@@ -863,68 +769,6 @@ class SqlEntityStore(BaseStore):
                 continue
             row[f.name] = _iso_now_utc() if f.default == "NOW" else f.default
         return row
-
-    def _stamp_consumed_if_non_trigger(
-        self,
-        defn: SqlEntityDef,
-        data: Dict[str, Any],
-        row: Dict[str, Any],
-    ) -> None:
-        """PR-41 (2026-04-21 / amend 2026-04-22) — non-trigger types born
-        ``lifecycle='consumed'``.
-
-        The outbox co-insert in :meth:`append` only fires for
-        ``row["type"] in defn.outbox_trigger_types``. For any other type
-        (e.g. ``AGENT_REPLY`` in ``chat_messages``) there is no subscriber
-        that will ever move the row off the SQL default ``lifecycle='pending'``.
-        PR-26's orphan scanner picks them up at the crit threshold (300 s)
-        and PR-27 re-dispatches them with ``TriggerType.RECOVERED`` —
-        causing the self-wake loop that motivated this ticket.
-
-        **Initial PR-41 (2026-04-21)** only patched :meth:`append`. Prod
-        kept self-waking because the runtime's ``chat_reply`` tool uses
-        ``gw.entity_create("messages", {...})`` — which lands in
-        :meth:`_sql_create`, not :meth:`append` — and skipped the gate
-        entirely. The original AGENT_REPLY ``d8f43c8934b1`` captured on
-        prod at ``2026-04-22 03:04:02`` was born ``lifecycle='pending'``
-        even with the shipped fix, proving the asymmetry. The amend
-        extracts the gate into this helper and calls it from both write
-        paths so future callers can't repeat the bug.
-
-        Gating:
-
-            * ``defn`` must declare ``outbox_trigger_types`` (message-bus entity)
-            * ``lifecycle`` must be a declared column on this entity
-            * caller did NOT set ``lifecycle`` in ``data`` (explicit intent wins)
-            * ``row["type"]`` is truthy AND is not in ``outbox_trigger_types``
-              (there is no consumer that will transition it)
-
-        This is NOT a state-machine transition — there is no prior state,
-        the row is born in its terminal state. ``ALLOWED_TRANSITIONS`` is
-        not violated and PR-31's transitions log correctly stays empty
-        for these rows. The CHECK constraint accepts ``'consumed'`` as a
-        valid initial value.
-
-        Belt-and-suspenders: ``entangled/app/orphans.py`` also filters by
-        type at read time. Either alone would prevent the self-loop; both
-        together ensure that future non-trigger types added without
-        touching this code path still can't orphan-loop.
-        """
-        lifecycle_col = defn.field_map.get("lifecycle") if defn.fields else None
-        if not (
-            defn.outbox_trigger_types
-            and lifecycle_col is not None
-            and "lifecycle" not in data
-        ):
-            return
-        msg_type = row.get("type", "")
-        if not msg_type:
-            return
-        if msg_type in defn.outbox_trigger_types:
-            return
-        row["lifecycle"] = "consumed"
-        if "lifecycle_updated_at" in defn.field_map:
-            row["lifecycle_updated_at"] = int(time.time() * 1000)
 
     def _check_required(self, defn: SqlEntityDef, row: Dict[str, Any]) -> None:
         """Raise ``ValueError`` listing every NOT-NULL, no-default, non-primary

@@ -45,11 +45,6 @@ class SqlEntityDef(BaseEntityDef):
     # (parent_entity_name, local_fk_column, parent_pk_column)
     parent: Optional[Tuple[str, str, str]] = None
     default_not_in_filters: Dict[str, List[Any]] = field(default_factory=dict)
-    # Outbox: optional mapping of message type → TriggerType.value.
-    # When set, append() will co-transactionally insert a message_outbox row
-    # for rows whose "type" field is a key in this dict.
-    outbox_trigger_types: Optional[Dict[str, str]] = None
-
     # ── DDL ────────────────────────────────────────────────────────────────
 
     def create_table_sql(self) -> str:
@@ -133,8 +128,6 @@ class SqlEntityDef(BaseEntityDef):
             "data_order": self.data_order,
             "default_not_in_filters": dict(self.default_not_in_filters),
         }
-        if self.outbox_trigger_types:
-            spec["outbox_trigger_types"] = dict(self.outbox_trigger_types)
         if self.parent:
             spec["parent"] = list(self.parent)
         if self.action_hooks:
@@ -163,5 +156,4 @@ class SqlEntityDef(BaseEntityDef):
             default_not_in_filters=spec.get("default_not_in_filters", {}),
             parent=tuple(spec["parent"]) if spec.get("parent") else None,
             action_hooks=spec.get("action_hooks", {}),
-            outbox_trigger_types=spec.get("outbox_trigger_types"),
         )
