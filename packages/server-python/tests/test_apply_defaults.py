@@ -28,7 +28,7 @@ from entangled.sql.entity_def import SqlEntityDef
 from entangled.sql.field_def import F
 
 
-# ── Test rig (mirrors tests/test_outbox_insert.py) ───────────────────────────
+# ── Test rig ─────────────────────────────────────────────────────────────────
 
 class _FakeDatabase:
     def __init__(self, conn):

@@ -29,7 +29,7 @@ from entangled.sql.entity_def import SqlEntityDef
 from entangled.sql.field_def import F
 
 
-# ── Fake DB plumbing (shape copied from test_outbox_insert.py) ─────────────
+# ── Fake DB plumbing ───────────────────────────────────────────────────────
 
 
 class _FakeDatabase:

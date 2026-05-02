@@ -81,10 +81,6 @@ def create_app(config: ServiceConfig) -> FastAPI:
     from .health import router as health_router
     from .schema import router as schema_router
     from .crud import router as crud_router
-    from .outbox import router as outbox_router
-    from .message_state import router as message_state_router
-    from .orphans import router as orphans_router
-    from .stuck_claimed import router as stuck_claimed_router
     from .state_transitions import router as state_transitions_router
     from .subagent_state import router as subagent_state_router
     from .ws import ws_sync_handler
@@ -92,34 +88,15 @@ def create_app(config: ServiceConfig) -> FastAPI:
     app.include_router(health_router)
     app.include_router(schema_router)
     app.include_router(crud_router)
-    app.include_router(outbox_router)
-    # PR-21 — single chokepoint for chat_messages.lifecycle transitions.
-    # All writes to the lifecycle column must route through this router;
-    # scripts/ci/lint_lifecycle.sh enforces that.
-    app.include_router(message_state_router)
-    # PR-26 — orphan listing endpoint. Read-only; consumed by HealthWorker
-    # (orphan scan + re-dispatch in PR-27) and by Business's ops-facing
-    # /internal/messages/orphaned proxy.
-    app.include_router(orphans_router)
-    # PR-51 Part 2 (2026-04-23) — stuck-claimed listing endpoint.
-    # Companion to /v1/orphans but for the other half of the lifecycle
-    # ladder: rows that got claimed but never moved to consumed. Consumed
-    # by HealthWorker's claimed-age scan and by Business's ops-facing
-    # /internal/messages/stuck-claimed proxy.
-    app.include_router(stuck_claimed_router)
-    # PR-31 — append-only history for message + subagent state machines.
-    # Message transitions are populated co-transactionally inside
-    # message_state.transition; the same property now holds for subagent
-    # transitions (PR-31b promoted the state machine server-side).
-    # Both entity types share read endpoints so ops can reconstruct a
-    # full lifecycle in one curl. Subagent transition writes now go through
-    # the PR-31b router below.
+    # PR-168E — chat-message lifecycle HTTP routes were retired with the
+    # Environment notification queue cutover. Active agent-loop state is stored
+    # in Environment notifications.
     app.include_router(state_transitions_router)
     # PR-31b — single chokepoint for subagents.status transitions.
     # Business's transition() helper delegates to
     # POST /v1/subagents/{agent_id}/{subagent_id}/transition, which does
-    # the status UPDATE + subagent_state_transitions INSERT in one
-    # global-lock transaction. Same shape as message_state_router.
+    # the status UPDATE + subagent_state_transitions INSERT in one global-lock
+    # transaction.
     app.include_router(subagent_state_router)
 
     # PR-32 — Prometheus exposition endpoint. Deliberately unauthenticated
