@@ -79,9 +79,6 @@ CREATE TABLE subagents (
     progress TEXT,
     error TEXT,
     result TEXT,
-    historical_summary TEXT,
-    last_scope_id TEXT,
-    last_scope_archived_at TEXT,
     updated_at TEXT
 )
 """
@@ -210,56 +207,14 @@ def test_unknown_target_status_rejected(db):
         transition(db, "s1", "a1", to="not-a-status", reason="r", actor="a")
 
 
-# ── PR-53 / PR-55: continuity columns must pass through EXTRA_ALLOWLIST ──
-#
-# Before PR-53, Business-side ``internal_update_entity`` force-routed any
-# ``subagents`` PATCH containing ``status`` through ``subagent_state.transition``,
-# which intersected ``extra`` with a 4-key allowlist and silently dropped
-# anything else. That took out ``last_scope_id`` / ``last_scope_archived_at``
-# on every terminal rest transition. PR-53 expanded the allowlist; PR-55
-# retired the ``handoff_notes`` / ``historical_summary`` half of the
-# continuity surface (no live producer), leaving ``last_scope_id`` as
-# the sole surviving piggybacked column.
+# ── Retired continuity extras ───────────────────────────────────────────────
 
-def test_transition_writes_last_scope_fields(db):
-    """PR-43 Wave A: root-scope chain pointer + its archive time."""
-    _insert_subagent(db, status="awake")
+def test_retired_continuity_extras_are_dropped(db, caplog):
+    """Retired continuity fields must not be re-accepted as subagent extras.
 
-    transition(
-        db, "s1", "a1", to="sleeping", reason="rest", actor="runtime",
-        extra={
-            "last_scope_id": "scope-abc-123",
-            "last_scope_archived_at": "2026-04-25T10:00:00Z",
-            "need_rest": 0,
-        },
-    )
-
-    row = db.fetchone(
-        "SELECT status, last_scope_id, last_scope_archived_at, need_rest "
-        "FROM subagents WHERE subagent_id='s1'"
-    )
-    assert row["status"] == "sleeping"
-    assert row["last_scope_id"] == "scope-abc-123"
-    assert row["last_scope_archived_at"] == "2026-04-25T10:00:00Z"
-    assert row["need_rest"] == 0
-
-
-def test_continuity_fields_are_in_allowlist():
-    """Defensive unit: if someone deletes an entry from EXTRA_ALLOWLIST
-    during a future refactor, this test flips red immediately instead of
-    continuity silently breaking in prod the next wake."""
-    for key in ("last_scope_id", "last_scope_archived_at"):
-        assert key in EXTRA_ALLOWLIST, (
-            f"{key!r} dropped from EXTRA_ALLOWLIST — "
-            "runtime handlers and PR-43 Wave A/B/C will regress silently"
-        )
-
-
-def test_retired_historical_summary_is_dropped(db, caplog):
-    """PR-55 (2026-04-23): ``historical_summary`` left the allowlist with
-    the field's retirement. If a stale caller still passes it, the
-    transition must drop the key (with a WARN) rather than fail the
-    UPDATE or silently land a write that no consumer reads."""
+    Cortex agent-root / wake-scope summaries are the continuity path now; the
+    state machine should keep accepting only product status extras.
+    """
     import logging
 
     _insert_subagent(db, status="awake")
@@ -270,39 +225,19 @@ def test_retired_historical_summary_is_dropped(db, caplog):
             extra={
                 "historical_summary": "stale-ignored",
                 "last_scope_id": "scope-xyz",
+                "last_scope_archived_at": "2026-04-25T10:00:00Z",
+                "need_rest": 0,
             },
         )
 
-    row = db.fetchone(
-        "SELECT status, historical_summary, last_scope_id "
-        "FROM subagents WHERE subagent_id='s1'"
-    )
+    row = db.fetchone("SELECT status, need_rest FROM subagents WHERE subagent_id='s1'")
     assert row["status"] == "sleeping"
-    assert row["historical_summary"] is None
-    assert row["last_scope_id"] == "scope-xyz"
+    assert row["need_rest"] == 0
+    for key in ("historical_summary", "last_scope_id", "last_scope_archived_at"):
+        assert key not in EXTRA_ALLOWLIST
     warns = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("historical_summary" in m for m in warns), warns
-
-
-def test_self_loop_also_writes_continuity_fields(db):
-    """The saga can fire a no-op ``sleeping -> sleeping`` when a wake
-    aborted early but we still want the last_scope_id update to land.
-    The self-loop branch goes through ``_apply_extras`` rather than
-    ``_apply_status_and_extras``; PR-53 checks both paths honor the
-    same allowlist."""
-    _insert_subagent(db, status="sleeping")
-
-    transition(
-        db, "s1", "a1", to="sleeping", reason="retry", actor="recovery",
-        extra={
-            "last_scope_id": "scope-xyz",
-        },
-    )
-
-    row = db.fetchone(
-        "SELECT last_scope_id FROM subagents WHERE subagent_id='s1'"
-    )
-    assert row["last_scope_id"] == "scope-xyz"
+    assert any("last_scope_archived_at,last_scope_id" in m for m in warns), warns
 
 
 def test_dropped_extra_keys_emit_warn(db, caplog):
@@ -337,7 +272,7 @@ def test_allowlisted_extras_do_not_emit_warn(db, caplog):
     with caplog.at_level(logging.WARNING, logger="entangled.sql.subagent_state"):
         transition(
             db, "s1", "a1", to="sleeping", reason="rest", actor="runtime",
-            extra={"last_scope_id": "s", "need_rest": 0},
+            extra={"need_rest": 0, "progress": "done"},
         )
 
     warns = [r for r in caplog.records if r.levelno >= logging.WARNING]

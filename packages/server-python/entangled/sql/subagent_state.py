@@ -93,41 +93,18 @@ VALID_STATES: frozenset[str] = frozenset(ALLOWED_TRANSITIONS.keys())
 # ``extra`` dict is dropped before the UPDATE — that keeps a future
 # column-rename on Business from blowing up an in-flight transition.
 #
-# Observability note (PR-53, 2026-04-25)
-# --------------------------------------
-# Prior to PR-53 dropped keys were silent. That turned out to cost us PR-42
-# (``handoff_notes``), PR-45 (``historical_summary``) and PR-43 Wave A
-# (``last_scope_id`` / ``last_scope_archived_at``) all at once: Business-side
-# ``internal_update_entity`` force-routes any ``subagents`` PATCH containing
-# ``status`` through :func:`transition`, so the additive continuity columns
-# that the runtime handlers piggyback on the terminal ``sleeping`` flip
-# landed here — and silently evaporated. Nothing in prod logs, every unit
-# test green (the handler layer mocked the Business client), ``subagents``
-# rows left NULL, continuity chain broken for every wake.
-#
-# PR-53 does two things to make that class of bug impossible:
-#   1. Expand the allowlist to cover the known terminal-flip continuity
-#      columns. After PR-55 the only surviving continuity column on
-#      this path is ``last_scope_id`` + ``last_scope_archived_at``;
-#      ``historical_summary`` was retired (removed 2026-04-23).
-#   2. WARN on every dropped key inside :func:`transition` so the next
-#      unlisted column shows up in ``business.log`` within minutes of the
-#      first write attempt, instead of hiding behind a green test.
+# Observability note
+# ------------------
+# Any extra key outside this narrow product set is dropped with a WARN inside
+# :func:`transition`. This intentionally rejects retired continuity fields
+# such as ``historical_summary``, ``handoff_notes``, ``last_scope_id`` and
+# ``last_scope_archived_at`` instead of preserving old shape as a tolerated
+# write path.
 EXTRA_ALLOWLIST: frozenset[str] = frozenset({
     "need_rest",
     "progress",
     "error",
     "result",
-    # PR-55 (2026-04-23): ``historical_summary`` retired from the
-    # allowlist along with its producer/consumer path. The column still
-    # exists on ``subagents`` (tolerant migration) but no live caller
-    # should write to it via the state-machine path. If a stale
-    # runtime still passes it, the WARN on dropped keys (below) will
-    # surface that before any correctness impact.
-    # PR-43 Wave A (2026-04-24): root-scope chain pointer + its archive
-    # time, piggybacked on the terminal sleeping/completed flip.
-    "last_scope_id",
-    "last_scope_archived_at",
 })
 
 
@@ -185,7 +162,7 @@ def transition(
     extra
         Optional mapping of ancillary columns to write alongside
         ``status``. Only keys in ``EXTRA_ALLOWLIST`` are honored; others
-        are silently dropped.
+        are dropped with a warning.
 
     Returns
     -------
