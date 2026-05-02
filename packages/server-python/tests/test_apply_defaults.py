@@ -110,6 +110,25 @@ def _make_users_def() -> SqlEntityDef:
     )
 
 
+def _make_agent_state_def(*, include_sleep_started_at: bool) -> SqlEntityDef:
+    fields = [
+        F.text("agent_id", primary=True),
+        F.text("state", nullable=False, default="awake"),
+    ]
+    if include_sleep_started_at:
+        fields.append(F.timestamp("sleep_started_at"))
+    return SqlEntityDef(
+        name="agent-state",
+        table="agent_state",
+        id_field="agent_id",
+        user_scoped=False,
+        key_params=[],
+        default_order="agent_id",
+        sync_type="list",
+        fields=fields,
+    )
+
+
 def _make_store(defn: SqlEntityDef) -> SqlEntityStore:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -207,6 +226,40 @@ def test_nullable_fields_with_defaults_are_not_runtime_filled() -> None:
         "Runtime fill leaked into a nullable field; this would change the "
         "observed wire format of existing F.timestamp(auto=True) columns."
     )
+
+
+def test_alter_add_column_omits_non_constant_now_default() -> None:
+    """SQLite rejects ADD COLUMN with DEFAULT (datetime('now')).
+
+    Existing online tables may be missing nullable timestamp columns after a
+    schema owner adds one. ALTER must add the column without the non-constant
+    SQL default, while CREATE TABLE keeps the default for fresh tables.
+    """
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    db = _FakeDatabase(conn)
+    store = SqlEntityStore(db=db)
+
+    old_def = _make_agent_state_def(include_sleep_started_at=False)
+    store.register(old_def)
+    store.ensure_schema(old_def)
+    conn.execute(
+        "INSERT INTO agent_state (agent_id, state) VALUES (?, ?)",
+        ("agent-a", "sleeping"),
+    )
+
+    new_def = _make_agent_state_def(include_sleep_started_at=True)
+    assert "DEFAULT (datetime('now'))" in new_def.create_table_sql()
+    alter_sqls = new_def.alter_add_column_sqls(["agent_id", "state"])
+    assert alter_sqls == ["ALTER TABLE agent_state ADD COLUMN sleep_started_at TEXT;"]
+
+    store.ensure_schema(new_def)
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(agent_state)")]
+    assert "sleep_started_at" in cols
+    row = conn.execute(
+        "SELECT sleep_started_at FROM agent_state WHERE agent_id='agent-a'"
+    ).fetchone()
+    assert row["sleep_started_at"] is None
 
 
 # ── upsert path ──────────────────────────────────────────────────────────────
