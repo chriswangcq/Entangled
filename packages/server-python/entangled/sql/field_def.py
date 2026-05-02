@@ -67,14 +67,24 @@ class FieldDef:
         return _map[self.kind]
 
     def column_ddl(self) -> str:
-        """Generate column DDL fragment (for CREATE TABLE or ALTER TABLE ADD COLUMN)."""
+        """Generate column DDL fragment for CREATE TABLE."""
         return self._build_ddl(include_pk=True)
+
+    def alter_column_ddl(self) -> str:
+        """Generate column DDL fragment for ALTER TABLE ADD COLUMN.
+
+        SQLite rejects ADD COLUMN with non-constant defaults such as
+        ``DEFAULT (datetime('now'))``. Migrations should add the column
+        without the non-constant SQL default and let product writers populate
+        values explicitly when the timestamp matters.
+        """
+        return self._build_ddl(include_pk=True, include_default=self.default != "NOW")
 
     def column_ddl_no_pk(self) -> str:
         """DDL without PRIMARY KEY (for composite PK via table constraint)."""
         return self._build_ddl(include_pk=False)
 
-    def _build_ddl(self, include_pk: bool = True) -> str:
+    def _build_ddl(self, include_pk: bool = True, include_default: bool = True) -> str:
         parts = [self.name, self.sql_type]
         if self.primary and include_pk:
             parts.append("PRIMARY KEY")
@@ -82,7 +92,7 @@ class FieldDef:
             parts.append("NOT NULL")
         if self.unique and not self.primary:
             parts.append("UNIQUE")
-        if self.default is not None:
+        if include_default and self.default is not None:
             if self.default == "NOW":
                 parts.append("DEFAULT (datetime('now'))")
             elif isinstance(self.default, str):

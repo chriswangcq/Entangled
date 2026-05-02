@@ -84,7 +84,7 @@ class SqlEntityDef(BaseEntityDef):
         stmts = []
         for f in self.fields:
             if f.name not in existing_cols:
-                stmts.append(f"ALTER TABLE {self.table} ADD COLUMN {f.column_ddl()};")
+                stmts.append(f"ALTER TABLE {self.table} ADD COLUMN {f.alter_column_ddl()};")
         return stmts
 
     # ── Field lookup ──────────────────────────────────────────────────────
