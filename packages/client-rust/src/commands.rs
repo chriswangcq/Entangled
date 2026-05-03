@@ -4,7 +4,7 @@
 //! Generic (non-Tauri) apps should use `EntangledClient` directly.
 
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use crate::cache::{Cache, CacheKey};
 use crate::push::{process_sync_with_contract, SyncFrame};
 use crate::schema::{EntitySchema, SchemaRegistry};
 
-// ── Subscription Registry (ref-counted, Rust-owned) ─────────────────────
+// ── Subscription Registry (monotonic, Rust-owned) ───────────────────────
 
 /// One active subscription tracked by the registry.
 #[derive(Debug, Clone)]
@@ -21,71 +21,50 @@ pub struct SubscriptionEntry {
     pub entity: String,
     pub params: Option<Value>,
     pub depth: Option<u64>,
-    pub ref_count: u32,
 }
 
-/// Ref-counted subscription registry.
+/// Monotonic subscription registry.
 ///
-/// Multiple React hooks (or eager bootstrap) may subscribe to the same
-/// (entity, params) key.  The registry ensures only **one** WS subscribe
-/// is sent when the first consumer acquires, and one unsubscribe when the
-/// last consumer releases.
-///
-/// On reconnect, `active_entries()` provides the full set of subscriptions
-/// to re-send — no React involvement required.
+/// The app subscribes every server-advertised entity for the current user once
+/// schema arrives.  Subscriptions stay active until the whole registry is
+/// cleared on identity/schema reset.  On reconnect, `active_entries()` provides
+/// the full set to re-send — no React involvement required.
 pub struct SubscriptionRegistry {
     entries: HashMap<String, SubscriptionEntry>,
 }
 
 impl SubscriptionRegistry {
     pub fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+        }
     }
 
-    /// Acquire a subscription.  Returns `true` if this is the **first**
-    /// subscriber (ref went 0 → 1) — the caller should send WS subscribe.
-    pub fn acquire(
-        &mut self,
-        entity: &str,
-        params: Option<Value>,
-        depth: Option<u64>,
-    ) -> bool {
+    /// Ensure a subscription exists.  Returns `true` only when a new entry is
+    /// inserted and the caller should send a WS subscribe.
+    pub fn acquire(&mut self, entity: &str, params: Option<Value>, depth: Option<u64>) -> bool {
         let key = subscription_key(entity, &params);
         if let Some(entry) = self.entries.get_mut(&key) {
-            entry.ref_count += 1;
-            // update depth if provided (stream may override)
             if depth.is_some() {
                 entry.depth = depth;
             }
-            false // already subscribed
+            false
         } else {
-            self.entries.insert(key, SubscriptionEntry {
-                entity: entity.to_string(),
-                params,
-                depth,
-                ref_count: 1,
-            });
-            true // first subscriber
+            self.entries.insert(
+                key,
+                SubscriptionEntry {
+                    entity: entity.to_string(),
+                    params,
+                    depth,
+                },
+            );
+            true
         }
     }
 
-    /// Release a subscription.  Returns `true` if ref hit zero — the
-    /// caller should send WS unsubscribe.
-    pub fn release(&mut self, entity: &str, params: &Option<Value>) -> bool {
-        let key = subscription_key(entity, params);
-        if let Some(entry) = self.entries.get_mut(&key) {
-            if entry.ref_count <= 1 {
-                self.entries.remove(&key);
-                return true; // last subscriber gone
-            }
-            entry.ref_count -= 1;
-        }
-        false
-    }
-
-    /// All active entries (ref > 0) — used for reconnect resubscribe.
+    /// All active entries — used for reconnect resubscribe.
     pub fn active_entries(&self) -> Vec<&SubscriptionEntry> {
-        self.entries.values().filter(|e| e.ref_count > 0).collect()
+        self.entries.values().collect()
     }
 
     /// Clear all subscriptions (e.g. on logout / user switch).
@@ -101,12 +80,13 @@ fn subscription_key(entity: &str, params: &Option<Value>) -> String {
         Some(Value::Object(map)) if !map.is_empty() => {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
-            let parts: Vec<String> = keys.iter().map(|k| {
-                let v = map.get(*k)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                format!("{}={}", k, v)
-            }).collect();
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    let v = map.get(*k).and_then(|v| v.as_str()).unwrap_or("");
+                    format!("{}={}", k, v)
+                })
+                .collect();
             format!("{}\0{}", entity, parts.join("&"))
         }
         _ => entity.to_string(),
@@ -218,8 +198,8 @@ impl EntangledState {
         &self,
         timeout_ms: u64,
     ) -> Result<(Vec<EntitySchema>, u32), String> {
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(timeout_ms.max(1));
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(1));
         loop {
             let (rows, version) = self.schema_snapshot();
             if !rows.is_empty() {
@@ -259,6 +239,186 @@ fn make_key(entity: &str, params: Option<Value>) -> CacheKey {
     }
 }
 
+fn params_object(params: &Option<Value>) -> serde_json::Map<String, Value> {
+    params
+        .as_ref()
+        .and_then(|p| p.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn values_match(actual: &Value, expected: &Value) -> bool {
+    if actual == expected {
+        return true;
+    }
+    scalar_to_string(actual)
+        .zip(scalar_to_string(expected))
+        .map(|(a, e)| a == e)
+        .unwrap_or(false)
+}
+
+fn scalar_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn row_matches_params(row: &Value, params: &serde_json::Map<String, Value>) -> bool {
+    params.iter().all(|(key, expected)| {
+        row.get(key)
+            .map(|actual| values_match(actual, expected))
+            .unwrap_or(false)
+    })
+}
+
+fn item_id(item: &Value, id_field: &str) -> Option<String> {
+    item.get(id_field).and_then(|v| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    })
+}
+
+fn merge_global_then_exact(
+    global_filtered: Vec<Value>,
+    exact: Vec<Value>,
+    id_field: &str,
+) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(global_filtered.len() + exact.len());
+
+    for item in global_filtered.into_iter().chain(exact.into_iter()) {
+        if let Some(id) = item_id(&item, id_field) {
+            if seen.insert(id) {
+                out.push(item);
+            }
+        } else {
+            out.push(item);
+        }
+    }
+
+    out
+}
+
+fn id_field_for_entity(state: &EntangledState, entity: &str) -> String {
+    state
+        .registry
+        .read()
+        .unwrap()
+        .get(entity)
+        .and_then(|s| s.id_field.clone())
+        .unwrap_or_else(|| "id".to_string())
+}
+
+fn filtered_user_scope_list(
+    entity: &str,
+    params: Option<Value>,
+    state: &EntangledState,
+) -> Vec<Value> {
+    let params_map = params_object(&params);
+    let cache = &state.cache;
+    let exact = cache.get_list(&make_key(entity, params.clone()));
+
+    if params_map.is_empty() {
+        return exact;
+    }
+
+    let global = cache.get_list(&CacheKey::new_empty(entity));
+    let global_filtered = global
+        .into_iter()
+        .filter(|row| row_matches_params(row, &params_map))
+        .collect::<Vec<_>>();
+    if global_filtered.is_empty() {
+        return exact;
+    }
+
+    let id_field = id_field_for_entity(state, entity);
+    merge_global_then_exact(global_filtered, exact, &id_field)
+}
+
+fn filtered_user_scope_item(
+    entity: &str,
+    id: &str,
+    params: Option<Value>,
+    state: &EntangledState,
+) -> Option<Value> {
+    let params_map = params_object(&params);
+    let cache = &state.cache;
+
+    if params_map.is_empty() {
+        return cache.get_item(&CacheKey::new_empty(entity), id);
+    }
+
+    let global = cache.get_item(&CacheKey::new_empty(entity), id);
+    if let Some(row) = global {
+        if row_matches_params(&row, &params_map) {
+            return Some(row);
+        }
+    }
+
+    cache.get_item(&make_key(entity, params), id)
+}
+
+#[cfg(test)]
+mod user_scope_read_tests {
+    use super::{filtered_user_scope_item, filtered_user_scope_list, EntangledState};
+    use crate::cache::CacheKey;
+    use crate::schema::EntitySchema;
+    use serde_json::json;
+
+    fn state_with_messages() -> EntangledState {
+        let state = EntangledState::new();
+        state
+            .registry
+            .write()
+            .unwrap()
+            .register_all(vec![EntitySchema {
+                name: "messages".to_string(),
+                key_params: vec!["agent_id".to_string()],
+                push_events: vec![],
+                id_field: Some("id".to_string()),
+                sync_type: Some("stream".to_string()),
+                sync_limit: Some(50),
+                subscription_mode: Some("lazy".to_string()),
+                capabilities: None,
+            }]);
+        state.cache.apply_snapshot(
+            &CacheKey::new_empty("messages"),
+            &[
+                json!({"id": "m1", "agent_id": "a1", "text": "hello"}),
+                json!({"id": "m2", "agent_id": "a2", "text": "other"}),
+            ],
+            1,
+            "id",
+            false,
+        );
+        state
+    }
+
+    #[test]
+    fn scoped_list_reads_from_unscoped_user_cache() {
+        let state = state_with_messages();
+        let rows = filtered_user_scope_list("messages", Some(json!({"agent_id": "a1"})), &state);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "m1");
+    }
+
+    #[test]
+    fn scoped_item_reads_from_unscoped_user_cache() {
+        let state = state_with_messages();
+        let row =
+            filtered_user_scope_item("messages", "m1", Some(json!({"agent_id": "a1"})), &state)
+                .expect("row should come from unscoped cache");
+        assert_eq!(row["text"], "hello");
+
+        let miss =
+            filtered_user_scope_item("messages", "m2", Some(json!({"agent_id": "a1"})), &state);
+        assert!(miss.is_none());
+    }
+}
+
 /// Get list from SQLite cache (read path — always local, never hits the server).
 /// Empty vec means no rows for this key (cold or legitimately empty after sync).
 #[cfg(feature = "tauri")]
@@ -268,9 +428,7 @@ pub async fn entity_list(
     params: Option<Value>,
     state: tauri::State<'_, EntangledState>,
 ) -> Result<Vec<Value>, String> {
-    let key = make_key(&entity, params);
-    let cache = &state.cache;
-    Ok(cache.get_list(&key))
+    Ok(filtered_user_scope_list(&entity, params, &state))
 }
 
 /// Get single item from cache.
@@ -282,9 +440,7 @@ pub async fn entity_get(
     params: Option<Value>,
     state: tauri::State<'_, EntangledState>,
 ) -> Result<Option<Value>, String> {
-    let key = make_key(&entity, params);
-    let cache = &state.cache;
-    Ok(cache.get_item(&key, &id))
+    Ok(filtered_user_scope_item(&entity, &id, params, &state))
 }
 
 /// Get current version for an entity (for subscribe with since_version).
@@ -307,8 +463,8 @@ pub async fn entity_apply_sync(
     frame: Value,
     state: tauri::State<'_, EntangledState>,
 ) -> Result<Option<String>, String> {
-    let sync_frame: SyncFrame = serde_json::from_value(frame)
-        .map_err(|e| format!("Invalid sync frame: {}", e))?;
+    let sync_frame: SyncFrame =
+        serde_json::from_value(frame).map_err(|e| format!("Invalid sync frame: {}", e))?;
 
     let cache = &state.cache;
     let ver = state.get_sync_contract_version();
@@ -319,9 +475,7 @@ pub async fn entity_apply_sync(
 /// Clear all cache (on logout / reconnect).
 #[cfg(feature = "tauri")]
 #[tauri::command]
-pub async fn entity_cache_clear(
-    state: tauri::State<'_, EntangledState>,
-) -> Result<(), String> {
+pub async fn entity_cache_clear(state: tauri::State<'_, EntangledState>) -> Result<(), String> {
     let cache = &state.cache;
     cache.clear_all();
     Ok(())
@@ -362,7 +516,9 @@ pub async fn entity_prepend_page(
 
     tracing::info!(
         "[Cache] {} prepend_page: {} items, has_more={}",
-        entity, count, has_more
+        entity,
+        count,
+        has_more
     );
 
     Ok(count)

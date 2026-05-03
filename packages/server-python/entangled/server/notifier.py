@@ -1,10 +1,13 @@
 """
 entangled/server/notifier.py — Entanglement-based push notification.
 
-One write = one notification.  Only pushes to clients that have active
-entanglements for the exact (entity, params) that was written.
-User-scoped entities only push to the owning user's clients; global
-entities push to all entangled peers.
+One write = one notification.  Writes with key params push to both the exact
+(entity, params) entanglement and the unscoped user-level entanglement for that
+entity.  This keeps a user-scope full subscription complete while preserving
+scoped subscriptions for older clients and focused readers.
+
+User-scoped entities only push to the owning user's clients; global entities
+push to all entangled peers.
 
 NOTE: Uses module-level state bound via set_store(). This is intentional
 for backwards compatibility — a single process serves one store instance.
@@ -138,6 +141,66 @@ def _action_to_op(action: str) -> str:
     }.get(action, "update")
 
 
+def _id_field_for(entity: str) -> str:
+    if _store is None:
+        return "id"
+    try:
+        _defn = _store.get_def(entity)
+        return getattr(_defn, "id_field", "id")
+    except KeyError:
+        return "id"
+
+
+def _push_delta_to_entangled_clients(
+    *,
+    registry: SyncRegistry,
+    user_id: str,
+    entity: str,
+    params: Optional[Dict[str, str]],
+    state,
+    sync_op: SyncOp,
+) -> int:
+    entangled = registry.get_entangled_clients(entity, params)
+    if not entangled:
+        return 0
+
+    delta_frame = {
+        "type": "sync",
+        "entity": entity,
+        "params": params if params else None,
+        "idField": _id_field_for(entity),
+        "mode": "delta",
+        "version": state.current_version,
+        "baseVersion": state.current_version - 1,
+        "ops": [sync_op.to_dict()],
+    }
+
+    user_owned = _is_user_owned(entity)
+    sent = 0
+    for cid in entangled:
+        if cid not in _clients:
+            continue
+        client_uid, push_fn = _clients[cid]
+        if user_owned and user_id and client_uid != user_id:
+            continue
+        try:
+            push_fn("sync", delta_frame)
+            sent += 1
+        except Exception as e:
+            logger.warning("[Notifier] Push to %s failed: %s", cid, e)
+
+    if sent > 0:
+        logger.debug(
+            "[Notifier] %s.%s v%d params=%s → %d client(s)",
+            entity,
+            sync_op.op,
+            state.current_version,
+            params,
+            sent,
+        )
+    return sent
+
+
 def _inproc_notify_entity_change(
     user_id: str,
     entity: str,
@@ -152,52 +215,37 @@ def _inproc_notify_entity_change(
     registry = _get_registry()
     op_type = _action_to_op(action)
 
-    # 1. Record in op_log (with request_id for optimistic correlation)
+    # 1. Record in scoped op_log (with request_id for optimistic correlation).
     state, sync_op = registry.record_op(
         entity, op_type, entity_id or "", params=params, data=data,
         request_id=request_id,
     )
 
-    # 2. Push delta to entangled clients (scoped by user for user-owned entities)
-    entangled = registry.get_entangled_clients(entity, params)
-    user_owned = _is_user_owned(entity)
-    if entangled:
-        id_field = "id"
-        if _store is not None:
-            try:
-                _defn = _store.get_def(entity)
-                id_field = getattr(_defn, "id_field", "id")
-            except KeyError:
-                pass
-        delta_frame = {
-            "type": "sync",
-            "entity": entity,
-            "params": params if params else None,
-            "idField": id_field,
-            "mode": "delta",
-            "version": state.current_version,
-            "baseVersion": state.current_version - 1,
-            "ops": [sync_op.to_dict()],
-        }
+    # 2. Push exact scoped delta for focused subscribers.
+    _push_delta_to_entangled_clients(
+        registry=registry,
+        user_id=user_id,
+        entity=entity,
+        params=params,
+        state=state,
+        sync_op=sync_op,
+    )
 
-        sent = 0
-        for cid in entangled:
-            if cid not in _clients:
-                continue
-            client_uid, push_fn = _clients[cid]
-            if user_owned and user_id and client_uid != user_id:
-                continue
-            try:
-                push_fn("sync", delta_frame)
-                sent += 1
-            except Exception as e:
-                logger.warning("[Notifier] Push to %s failed: %s", cid, e)
-
-        if sent > 0:
-            logger.debug(
-                "[Notifier] %s.%s v%d → %d client(s)",
-                entity, op_type, state.current_version, sent,
-            )
+    # 3. Also bump/push the unscoped user-domain state. This is the canonical
+    #    "subscribe all rows for the current user" path used by the desktop app.
+    if params:
+        global_state, global_sync_op = registry.record_op(
+            entity, op_type, entity_id or "", params=None, data=data,
+            request_id=request_id,
+        )
+        _push_delta_to_entangled_clients(
+            registry=registry,
+            user_id=user_id,
+            entity=entity,
+            params=None,
+            state=global_state,
+            sync_op=global_sync_op,
+        )
 
 
 class InProcSyncPushPort:
