@@ -186,11 +186,6 @@ mod ws {
             }).await;
         }
 
-        /// Host-facing alias used by embedded App sync bridge.
-        pub async fn unsubscribe(&self, entity: &str, params: Option<Value>) {
-            self.disentangle(entity, params).await;
-        }
-
         /// Send a first-class action (mutation) and wait for ack.
         pub async fn send_action(
             &self,

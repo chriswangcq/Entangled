@@ -117,6 +117,61 @@ def test_notifier_delta_includes_id_field(monkeypatch):
     assert pushed[0]["mode"] == "delta"
 
 
+def test_scoped_delta_also_pushes_to_unscoped_user_subscription(monkeypatch):
+    from entangled.server import notifier
+    from entangled.server.sync import SyncRegistry
+
+    notifier.reset_state()
+
+    class FakeDefn:
+        name = "messages"
+        id_field = "msg_id"
+        op_log_size = 1000
+        relations = []
+        user_scoped = True
+
+    class FakeStore:
+        def get_all_defs(self):
+            return [FakeDefn()]
+
+        def get_def(self, entity):
+            if entity == "messages":
+                return FakeDefn()
+            raise KeyError(entity)
+
+    registry = SyncRegistry()
+    notifier.set_store(FakeStore(), sync_registry=registry)
+
+    scoped_pushed = []
+    unscoped_pushed = []
+
+    notifier.register_client("scoped", "u1", lambda _event, payload: scoped_pushed.append(payload))
+    notifier.register_client("unscoped", "u1", lambda _event, payload: unscoped_pushed.append(payload))
+    registry.entangle("scoped", "messages", {"agent_id": "a1"})
+    registry.entangle("unscoped", "messages", None)
+
+    notifier.notify_entity_change(
+        "u1",
+        "messages",
+        "created",
+        entity_id="m1",
+        params={"agent_id": "a1"},
+        data={"msg_id": "m1", "agent_id": "a1", "text": "hello"},
+    )
+
+    notifier.unregister_client("scoped")
+    notifier.unregister_client("unscoped")
+    notifier.reset_state()
+
+    assert len(scoped_pushed) == 1
+    assert scoped_pushed[0]["params"] == {"agent_id": "a1"}
+    assert scoped_pushed[0]["ops"][0]["data"]["text"] == "hello"
+
+    assert len(unscoped_pushed) == 1
+    assert unscoped_pushed[0]["params"] is None
+    assert unscoped_pushed[0]["ops"][0]["data"]["agent_id"] == "a1"
+
+
 def test_sync_push_port_override_routes_notify():
     from entangled.server import notifier
     from entangled.server.push_port import set_sync_push_port
