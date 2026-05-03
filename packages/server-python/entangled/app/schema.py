@@ -7,10 +7,11 @@ import hashlib
 import json
 from typing import List
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from ..sql.entity_def import SqlEntityDef
+from ..sql.validation import SchemaValidationError, validate_schema_batch
 from ..server.notifier import notify_all
 from ..server.ws_handler import SYNC_CONTRACT_VERSION
 from .auth import verify_service_or_user
@@ -28,20 +29,28 @@ class RegisterRequest(BaseModel):
 @router.post("/v1/schema/register")
 def register_schema(req: RegisterRequest, _user: str = Depends(verify_service_or_user)):
     store = get_store()
-    registered = []
-    errors = []
+    try:
+        defs = [SqlEntityDef.from_spec(spec) for spec in req.entities]
+        existing_defs = {
+            defn.name: defn
+            for defn in getattr(store, "get_all_defs", lambda: [])()
+        }
+        validate_schema_batch(defs, existing_defs=existing_defs)
+    except (KeyError, ValueError, SchemaValidationError) as e:
+        logger.error("[SchemaRegistry] Invalid schema batch: %s", e)
+        raise HTTPException(status_code=422, detail=str(e))
 
-    for spec in req.entities:
-        name = spec.get("name", "<unknown>")
-        try:
-            defn = SqlEntityDef.from_spec(spec)
+    registered = [defn.name for defn in defs]
+    try:
+        with store.db.transaction("global"):
+            for defn in defs:
+                store.ensure_schema_unlocked(defn)
+        for defn in defs:
             store.register(defn)
-            store.ensure_schema(defn)
-            registered.append(name)
-            logger.info("[SchemaRegistry] Registered: %s → %s", name, defn.table)
-        except Exception as e:
-            logger.error("[SchemaRegistry] Failed to register %s: %s", name, e)
-            errors.append({"name": name, "error": str(e)})
+            logger.info("[SchemaRegistry] Registered: %s → %s", defn.name, defn.table)
+    except Exception as e:
+        logger.error("[SchemaRegistry] Failed schema registration batch: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
     if registered:
         schema = store.get_schema()
@@ -61,6 +70,6 @@ def register_schema(req: RegisterRequest, _user: str = Depends(verify_service_or
 
     return {
         "registered": registered,
-        "errors": errors,
+        "errors": [],
         "total": len(registered),
     }

@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..server.store import EntityStore as BaseStore
 from .entity_def import SqlEntityDef
+from .validation import normalize_order_by, validate_field_keys
 
 logger = logging.getLogger(__name__)
 
@@ -109,24 +110,30 @@ class SqlEntityStore(BaseStore):
         if not entity_def.fields:
             return
         with self.db.transaction("global"):
-            self.db.execute(entity_def.create_table_sql())
-            # PR-21 (2026-04-20): ALTER MUST run before index_sqls.
-            # Previously the order was reversed, which silently worked for
-            # every prior migration because new columns happened to be
-            # index=False. The moment someone adds a new column with
-            # index=True (e.g. chat_messages.lifecycle), CREATE INDEX
-            # fires against the not-yet-added column and fails with
-            # ``no such column`` — the exception escapes ensure_schema,
-            # the ALTER never runs, and the table is left permanently
-            # half-migrated. Swap the order so every ALTER commits first
-            # and index creation always sees the final column set.
-            existing = self.db.fetchall(f"PRAGMA table_info({entity_def.table})")
-            existing_cols = [r["name"] for r in existing]
-            for alter_sql in entity_def.alter_add_column_sqls(existing_cols):
-                logger.info("[SqlEntityStore] Migrating: %s", alter_sql)
-                self.db.execute(alter_sql)
-            for idx_sql in entity_def.index_sqls():
-                self.db.execute(idx_sql)
+            self.ensure_schema_unlocked(entity_def)
+
+    def ensure_schema_unlocked(self, entity_def: SqlEntityDef) -> None:
+        """Idempotent schema management inside an already-held transaction."""
+        if not entity_def.fields:
+            return
+        self.db.execute(entity_def.create_table_sql())
+        # PR-21 (2026-04-20): ALTER MUST run before index_sqls.
+        # Previously the order was reversed, which silently worked for
+        # every prior migration because new columns happened to be
+        # index=False. The moment someone adds a new column with
+        # index=True (e.g. chat_messages.lifecycle), CREATE INDEX
+        # fires against the not-yet-added column and fails with
+        # ``no such column`` — the exception escapes ensure_schema,
+        # the ALTER never runs, and the table is left permanently
+        # half-migrated. Swap the order so every ALTER commits first
+        # and index creation always sees the final column set.
+        existing = self.db.fetchall(f"PRAGMA table_info({entity_def.table})")
+        existing_cols = [r["name"] for r in existing]
+        for alter_sql in entity_def.alter_add_column_sqls(existing_cols):
+            logger.info("[SqlEntityStore] Migrating: %s", alter_sql)
+            self.db.execute(alter_sql)
+        for idx_sql in entity_def.index_sqls():
+            self.db.execute(idx_sql)
 
     def ensure_all_schemas(self) -> None:
         """Run ensure_schema for all registered entities that have fields."""
@@ -183,18 +190,20 @@ class SqlEntityStore(BaseStore):
         where, values = self._scope_where(defn, user_id, params)
 
         if filters:
+            validate_field_keys(defn, filters.keys(), label="filter field")
             for k, v in filters.items():
                 where += f" AND {k} = ?"
                 values.append(v)
 
         if not skip_default_not_in and defn.default_not_in_filters:
+            validate_field_keys(defn, defn.default_not_in_filters.keys(), label="default_not_in_filter")
             for k, vlist in defn.default_not_in_filters.items():
                 if vlist:
                     placeholders = ",".join(["?"] * len(vlist))
                     where += f" AND {k} NOT IN ({placeholders})"
                     values.extend(vlist)
 
-        order = order_by or defn.default_order
+        order = normalize_order_by(defn, order_by or defn.default_order)
         sql = f"SELECT * FROM {defn.table} WHERE {where} ORDER BY {order}"
         if limit:
             sql += f" LIMIT {limit}"
@@ -213,8 +222,8 @@ class SqlEntityStore(BaseStore):
         before_id: Optional[str] = None,
         after_id: Optional[str] = None,
         limit: int = 50,
-        order_by: str = "timestamp DESC, rowid DESC",
-        cursor_field: str = "timestamp",
+        order_by: Optional[str] = None,
+        cursor_field: Optional[str] = None,
         skip_default_not_in: bool = False,
     ) -> List[Dict[str, Any]]:
         """Cursor-based backward pagination for stream entities."""
@@ -222,11 +231,13 @@ class SqlEntityStore(BaseStore):
         where, values = self._scope_where(defn, user_id, params)
 
         if filters:
+            validate_field_keys(defn, filters.keys(), label="filter field")
             for k, v in filters.items():
                 where += f" AND {k} = ?"
                 values.append(v)
 
         if in_filters:
+            validate_field_keys(defn, in_filters.keys(), label="in_filter field")
             for k, vlist in in_filters.items():
                 if not vlist:
                     continue
@@ -235,6 +246,7 @@ class SqlEntityStore(BaseStore):
                 values.extend(vlist)
 
         if not_in_filters:
+            validate_field_keys(defn, not_in_filters.keys(), label="not_in_filter field")
             for k, vlist in not_in_filters.items():
                 if not vlist:
                     continue
@@ -243,12 +255,16 @@ class SqlEntityStore(BaseStore):
                 values.extend(vlist)
 
         if not skip_default_not_in and defn.default_not_in_filters:
+            validate_field_keys(defn, defn.default_not_in_filters.keys(), label="default_not_in_filter")
             for k, vlist in defn.default_not_in_filters.items():
                 if vlist:
                     placeholders = ",".join(["?"] * len(vlist))
                     where += f" AND {k} NOT IN ({placeholders})"
                     values.extend(vlist)
 
+        order_by = normalize_order_by(defn, order_by or defn.default_order or "rowid DESC")
+        cursor_field = cursor_field or order_by.split(",")[0].strip().split()[0]
+        validate_field_keys(defn, [cursor_field], label="cursor field")
         if before_id:
             ref = self.db.fetchone(
                 f"SELECT {cursor_field} AS _cf, rowid AS _rid FROM {defn.table} WHERE {defn.id_field} = ?",
@@ -279,6 +295,7 @@ class SqlEntityStore(BaseStore):
         where, values = self._scope_where(defn, user_id, params)
 
         if defn.default_not_in_filters:
+            validate_field_keys(defn, defn.default_not_in_filters.keys(), label="default_not_in_filter")
             for k, vlist in defn.default_not_in_filters.items():
                 if vlist:
                     placeholders = ",".join(["?"] * len(vlist))
@@ -286,7 +303,9 @@ class SqlEntityStore(BaseStore):
                     values.extend(vlist)
 
         raw_order = defn.default_order or "created_at"
+        normalize_order_by(defn, raw_order)
         cursor_field = raw_order.split(",")[0].strip().split()[0]
+        validate_field_keys(defn, [cursor_field], label="cursor field")
         ref = self.db.fetchone(
             f"SELECT {cursor_field} AS _cf, rowid AS _rid FROM {defn.table} WHERE {defn.id_field} = ?",
             (before_id,),
@@ -456,6 +475,7 @@ class SqlEntityStore(BaseStore):
         defn = self.get_def(entity)
         where, values = self._scope_where(defn, user_id, params)
         if filters:
+            validate_field_keys(defn, filters.keys(), label="filter field")
             for k, v in filters.items():
                 where += f" AND {k} = ?"
                 values.append(v)
@@ -467,6 +487,7 @@ class SqlEntityStore(BaseStore):
         defn = self.get_def(entity)
         where, values = self._scope_where(defn, user_id, params)
         if filters:
+            validate_field_keys(defn, filters.keys(), label="filter field")
             for k, v in filters.items():
                 where += f" AND {k} = ?"
                 values.append(v)
@@ -495,6 +516,7 @@ class SqlEntityStore(BaseStore):
             set_parts.append("updated_at = datetime('now')")
         where, where_vals = self._scope_where(defn, user_id, params)
         if filters:
+            validate_field_keys(defn, filters.keys(), label="filter field")
             for k, v in filters.items():
                 where += f" AND {k} = ?"
                 where_vals.append(v)
@@ -511,7 +533,7 @@ class SqlEntityStore(BaseStore):
                 *, params: Optional[Dict[str, str]] = None,
                 order_by: Optional[str] = None, notify: bool = True) -> int:
         defn = self.get_def(entity)
-        order = order_by or defn.default_order or "rowid DESC"
+        order = normalize_order_by(defn, order_by or defn.default_order or "rowid DESC")
         where, values = self._scope_where(defn, user_id, params)
         keep_sql = (
             f"SELECT {defn.id_field} FROM {defn.table} "
@@ -596,6 +618,7 @@ class SqlEntityStore(BaseStore):
         if defn.tracks_updated_at_column:
             update_parts.append("updated_at = datetime('now')")
         where, where_values = self._scope_where(defn, user_id, params)
+        validate_field_keys(defn, where_condition.keys(), label="CAS condition field")
         for k, v in where_condition.items():
             where += f" AND {k} = ?"
             where_values.append(v)
@@ -729,6 +752,7 @@ class SqlEntityStore(BaseStore):
         if not defn.fields:
             raise ValueError(f"Entity '{defn.name}' has no fields defined.")
         fm = defn.field_map
+        validate_field_keys(defn, result.keys(), label="input field")
         for h in defn.hidden_fields:
             has_key = f"has_{h}"
             if has_key in fm and h in result:
