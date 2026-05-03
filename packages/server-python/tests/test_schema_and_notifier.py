@@ -72,3 +72,46 @@ def test_sync_push_port_override_routes_notify():
 
     assert len(calls) == 1
     assert calls[0][0][0] == "u1"
+
+
+def test_schema_registration_broadcasts_schema_update(monkeypatch):
+    from entangled.app import schema as schema_module
+    from entangled.app.schema import RegisterRequest
+
+    class FakeDefn:
+        name = "widgets"
+        table = "widgets"
+
+    class FakeStore:
+        def __init__(self):
+            self.registered = []
+            self.ensured = []
+
+        def register(self, defn):
+            self.registered.append(defn.name)
+
+        def ensure_schema(self, defn):
+            self.ensured.append(defn.name)
+
+        def get_schema(self):
+            return [{"name": "widgets", "idField": "id"}]
+
+    store = FakeStore()
+    broadcasts = []
+
+    monkeypatch.setattr(schema_module, "get_store", lambda: store)
+    monkeypatch.setattr(schema_module.SqlEntityDef, "from_spec", lambda spec: FakeDefn())
+    monkeypatch.setattr(schema_module, "notify_all", lambda event, data: broadcasts.append((event, data)))
+
+    result = schema_module.register_schema(RegisterRequest(entities=[{"name": "widgets"}]))
+
+    assert result["registered"] == ["widgets"]
+    assert result["errors"] == []
+    assert store.registered == ["widgets"]
+    assert store.ensured == ["widgets"]
+    assert len(broadcasts) == 1
+    event, data = broadcasts[0]
+    assert event == "schema"
+    assert data["entities"] == [{"name": "widgets", "idField": "id"}]
+    assert data["hash"]
+    assert data["syncContractVersion"] == schema_module.SYNC_CONTRACT_VERSION
