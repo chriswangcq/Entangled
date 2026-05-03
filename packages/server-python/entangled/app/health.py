@@ -1,6 +1,6 @@
-"""Health check endpoint."""
+"""Health and readiness endpoints."""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query
 
 from .state import get_store
 
@@ -14,4 +14,28 @@ def health():
         "status": "ok",
         "entities": len(store.entities),
         "entity_names": store.entities,
+    }
+
+
+@router.get("/v1/ready")
+def ready(required: str = Query("", description="Comma-separated required entity names")):
+    store = get_store()
+    entity_names = set(store.entities)
+    required_names = {name.strip() for name in required.split(",") if name.strip()}
+    missing = sorted(required_names - entity_names)
+    if not entity_names or missing:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "entities": len(entity_names),
+                "entity_names": sorted(entity_names),
+                "missing": missing,
+            },
+        )
+    return {
+        "status": "ready",
+        "entities": len(entity_names),
+        "entity_names": sorted(entity_names),
+        "missing": [],
     }
