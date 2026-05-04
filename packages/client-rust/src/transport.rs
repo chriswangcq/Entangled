@@ -11,7 +11,7 @@ mod ws {
 
     use futures_util::{SinkExt, StreamExt};
     use serde_json::Value;
-    use tokio::sync::{Mutex, Notify, broadcast, mpsc};
+    use tokio::sync::{broadcast, mpsc, Mutex, Notify};
     use tokio_tungstenite::{
         connect_async,
         tungstenite::{client::IntoClientRequest, Message},
@@ -63,7 +63,12 @@ mod ws {
         /// Entangled sync frame — handled internally by the engine
         Sync(Value),
         /// Action acknowledgement — matched by request_id for optimistic update correlation
-        Ack { request_id: String, success: bool, data: Option<Value>, error: Option<String> },
+        Ack {
+            request_id: String,
+            success: bool,
+            data: Option<Value>,
+            error: Option<String>,
+        },
         /// Server ping
         Ping,
         /// Unknown / host-specific push event
@@ -84,26 +89,84 @@ mod ws {
                 "error" => InMsg::Ack {
                     request_id: val
                         .get("request_id")
-                        .or_else(|| val.get("requestId"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
                     success: false,
                     data: None,
-                    error: val.get("error").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    error: val
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 },
                 "ack" => InMsg::Ack {
-                    request_id: val.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    success: val.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+                    request_id: val
+                        .get("request_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    success: val
+                        .get("success")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                     data: val.get("data").cloned(),
-                    error: val.get("error").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    error: val
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 },
                 "ping" | "heartbeat" => InMsg::Ping,
                 "push" => InMsg::Push {
-                    event: val.get("event").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    event: val
+                        .get("event")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     data: val.get("data").cloned(),
                 },
                 _ => InMsg::Unknown,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::InMsg;
+
+        #[test]
+        fn parses_ack_with_canonical_request_id() {
+            match InMsg::parse(
+                r#"{"type":"ack","request_id":"req-1","success":true,"data":{"ok":true}}"#,
+            ) {
+                InMsg::Ack {
+                    request_id,
+                    success,
+                    data,
+                    error,
+                } => {
+                    assert_eq!(request_id, "req-1");
+                    assert!(success);
+                    assert_eq!(data.unwrap()["ok"], true);
+                    assert!(error.is_none());
+                }
+                _ => panic!("expected ack"),
+            }
+        }
+
+        #[test]
+        fn does_not_parse_retired_request_id_alias() {
+            match InMsg::parse(r#"{"type":"error","requestId":"legacy","error":"boom"}"#) {
+                InMsg::Ack {
+                    request_id,
+                    success,
+                    error,
+                    ..
+                } => {
+                    assert_eq!(request_id, "");
+                    assert!(!success);
+                    assert_eq!(error.as_deref(), Some("boom"));
+                }
+                _ => panic!("expected error ack"),
             }
         }
     }
@@ -170,7 +233,8 @@ mod ws {
                 before_id: None,
                 limit: None,
                 request_id: None,
-            }).await;
+            })
+            .await;
         }
 
         /// Host-facing alias used by embedded App sync bridge.
@@ -183,7 +247,8 @@ mod ws {
             self.send(&OutMsg::Disentangle {
                 entity: entity.to_string(),
                 params,
-            }).await;
+            })
+            .await;
         }
 
         /// Send a first-class action (mutation) and wait for ack.
@@ -205,7 +270,8 @@ mod ws {
                 id,
                 params,
                 data,
-            }).await;
+            })
+            .await;
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             loop {
@@ -236,7 +302,8 @@ mod ws {
                 before_id,
                 limit: Some(limit),
                 request_id: Some(request_id.clone()),
-            }).await;
+            })
+            .await;
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             loop {
@@ -272,7 +339,9 @@ mod ws {
             sync_tx: mpsc::UnboundedSender<Value>,
             shutdown: Arc<Notify>,
         ) {
-            let ws_base = ws_url.replace("http://", "ws://").replace("https://", "wss://");
+            let ws_base = ws_url
+                .replace("http://", "ws://")
+                .replace("https://", "wss://");
 
             loop {
                 tokio::select! {
@@ -306,7 +375,10 @@ mod ws {
             let req = match ws_url.into_client_request() {
                 Ok(mut r) => {
                     for (k, v) in auth.auth_headers() {
-                        if let (Ok(name), Ok(val)) = (k.parse::<tokio_tungstenite::tungstenite::http::header::HeaderName>(), v.parse::<tokio_tungstenite::tungstenite::http::header::HeaderValue>()) {
+                        if let (Ok(name), Ok(val)) = (
+                            k.parse::<tokio_tungstenite::tungstenite::http::header::HeaderName>(),
+                            v.parse::<tokio_tungstenite::tungstenite::http::header::HeaderValue>(),
+                        ) {
                             r.headers_mut().insert(name, val);
                         }
                     }
@@ -329,7 +401,8 @@ mod ws {
                 }
             };
 
-            self.connected.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.connected
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = self.connected_tx.send(true);
 
             let (sink, mut stream) = ws.split();
@@ -363,7 +436,8 @@ mod ws {
                         if let Some(ref f) = frame {
                             tracing::warn!(
                                 "[Entangled] Server closed connection: code={}, reason={}",
-                                u16::from(f.code), f.reason
+                                u16::from(f.code),
+                                f.reason
                             );
                             if f.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(4001) {
                                 auth.on_auth_rejected();
@@ -380,7 +454,10 @@ mod ws {
                         }
                         continue;
                     }
-                    Err(e) => { tracing::warn!("[Entangled] WS error: {}", e); return; }
+                    Err(e) => {
+                        tracing::warn!("[Entangled] WS error: {}", e);
+                        return;
+                    }
                     _ => continue,
                 };
 
@@ -388,17 +465,13 @@ mod ws {
                     InMsg::Sync(val) => {
                         let request_id = val
                             .get("request_id")
-                            .or_else(|| val.get("requestId"))
                             .and_then(|v| v.as_str())
                             .filter(|s| !s.is_empty())
                             .map(String::from);
                         if let Some(request_id) = request_id {
                             let payload = serde_json::json!({
                                 "entries": val.get("data").cloned().unwrap_or(Value::Array(vec![])),
-                                "has_more": val.get("hasMore")
-                                    .or_else(|| val.get("has_more"))
-                                    .cloned()
-                                    .unwrap_or(Value::Bool(false)),
+                                "has_more": val.get("hasMore").cloned().unwrap_or(Value::Bool(false)),
                                 "success": true,
                             });
                             let _ = self.response_tx.send((request_id, Ok(payload)));
@@ -406,7 +479,12 @@ mod ws {
                             let _ = sync_tx.send(val);
                         }
                     }
-                    InMsg::Ack { request_id, success, data, error } => {
+                    InMsg::Ack {
+                        request_id,
+                        success,
+                        data,
+                        error,
+                    } => {
                         let result = if !success {
                             Err(error.unwrap_or_else(|| "action failed".into()))
                         } else {

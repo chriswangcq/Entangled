@@ -12,7 +12,6 @@ Infrastructure:
 """
 
 import asyncio
-import hashlib
 import inspect
 import json
 import logging
@@ -41,8 +40,19 @@ class WsSender(Protocol):
     async def send_json(self, data: Any) -> None: ...
 
 from .notifier import register_client, unregister_client, set_store, get_sync_registry
+from .protocol import (
+    build_ack_frame,
+    build_error_frame,
+    build_error_ack_frame,
+    build_page_sync_frame,
+    build_push_frame,
+    build_schema_push_frame,
+    parse_action_frame,
+    parse_disentangle_frame,
+    parse_entangle_frame,
+)
 from .store import EntityStore
-from .sync import resolve_sync, snapshot_for_resolve
+from .sync import _pk_value_from_row, resolve_sync, snapshot_for_resolve
 
 logger = logging.getLogger(__name__)
 
@@ -71,16 +81,15 @@ def create_ws_handler(
     # One-time setup — not per-connection
     set_store(store)
 
-    # Compute schema hash once (recomputed on entity registration changes)
-    _schema_cache: dict = {"hash": "", "data": []}
+    # Compute schema frame once (recomputed on entity registration changes)
+    _schema_cache: dict = {"frame": None}
 
-    def _get_schema_with_hash() -> tuple:
-        """Return (schema_list, schema_hash). Cached."""
+    def _get_schema_push_frame() -> dict:
+        """Return the explicit schema push frame."""
         schema = store.get_schema()
-        h = hashlib.md5(json.dumps(schema, sort_keys=True).encode()).hexdigest()[:12]
-        _schema_cache["hash"] = h
-        _schema_cache["data"] = schema
-        return schema, h
+        frame = build_schema_push_frame(schema, SYNC_CONTRACT_VERSION)
+        _schema_cache["frame"] = frame
+        return frame
 
     async def ws_handler(websocket: WebSocket):
         await websocket.accept()
@@ -121,11 +130,7 @@ def create_ws_handler(
 
         def sync_push(event: str, data: Any):
             """Sync callback for notifier — enqueue with backpressure (drop oldest)."""
-            msg = data if isinstance(data, dict) and data.get("type") == "sync" else {
-                "type": "push",
-                "event": event,
-                "data": data,
-            }
+            msg = build_push_frame(event, data)
             if push_queue.full():
                 try:
                     push_queue.get_nowait()  # Drop oldest to make room
@@ -140,16 +145,7 @@ def create_ws_handler(
 
         # ── Push schema (with hash for dedup) ────────────────────
         try:
-            schema, schema_hash = _get_schema_with_hash()
-            await websocket.send_json({
-                "type": "push",
-                "event": "schema",
-                "data": {
-                    "entities": schema,
-                    "hash": schema_hash,
-                    "syncContractVersion": SYNC_CONTRACT_VERSION,
-                },
-            })
+            await websocket.send_json(_get_schema_push_frame())
         except Exception as e:
             logger.error("[WS] Schema push failed: %s", e)
 
@@ -326,34 +322,40 @@ async def handle_entangle(
         {type: "entangle", entity, params?, before_id, limit?}
         → server sends {type: "sync", entity, params, mode: "page", ...}
     """
-    entity = msg.get("entity", "")
-    params = msg.get("params") or None  # Normalize
-    client_version = msg.get("version")
-    client_head = msg.get("head")
-    depth = msg.get("depth")
-    before_id = msg.get("before_id")
+    try:
+        frame = parse_entangle_frame(msg)
+    except ValueError as e:
+        await ws.send_json(build_error_frame(error=str(e)))
+        return
 
-    if not entity:
-        await ws.send_json({"type": "error", "error": "entity is required"})
+    if not frame.entity:
+        await ws.send_json(build_error_frame(error="entity is required"))
         return
 
     try:
-        store.get_def(entity)
+        store.get_def(frame.entity)
     except KeyError:
-        await ws.send_json({"type": "error", "error": f"Unknown entity: {entity}"})
+        await ws.send_json(build_error_frame(error=f"Unknown entity: {frame.entity}"))
         return
 
     # Deepen window: entangle with before_id → fetch older page
-    if before_id is not None:
-        limit = min(int(msg.get("limit", 50)), 500)
-        request_id = msg.get("request_id") or msg.get("requestId", "")
-        await _entangle_deepen(ws, store, user_id, entity, params, before_id, limit, request_id)
+    if frame.before_id is not None:
+        await _entangle_deepen(
+            ws,
+            store,
+            user_id,
+            frame.entity,
+            frame.params,
+            frame.before_id,
+            frame.limit,
+            frame.request_id,
+        )
         return
 
     # Standard entangle
     await _entangle_one(
-        ws, store, user_id, client_id, entity, params,
-        client_version, client_head, depth,
+        ws, store, user_id, client_id, frame.entity, frame.params,
+        frame.version, frame.head, frame.depth,
     )
 
 
@@ -390,29 +392,21 @@ async def _entangle_deepen(
 
         entries, has_more = await asyncio.to_thread(_fetch)
 
-        await ws.send_json({
-            "type": "sync",
-            "entity": entity,
-            "params": params if params else None,
-            "mode": "page",
-            "data": entries,
-            "hasMore": has_more,
-            "requestId": request_id if request_id else None,
-        })
+        await ws.send_json(build_page_sync_frame(
+            entity=entity,
+            params=params,
+            entries=entries,
+            has_more=has_more,
+            request_id=request_id,
+        ))
     except Exception as e:
         logger.error("[WS] entangle deepen %s failed: %s\n%s", entity, e, traceback.format_exc())
-        await ws.send_json({
-            "type": "error",
-            "entity": entity,
-            "error": str(e),
-            "requestId": request_id if request_id else None,
-        })
+        await ws.send_json(build_error_frame(entity=entity, error=str(e), request_id=request_id))
 
 # ── Disentangle ──────────────────────────────────────────────────
 
 def handle_disentangle(client_id: str, msg: dict, store: Optional[EntityStore] = None) -> None:
-    entity = msg.get("entity", "")
-    params = msg.get("params") or None
+    entity, params = parse_disentangle_frame(msg)
     if not entity:
         return
 
@@ -443,35 +437,34 @@ async def handle_action(
     msg: dict,
 ) -> None:
     """Handle a first-class action message (mutation intent)."""
-    request_id = msg.get("request_id") or msg.get("requestId", "")
-    entity = msg.get("entity", "")
-    op = msg.get("op", "")
-    entity_id = msg.get("id")
-    params = msg.get("params") or {}
-    payload = msg.get("data") or {}
-
-    if not entity:
-        await ws.send_json({"type": "ack", "request_id": request_id, "success": False, "error": "entity is required"})
+    try:
+        frame = parse_action_frame(msg)
+    except ValueError as e:
+        await ws.send_json(build_error_ack_frame("", str(e)))
         return
-    if not op:
-        await ws.send_json({"type": "ack", "request_id": request_id, "success": False, "error": "op is required"})
+
+    if not frame.entity:
+        await ws.send_json(build_error_ack_frame(frame.request_id, "entity is required"))
+        return
+    if not frame.op:
+        await ws.send_json(build_error_ack_frame(frame.request_id, "op is required"))
         return
 
     try:
-        result = await _dispatch_action(store, user_id, entity, op, entity_id, params, payload, request_id)
-        await ws.send_json({
-            "type": "ack",
-            "request_id": request_id,
-            **result,
-        })
+        result = await _dispatch_action(
+            store,
+            user_id,
+            frame.entity,
+            frame.op,
+            frame.entity_id,
+            frame.params,
+            frame.payload,
+            frame.request_id,
+        )
+        await ws.send_json(build_ack_frame(frame.request_id, result))
     except Exception as e:
-        logger.error("[WS] Action %s.%s failed: %s\n%s", entity, op, e, traceback.format_exc())
-        await ws.send_json({
-            "type": "ack",
-            "request_id": request_id,
-            "success": False,
-            "error": str(e),
-        })
+        logger.error("[WS] Action %s.%s failed: %s\n%s", frame.entity, frame.op, e, traceback.format_exc())
+        await ws.send_json(build_error_ack_frame(frame.request_id, str(e)))
 
 
 def _dispatch_action_blocking(

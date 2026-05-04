@@ -7,12 +7,10 @@ real-time delta/snapshot pushes.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import logging
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -31,6 +29,7 @@ from ..server.ws_handler import (
     handle_entangle,
     handle_disentangle,
 )
+from ..server.protocol import build_push_frame, build_schema_push_frame
 
 from .auth import decode_jwt_from_raw
 from .state import get_store
@@ -79,15 +78,6 @@ class _WsSender:
         await self._ws.send_json(data)
 
 
-def _normalize_incoming_msg(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Accept requestId (camelCase) or request_id."""
-    m = dict(raw)
-    rid = m.get("request_id") or m.get("requestId")
-    if rid is not None:
-        m["request_id"] = rid
-    return m
-
-
 async def ws_sync_handler(websocket: WebSocket):
     """WS /v1/sync — the main Entangled sync endpoint."""
 
@@ -127,11 +117,7 @@ async def ws_sync_handler(websocket: WebSocket):
             pass
 
     def sync_push(event: str, data: Any) -> None:
-        msg = data if isinstance(data, dict) and data.get("type") == "sync" else {
-            "type": "push",
-            "event": event,
-            "data": data,
-        }
+        msg = build_push_frame(event, data)
         if push_queue.full():
             try:
                 push_queue.get_nowait()
@@ -170,18 +156,7 @@ async def ws_sync_handler(websocket: WebSocket):
     # 3. Push schema on connect — same frame as Gateway /app/ws and ws_handler.create_ws_handler
     try:
         schema = store.get_schema()
-        schema_hash = hashlib.md5(
-            json.dumps(schema, sort_keys=True).encode()
-        ).hexdigest()[:12]
-        await sender.send_json({
-            "type": "push",
-            "event": "schema",
-            "data": {
-                "entities": schema,
-                "hash": schema_hash,
-                "syncContractVersion": SYNC_CONTRACT_VERSION,
-            },
-        })
+        await sender.send_json(build_schema_push_frame(schema, SYNC_CONTRACT_VERSION))
     except Exception as e:
         logger.warning("[WS] Failed to push schema to %s: %s", client_id, e)
 
@@ -197,7 +172,7 @@ async def ws_sync_handler(websocket: WebSocket):
             elif msg_type == "disentangle":
                 handle_disentangle(client_id, data, store=store)
             elif msg_type == "action":
-                await handle_action(sender, store, user_id, client_id, _normalize_incoming_msg(data))
+                await handle_action(sender, store, user_id, client_id, data)
             elif msg_type == "ping":
                 await sender.send_json({"type": "pong"})
             elif msg_type in ("pong", "heartbeat"):
