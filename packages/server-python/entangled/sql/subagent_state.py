@@ -36,11 +36,6 @@ Rules (state diagram, identical to PR-28's Business-side matrix)
     failed            ──▶ sleeping / awake          (recovery)
     completed, cancelled: terminal (empty out-set)
 
-Legacy enum values (``active``, ``inactive``, ``paused``) exist in
-``SubagentStatus`` for backward compatibility but no current code path
-transitions into them — their out-set is empty so any attempt fails
-fail-loud with ``InvalidTransition``.
-
 Ancillary fields (``extra``)
 ----------------------------
 Business occasionally needs to write ancillary columns atomically with
@@ -76,12 +71,6 @@ ALLOWED_TRANSITIONS: Dict[str, set[str]] = {
     "failed":      {"sleeping", "awake"},
     "completed":   set(),
     "cancelled":   set(),
-    # Legacy enum values — no current writer transitions into these; kept as
-    # empty-set entries so an accidental ``to="active"`` raises instead of
-    # hitting a ``KeyError`` halfway through.
-    "active":      set(),
-    "inactive":    set(),
-    "paused":      set(),
 }
 
 VALID_STATES: frozenset[str] = frozenset(ALLOWED_TRANSITIONS.keys())

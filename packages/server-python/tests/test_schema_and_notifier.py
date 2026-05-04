@@ -124,8 +124,8 @@ def test_scoped_delta_also_pushes_to_unscoped_user_subscription(monkeypatch):
     notifier.reset_state()
 
     class FakeDefn:
-        name = "messages"
-        id_field = "msg_id"
+        name = "agent-activity-records"
+        id_field = "record_id"
         op_log_size = 1000
         relations = []
         user_scoped = True
@@ -135,7 +135,7 @@ def test_scoped_delta_also_pushes_to_unscoped_user_subscription(monkeypatch):
             return [FakeDefn()]
 
         def get_def(self, entity):
-            if entity == "messages":
+            if entity == "agent-activity-records":
                 return FakeDefn()
             raise KeyError(entity)
 
@@ -147,16 +147,16 @@ def test_scoped_delta_also_pushes_to_unscoped_user_subscription(monkeypatch):
 
     notifier.register_client("scoped", "u1", lambda _event, payload: scoped_pushed.append(payload))
     notifier.register_client("unscoped", "u1", lambda _event, payload: unscoped_pushed.append(payload))
-    registry.entangle("scoped", "messages", {"agent_id": "a1"})
-    registry.entangle("unscoped", "messages", None)
+    registry.entangle("scoped", "agent-activity-records", {"agent_id": "a1"})
+    registry.entangle("unscoped", "agent-activity-records", None)
 
     notifier.notify_entity_change(
         "u1",
-        "messages",
+        "agent-activity-records",
         "created",
-        entity_id="m1",
+        entity_id="r1",
         params={"agent_id": "a1"},
-        data={"msg_id": "m1", "agent_id": "a1", "text": "hello"},
+        data={"record_id": "r1", "agent_id": "a1", "text": "hello"},
     )
 
     notifier.unregister_client("scoped")
@@ -170,6 +170,94 @@ def test_scoped_delta_also_pushes_to_unscoped_user_subscription(monkeypatch):
     assert len(unscoped_pushed) == 1
     assert unscoped_pushed[0]["params"] is None
     assert unscoped_pushed[0]["ops"][0]["data"]["agent_id"] == "a1"
+
+
+def test_scoped_clear_pushes_invalidate_to_scoped_and_unscoped_subscriptions(monkeypatch):
+    from entangled.server import notifier
+    from entangled.server.sync import SyncRegistry
+
+    notifier.reset_state()
+
+    class FakeDefn:
+        name = "agent-activity-records"
+        id_field = "record_id"
+        op_log_size = 1000
+        relations = []
+        user_scoped = True
+
+    class FakeStore:
+        def get_all_defs(self):
+            return [FakeDefn()]
+
+        def get_def(self, entity):
+            if entity == "agent-activity-records":
+                return FakeDefn()
+            raise KeyError(entity)
+
+    registry = SyncRegistry()
+    notifier.set_store(FakeStore(), sync_registry=registry)
+
+    scoped_pushed = []
+    unscoped_pushed = []
+
+    notifier.register_client("scoped", "u1", lambda _event, payload: scoped_pushed.append(payload))
+    notifier.register_client("unscoped", "u1", lambda _event, payload: unscoped_pushed.append(payload))
+    registry.entangle("scoped", "agent-activity-records", {"agent_id": "a1"})
+    registry.entangle("unscoped", "agent-activity-records", None)
+
+    notifier.notify_entity_change(
+        "u1",
+        "agent-activity-records",
+        "clear",
+        params={"agent_id": "a1"},
+    )
+
+    notifier.unregister_client("scoped")
+    notifier.unregister_client("unscoped")
+    notifier.reset_state()
+
+    assert scoped_pushed[0]["params"] == {"agent_id": "a1"}
+    assert scoped_pushed[0]["ops"][0]["op"] == "invalidate"
+    assert unscoped_pushed[0]["params"] is None
+    assert unscoped_pushed[0]["ops"][0]["op"] == "invalidate"
+
+
+def test_delete_where_notifies_scoped_invalidate():
+    store = _make_sql_store()
+    defn = _widget_def(
+        key_params=["agent_id"],
+        fields=[
+            F.text("id", primary=True),
+            F.text("user_id", nullable=False, default="", index=True),
+            F.text("agent_id", nullable=False, index=True),
+            F.text("name", nullable=False),
+            F.timestamp("created_at"),
+        ],
+    )
+    store.ensure_schema(defn)
+    store.register(defn)
+    store.create("widgets", "user-1", {"id": "w1", "agent_id": "a1", "name": "one"}, notify=False)
+
+    calls = []
+    store._notify_change = lambda *args, **kwargs: calls.append((args, kwargs))
+
+    assert store.delete_where("widgets", "user-1", params={"agent_id": "a1"}) == 1
+    assert calls == [(("widgets", "clear", "user-1"), {"params": {"agent_id": "a1"}})]
+
+
+def test_cleanup_notifies_invalidate_for_batch_delete():
+    store = _make_sql_store()
+    defn = _widget_def()
+    store.ensure_schema(defn)
+    store.register(defn)
+    store.create("widgets", "user-1", {"id": "w1", "name": "one"}, notify=False)
+    store.create("widgets", "user-1", {"id": "w2", "name": "two"}, notify=False)
+
+    calls = []
+    store._notify_change = lambda *args, **kwargs: calls.append((args, kwargs))
+
+    assert store.cleanup("widgets", "user-1", keep_count=1) == 1
+    assert calls == [(("widgets", "clear", "user-1"), {"params": None})]
 
 
 def test_sync_push_port_override_routes_notify():

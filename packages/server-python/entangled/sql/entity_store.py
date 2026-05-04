@@ -497,7 +497,10 @@ class SqlEntityStore(BaseStore):
             cur = self.db.execute(sql, tuple(values))
         rowcount = cur.rowcount
         if notify and rowcount > 0:
-            self._notify_change(entity, "deleted", user_id, params=params)
+            # Batch deletes do not have per-row ids. Broadcast them as a scoped
+            # invalidate so clients drop the affected projection and resubscribe
+            # from the server snapshot instead of trying to delete id="".
+            self._notify_change(entity, "clear", user_id, params=params)
         return rowcount
 
     def update_where(self, entity: str, user_id: str, data: Dict[str, Any],
@@ -550,7 +553,9 @@ class SqlEntityStore(BaseStore):
             cur = self.db.execute(sql, tuple(all_values))
         rowcount = cur.rowcount
         if notify and rowcount > 0:
-            self._notify_change(entity, "deleted", user_id, params=params)
+            # Cleanup is also a batch delete; clients must invalidate and
+            # resubscribe rather than applying a fake per-row delete.
+            self._notify_change(entity, "clear", user_id, params=params)
         return rowcount
 
     # ── Stream ops ────────────────────────────────────────────────────────

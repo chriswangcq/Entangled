@@ -472,15 +472,6 @@ pub async fn entity_apply_sync(
     Ok(changed.map(|c| c.entity))
 }
 
-/// Clear all cache (on logout / reconnect).
-#[cfg(feature = "tauri")]
-#[tauri::command]
-pub async fn entity_cache_clear(state: tauri::State<'_, EntangledState>) -> Result<(), String> {
-    let cache = &state.cache;
-    cache.clear_all();
-    Ok(())
-}
-
 /// Check if a stream entity has more older items in cache.
 #[cfg(feature = "tauri")]
 #[tauri::command]
