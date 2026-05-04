@@ -40,6 +40,90 @@ fn entity_changed(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{process_sync_with_contract, SyncFrame};
+    use crate::cache::{Cache, CacheKey, SyncOp};
+
+    #[test]
+    fn delta_with_invalidate_reports_invalidated_for_resubscribe() {
+        let cache = Cache::new_in_memory();
+        let key = CacheKey::new_empty("messages");
+        cache.apply_snapshot(
+            &key,
+            &[json!({"id": "m1", "text": "hello"})],
+            1,
+            "id",
+            false,
+        );
+
+        let changed = process_sync_with_contract(
+            &cache,
+            &SyncFrame {
+                entity: "messages".to_string(),
+                params: None,
+                mode: "delta".to_string(),
+                version: 2,
+                id_field: Some("id".to_string()),
+                data: None,
+                has_more: false,
+                base_version: Some(1),
+                ops: Some(vec![SyncOp {
+                    version: 2,
+                    op: "invalidate".to_string(),
+                    id: String::new(),
+                    data: None,
+                    ts: 0.0,
+                    request_id: Some("req-1".to_string()),
+                }]),
+            },
+            2,
+        )
+        .expect("invalidate delta should emit entity change");
+
+        assert_eq!(changed.action, "invalidated");
+        assert_eq!(changed.request_ids, vec!["req-1".to_string()]);
+        assert!(cache.get_list(&key).is_empty());
+        assert_eq!(cache.get_meta(&key).version, 0);
+    }
+
+    #[test]
+    fn ordinary_delta_still_reports_delta() {
+        let cache = Cache::new_in_memory();
+        let key = CacheKey::new_empty("messages");
+        cache.apply_snapshot(&key, &[], 1, "id", false);
+
+        let changed = process_sync_with_contract(
+            &cache,
+            &SyncFrame {
+                entity: "messages".to_string(),
+                params: None,
+                mode: "delta".to_string(),
+                version: 2,
+                id_field: Some("id".to_string()),
+                data: None,
+                has_more: false,
+                base_version: Some(1),
+                ops: Some(vec![SyncOp {
+                    version: 2,
+                    op: "insert".to_string(),
+                    id: "m2".to_string(),
+                    data: Some(json!({"id": "m2", "text": "world"})),
+                    ts: 0.0,
+                    request_id: None,
+                }]),
+            },
+            2,
+        )
+        .expect("insert delta should emit entity change");
+
+        assert_eq!(changed.action, "delta");
+        assert_eq!(cache.get_list(&key).len(), 1);
+    }
+}
+
 /// A change notification for the UI layer.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -149,6 +233,7 @@ pub fn process_sync_with_contract(
         "delta" => {
             let ops = frame.ops.as_ref()?;
             let base = frame.base_version.unwrap_or(0);
+            let has_invalidate = ops.iter().any(|op| op.op == "invalidate");
 
             // Collect requestIds from ops for optimistic confirmation
             let request_ids: Vec<String> = ops.iter()
@@ -160,9 +245,10 @@ pub fn process_sync_with_contract(
                     "[Sync] {} delta v{}→v{} ({} ops, {} requestIds)",
                     frame.entity, base, frame.version, ops.len(), request_ids.len()
                 );
+                let action = if has_invalidate { "invalidated" } else { "delta" };
                 Some(entity_changed(
                     &frame.entity,
-                    "delta",
+                    action,
                     request_ids,
                     &frame.params,
                 ))
