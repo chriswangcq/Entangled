@@ -21,12 +21,12 @@ which gives us:
 * **1 HTTP round-trip per transition.**
 * **Atomicity.** Either the ``subagents.status`` UPDATE and the
   ``subagent_state_transitions`` INSERT both commit or neither does.
-* **Single source of truth for the ALLOWED matrix.** Business still
-  re-exports the names for backward compatibility but the canonical
-  rules live here.
+* **Single source of truth for the transition matrix.** Business sends
+  transition requests and translates Entangled errors; the canonical rules live
+  here.
 
-Rules (state diagram, identical to PR-28's Business-side matrix)
----------------------------------------------------------------
+Rules (state diagram)
+---------------------
 ::
 
     sleeping ⇄ awake
