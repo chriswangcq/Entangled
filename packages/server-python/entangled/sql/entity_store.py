@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..server.store import EntityStore as BaseStore
 from .entity_def import SqlEntityDef
-from .validation import normalize_order_by, validate_field_keys
+from .validation import normalize_order_by, validate_field_key_with_extras, validate_field_keys
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,63 @@ class SqlEntityStore(BaseStore):
             )
         return self._db
 
+    def _dialect(self) -> str:
+        return getattr(self.db, "backend_name", "sqlite")
+
+    def _is_postgres(self) -> bool:
+        return self._dialect() == "postgres"
+
+    def _timestamp_update_expr(self) -> str:
+        if self._is_postgres():
+            return "to_char(timezone('UTC', now()), 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')"
+        return "datetime('now')"
+
+    def _insert_sql(self, table: str, cols: List[str], *, returning: str = "") -> str:
+        ph = ", ".join("?" for _ in cols)
+        sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({ph})"
+        if returning:
+            sql += f" RETURNING {returning}"
+        return sql
+
+    def _insert_row(
+        self,
+        defn: SqlEntityDef,
+        row: Dict[str, Any],
+        *,
+        is_auto_int: bool,
+    ) -> None:
+        cols = list(row.keys())
+        returning = defn.id_field if is_auto_int and self._is_postgres() else ""
+        sql = self._insert_sql(defn.table, cols, returning=returning)
+        values = tuple(row[c] for c in cols)
+        if returning and hasattr(self.db, "insert_returning_id"):
+            returned_id = self.db.insert_returning_id(sql, values)
+            if returned_id is not None:
+                row[defn.id_field] = returned_id
+            return
+        cur = self.db.execute(sql, values)
+        if is_auto_int and getattr(cur, "lastrowid", None):
+                row[defn.id_field] = cur.lastrowid
+
+    def _rowid_column(self) -> str:
+        return "entangled_rowid" if self._is_postgres() else "rowid"
+
+    def _normalize_order_by(self, defn: SqlEntityDef, order_by: str | None) -> str:
+        normalized = normalize_order_by(
+            defn,
+            order_by,
+            extra_fields=[self._rowid_column()],
+        )
+        if not self._is_postgres():
+            return normalized
+        parts = []
+        for part in normalized.split(","):
+            tokens = part.strip().split()
+            if tokens and tokens[0] == "rowid":
+                tokens[0] = "entangled_rowid"
+            parts.append(" ".join(tokens))
+        return ", ".join(parts)
+
     # ── Registration & Schema ─────────────────────────────────────────────
 
     def register(self, entity_def: SqlEntityDef) -> None:
@@ -116,7 +173,8 @@ class SqlEntityStore(BaseStore):
         """Idempotent schema management inside an already-held transaction."""
         if not entity_def.fields:
             return
-        self.db.execute(entity_def.create_table_sql())
+        dialect = getattr(self.db, "backend_name", "sqlite")
+        self.db.execute(entity_def.create_table_sql(dialect=dialect))
         # PR-21 (2026-04-20): ALTER MUST run before index_sqls.
         # Previously the order was reversed, which silently worked for
         # every prior migration because new columns happened to be
@@ -127,12 +185,15 @@ class SqlEntityStore(BaseStore):
         # the ALTER never runs, and the table is left permanently
         # half-migrated. Swap the order so every ALTER commits first
         # and index creation always sees the final column set.
-        existing = self.db.fetchall(f"PRAGMA table_info({entity_def.table})")
-        existing_cols = [r["name"] for r in existing]
-        for alter_sql in entity_def.alter_add_column_sqls(existing_cols):
+        if hasattr(self.db, "table_columns"):
+            existing_cols = self.db.table_columns(entity_def.table)
+        else:
+            existing = self.db.fetchall(f"PRAGMA table_info({entity_def.table})")
+            existing_cols = [r["name"] for r in existing]
+        for alter_sql in entity_def.alter_add_column_sqls(existing_cols, dialect=dialect):
             logger.info("[SqlEntityStore] Migrating: %s", alter_sql)
             self.db.execute(alter_sql)
-        for idx_sql in entity_def.index_sqls():
+        for idx_sql in entity_def.index_sqls(dialect=dialect):
             self.db.execute(idx_sql)
 
     def ensure_all_schemas(self) -> None:
@@ -203,7 +264,7 @@ class SqlEntityStore(BaseStore):
                     where += f" AND {k} NOT IN ({placeholders})"
                     values.extend(vlist)
 
-        order = normalize_order_by(defn, order_by or defn.default_order)
+        order = self._normalize_order_by(defn, order_by or defn.default_order)
         sql = f"SELECT * FROM {defn.table} WHERE {where} ORDER BY {order}"
         if limit:
             sql += f" LIMIT {limit}"
@@ -262,16 +323,22 @@ class SqlEntityStore(BaseStore):
                     where += f" AND {k} NOT IN ({placeholders})"
                     values.extend(vlist)
 
-        order_by = normalize_order_by(defn, order_by or defn.default_order or "rowid DESC")
+        rowid_col = self._rowid_column()
+        order_by = self._normalize_order_by(defn, order_by or defn.default_order or f"{rowid_col} DESC")
         cursor_field = cursor_field or order_by.split(",")[0].strip().split()[0]
-        validate_field_keys(defn, [cursor_field], label="cursor field")
+        validate_field_key_with_extras(
+            defn,
+            cursor_field,
+            label="cursor field",
+            extra_fields=[rowid_col],
+        )
         if before_id:
             ref = self.db.fetchone(
-                f"SELECT {cursor_field} AS _cf, rowid AS _rid FROM {defn.table} WHERE {defn.id_field} = ?",
+                f"SELECT {cursor_field} AS _cf, {rowid_col} AS _rid FROM {defn.table} WHERE {defn.id_field} = ?",
                 (before_id,),
             )
             if ref:
-                where += f" AND ({cursor_field} < ? OR ({cursor_field} = ? AND rowid < ?))"
+                where += f" AND ({cursor_field} < ? OR ({cursor_field} = ? AND {rowid_col} < ?))"
                 values.extend([ref["_cf"], ref["_cf"], ref["_rid"]])
         elif after_id:
             where += f" AND {defn.id_field} > ?"
@@ -303,16 +370,22 @@ class SqlEntityStore(BaseStore):
                     values.extend(vlist)
 
         raw_order = defn.default_order or "created_at"
-        normalize_order_by(defn, raw_order)
+        rowid_col = self._rowid_column()
+        raw_order = self._normalize_order_by(defn, raw_order)
         cursor_field = raw_order.split(",")[0].strip().split()[0]
-        validate_field_keys(defn, [cursor_field], label="cursor field")
+        validate_field_key_with_extras(
+            defn,
+            cursor_field,
+            label="cursor field",
+            extra_fields=[rowid_col],
+        )
         ref = self.db.fetchone(
-            f"SELECT {cursor_field} AS _cf, rowid AS _rid FROM {defn.table} WHERE {defn.id_field} = ?",
+            f"SELECT {cursor_field} AS _cf, {rowid_col} AS _rid FROM {defn.table} WHERE {defn.id_field} = ?",
             (before_id,),
         )
         if not ref:
             return False
-        where += f" AND ({cursor_field} < ? OR ({cursor_field} = ? AND rowid < ?))"
+        where += f" AND ({cursor_field} < ? OR ({cursor_field} = ? AND {rowid_col} < ?))"
         values.extend([ref["_cf"], ref["_cf"], ref["_rid"]])
         row = self.db.fetchone(
             f"SELECT EXISTS(SELECT 1 FROM {defn.table} WHERE {where}) AS has_more",
@@ -373,14 +446,10 @@ class SqlEntityStore(BaseStore):
 
         self._apply_defaults(defn, row)
         self._check_required(defn, row)
-        cols = list(row.keys())
-        ph = ", ".join("?" for _ in cols)
-        sql = f"INSERT INTO {defn.table} ({', '.join(cols)}) VALUES ({ph})"
         with self.db.transaction(defn.lock_type, resource_id=res_id or ""):
-            cur = self.db.execute(sql, tuple(row[c] for c in cols))
-            if is_auto_int and cur.lastrowid:
-                row[defn.id_field] = cur.lastrowid
-                res_id = str(cur.lastrowid)
+            self._insert_row(defn, row, is_auto_int=bool(is_auto_int))
+            if is_auto_int and row.get(defn.id_field):
+                res_id = str(row[defn.id_field])
         entity_id = str(row.get(defn.id_field, res_id))
         result = self._sql_get(defn, user_id, entity_id, params=params)
         return result or row
@@ -395,7 +464,7 @@ class SqlEntityStore(BaseStore):
             set_parts.append(f"{k} = ?")
             set_vals.append(v)
         if defn.tracks_updated_at_column:
-            set_parts.append("updated_at = datetime('now')")
+            set_parts.append(f"updated_at = {self._timestamp_update_expr()}")
         where, where_vals = self._scope_where(defn, user_id, params)
         where += f" AND {defn.id_field} = ?"
         where_vals.append(entity_id)
@@ -429,7 +498,7 @@ class SqlEntityStore(BaseStore):
         ph = ", ".join("?" for _ in cols)
         update_parts = [f"{c} = excluded.{c}" for c in cols if c != defn.id_field]
         if defn.tracks_updated_at_column:
-            update_parts.append("updated_at = datetime('now')")
+            update_parts.append(f"updated_at = {self._timestamp_update_expr()}")
         sql = (
             f"INSERT INTO {defn.table} ({', '.join(cols)}) VALUES ({ph})"
             f" ON CONFLICT({defn.id_field}) DO UPDATE SET {', '.join(update_parts)}"
@@ -455,7 +524,7 @@ class SqlEntityStore(BaseStore):
             set_parts.append(f"{k} = ?")
             set_vals.append(v)
         if defn.tracks_updated_at_column:
-            set_parts.append("updated_at = datetime('now')")
+            set_parts.append(f"updated_at = {self._timestamp_update_expr()}")
         where, where_vals = self._scope_where(defn, user_id, params)
         placeholders = ",".join("?" for _ in entity_ids)
         where += f" AND {defn.id_field} IN ({placeholders})"
@@ -516,7 +585,7 @@ class SqlEntityStore(BaseStore):
             set_parts.append(f"{k} = ?")
             set_vals.append(v)
         if defn.tracks_updated_at_column:
-            set_parts.append("updated_at = datetime('now')")
+            set_parts.append(f"updated_at = {self._timestamp_update_expr()}")
         where, where_vals = self._scope_where(defn, user_id, params)
         if filters:
             validate_field_keys(defn, filters.keys(), label="filter field")
@@ -536,7 +605,8 @@ class SqlEntityStore(BaseStore):
                 *, params: Optional[Dict[str, str]] = None,
                 order_by: Optional[str] = None, notify: bool = True) -> int:
         defn = self.get_def(entity)
-        order = normalize_order_by(defn, order_by or defn.default_order or "rowid DESC")
+        rowid_col = self._rowid_column()
+        order = self._normalize_order_by(defn, order_by or defn.default_order or f"{rowid_col} DESC")
         where, values = self._scope_where(defn, user_id, params)
         keep_sql = (
             f"SELECT {defn.id_field} FROM {defn.table} "
@@ -588,14 +658,10 @@ class SqlEntityStore(BaseStore):
         lock_id = res_id or (params.get(defn.key_params[0], "") if params and defn.key_params else "") or "auto"
         self._apply_defaults(defn, row)
         self._check_required(defn, row)
-        cols = list(row.keys())
-        ph = ", ".join("?" for _ in cols)
-        sql = f"INSERT INTO {defn.table} ({', '.join(cols)}) VALUES ({ph})"
         with self.db.transaction(defn.lock_type, resource_id=lock_id):
-            cur = self.db.execute(sql, tuple(row[c] for c in cols))
-            if is_auto_int and cur.lastrowid:
-                row[defn.id_field] = cur.lastrowid
-                res_id = str(cur.lastrowid)
+            self._insert_row(defn, row, is_auto_int=bool(is_auto_int))
+            if is_auto_int and row.get(defn.id_field):
+                res_id = str(row[defn.id_field])
         entity_id = str(row.get(defn.id_field, res_id))
         result = self.get(entity, user_id, entity_id, params=params) or row
         if notify:
@@ -621,7 +687,7 @@ class SqlEntityStore(BaseStore):
         update_parts = [f"{c} = ?" for c in cols]
         values = [row[c] for c in cols]
         if defn.tracks_updated_at_column:
-            update_parts.append("updated_at = datetime('now')")
+            update_parts.append(f"updated_at = {self._timestamp_update_expr()}")
         where, where_values = self._scope_where(defn, user_id, params)
         validate_field_keys(defn, where_condition.keys(), label="CAS condition field")
         for k, v in where_condition.items():
@@ -764,7 +830,10 @@ class SqlEntityStore(BaseStore):
                 result[has_key] = bool(result[h])
         for k in list(result.keys()):
             if k in fm:
-                result[k] = fm[k].serialize(result[k])
+                if self._is_postgres() and fm[k].is_bool and result[k] is not None:
+                    result[k] = bool(result[k])
+                else:
+                    result[k] = fm[k].serialize(result[k])
         return result
 
     def _apply_defaults(self, defn: SqlEntityDef, row: Dict[str, Any]) -> Dict[str, Any]:

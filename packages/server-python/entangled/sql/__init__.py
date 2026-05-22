@@ -18,7 +18,7 @@ service with:
 from .field_def import FieldDef, FieldKind, F
 from .entity_def import SqlEntityDef
 from .entity_store import SqlEntityStore
-from .database import Database
+from .database import Database, PostgresDatabase, create_database
 from .locks import DatabaseLockManager, FIFOLock, ShardedFIFOLock
 from .persistence import load_all_sync_versions, make_version_bump_handler
 
@@ -33,6 +33,8 @@ __all__ = [
     "SqlEntityStore",
     # Database
     "Database",
+    "PostgresDatabase",
+    "create_database",
     "DatabaseLockManager",
     "FIFOLock",
     "ShardedFIFOLock",
