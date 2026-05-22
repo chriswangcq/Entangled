@@ -10,15 +10,45 @@ from ..server.sync import SyncRegistry
 logger = logging.getLogger(__name__)
 
 
-def ensure_sync_versions_table(db) -> None:
-    """Create the entangled_sync_versions table if it doesn't exist."""
-    with db.transaction("global"):
-        db.execute("""
+def _is_postgres(db) -> bool:
+    return getattr(db, "backend_name", "sqlite") == "postgres"
+
+
+def sync_versions_create_table_sql(db) -> str:
+    if _is_postgres(db):
+        return """
+            CREATE TABLE IF NOT EXISTS entangled_sync_versions (
+                state_key text PRIMARY KEY,
+                version bigint NOT NULL DEFAULT 0 CHECK (version >= 0)
+            )
+        """
+    return """
             CREATE TABLE IF NOT EXISTS entangled_sync_versions (
                 state_key TEXT PRIMARY KEY,
                 version INTEGER NOT NULL DEFAULT 0
             )
-        """)
+        """
+
+
+def sync_version_upsert_sql(db) -> str:
+    if _is_postgres(db):
+        return (
+            "INSERT INTO entangled_sync_versions (state_key, version) "
+            "VALUES (?, ?) "
+            "ON CONFLICT(state_key) DO UPDATE SET "
+            "version = GREATEST(entangled_sync_versions.version, excluded.version)"
+        )
+    return (
+        "INSERT INTO entangled_sync_versions (state_key, version) "
+        "VALUES (?, ?) "
+        "ON CONFLICT(state_key) DO UPDATE SET version = excluded.version"
+    )
+
+
+def ensure_sync_versions_table(db) -> None:
+    """Create the entangled_sync_versions table if it doesn't exist."""
+    with db.transaction("global"):
+        db.execute(sync_versions_create_table_sql(db))
 
 
 def load_all_sync_versions(db, registry: SyncRegistry) -> None:
@@ -50,12 +80,7 @@ def make_version_bump_handler(db) -> Callable[[str, int], None]:
     def _on_version_bump(state_key: str, version: int) -> None:
         try:
             with db.transaction("global"):
-                db.execute(
-                    "INSERT INTO entangled_sync_versions (state_key, version) "
-                    "VALUES (?, ?) "
-                    "ON CONFLICT(state_key) DO UPDATE SET version = excluded.version",
-                    (state_key, version),
-                )
+                db.execute(sync_version_upsert_sql(db), (state_key, version))
         except Exception as e:
             logger.warning("[SyncPersistence] Failed to persist version for %s: %s", state_key, e)
 

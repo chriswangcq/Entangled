@@ -12,7 +12,10 @@ from dataclasses import dataclass
 class ServiceConfig:
     host: str = "0.0.0.0"
     port: int = 19900
+    db_backend: str = "sqlite"
     db_path: str = "data/entangled.db"
+    postgres_dsn: str = ""
+    postgres_dsn_file: str = ""
     jwt_secret: str = ""
     service_token: str = ""
     log_level: str = "INFO"

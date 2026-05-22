@@ -65,8 +65,18 @@ def _field_names(defn: SqlEntityDef) -> set[str]:
 
 
 def validate_field_key(defn: SqlEntityDef, key: str, *, label: str = "field") -> None:
+    validate_field_key_with_extras(defn, key, label=label)
+
+
+def validate_field_key_with_extras(
+    defn: SqlEntityDef,
+    key: str,
+    *,
+    label: str = "field",
+    extra_fields: Iterable[str] = (),
+) -> None:
     validate_sql_identifier(key, label=label)
-    allowed = _field_names(defn) | {"rowid"}
+    allowed = _field_names(defn) | {"rowid"} | set(extra_fields)
     if key not in allowed:
         raise SchemaValidationError(
             f"unknown {label} {key!r} for entity {defn.name!r}"
@@ -83,7 +93,12 @@ def validate_field_keys(
         validate_field_key(defn, str(key), label=label)
 
 
-def normalize_order_by(defn: SqlEntityDef, order_by: str | None) -> str:
+def normalize_order_by(
+    defn: SqlEntityDef,
+    order_by: str | None,
+    *,
+    extra_fields: Iterable[str] = (),
+) -> str:
     """Validate and return a canonical ORDER BY fragment.
 
     Supported shape is intentionally small: ``field`` or ``field ASC|DESC``,
@@ -104,7 +119,12 @@ def normalize_order_by(defn: SqlEntityDef, order_by: str | None) -> str:
                 f"unsupported order_by segment {part!r} for entity {defn.name!r}"
             )
         field = tokens[0]
-        validate_field_key(defn, field, label="order_by field")
+        validate_field_key_with_extras(
+            defn,
+            field,
+            label="order_by field",
+            extra_fields=extra_fields,
+        )
         if len(tokens) == 2:
             direction = tokens[1].upper()
             if direction not in {"ASC", "DESC"}:
@@ -179,4 +199,3 @@ def validate_schema_batch(
 
     for defn in batch_defs:
         validate_entity_def(defn, known_defs=candidate)
-
