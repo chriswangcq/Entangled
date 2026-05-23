@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from entangled.app import state
-from entangled.sql.database import Database, PostgresDatabase, create_database
+from entangled.sql.database import PostgresDatabase, create_database
 
 
 class _FakeCursor:
@@ -67,19 +67,9 @@ class _FakePool:
         self.closed = True
 
 
-def test_create_database_requires_explicit_backend(tmp_path: Path):
-    sqlite_db = create_database(backend="sqlite", db_path=tmp_path / "entangled.db")
-    assert isinstance(sqlite_db, Database)
-
-    postgres_db = create_database(
-        backend="postgres",
-        db_path=tmp_path / "ignored.db",
-        postgres_dsn="dbname=test",
-    )
+def test_create_database_returns_postgres_boundary():
+    postgres_db = create_database(postgres_dsn="dbname=test")
     assert isinstance(postgres_db, PostgresDatabase)
-
-    with pytest.raises(ValueError):
-        create_database(backend="mysql", db_path=tmp_path / "ignored.db")
 
 
 def test_postgres_connect_requires_dsn():
@@ -150,10 +140,14 @@ def test_postgres_transaction_rolls_back_on_exception(tmp_path: Path):
 def test_state_postgres_misconfig_does_not_poison_singleton(tmp_path: Path):
     state.close_database()
     with pytest.raises(ValueError):
-        state.init_database(str(tmp_path / "ignored.db"), backend="postgres")
+        state.init_database()
 
-    sqlite_db = state.init_database(str(tmp_path / "entangled.db"), backend="sqlite")
+    dsn_file = tmp_path / "dsn"
+    dsn_file.write_text("dbname=entangled_test", encoding="utf-8")
+    fake_pool = _FakePool()
+    db = PostgresDatabase(dsn_file=dsn_file, pool_factory=lambda *_args, **_kwargs: fake_pool)
+    db.connect()
     try:
-        assert isinstance(sqlite_db, Database)
+        assert isinstance(db, PostgresDatabase)
     finally:
-        state.close_database()
+        db.close()

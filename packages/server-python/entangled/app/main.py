@@ -2,7 +2,7 @@
 
 Usage:
     python -m entangled.app.main
-    python -m entangled.app.main --port 8080 --db-path data/my.db
+    python -m entangled.app.main --port 8080 --postgres-dsn-file /path/to/dsn
 """
 
 import argparse
@@ -17,8 +17,6 @@ def main():
     parser = argparse.ArgumentParser(description="Entangled Service")
     parser.add_argument("--host", default=None, help="Host to bind")
     parser.add_argument("--port", type=int, default=None, help="Port to listen")
-    parser.add_argument("--db-backend", choices=("sqlite", "postgres"), default=None, help="Database backend")
-    parser.add_argument("--db-path", default=None, help="SQLite database path")
     parser.add_argument("--postgres-dsn", default=None, help="Postgres DSN for Entangled")
     parser.add_argument("--postgres-dsn-file", default=None, help="File containing Postgres DSN for Entangled")
     parser.add_argument("--service-token", default=None, help="Service-to-service auth token (shared JWT secret)")
@@ -31,10 +29,6 @@ def main():
         config.host = args.host
     if args.port:
         config.port = args.port
-    if args.db_backend:
-        config.db_backend = args.db_backend
-    if args.db_path:
-        config.db_path = args.db_path
     if args.postgres_dsn:
         config.postgres_dsn = args.postgres_dsn
     if args.postgres_dsn_file:

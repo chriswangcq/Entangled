@@ -27,7 +27,6 @@ dev = ["pytest", "httpx", "uvicorn", "starlette>=0.27"]
 
 [project.scripts]
 entangled-service = "entangled.app.main:main"
-entangled-migrate-postgres = "entangled.sql.migration_cli:main"
 entangled-ws-smoke = "entangled.tools.ws_smoke:main"
 
 [tool.pytest.ini_options]

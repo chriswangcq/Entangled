@@ -171,7 +171,7 @@ class SyncRegistry:
         self._states: Dict[str, SyncState] = {}
         self._client_subs: Dict[str, Set[str]] = {}
         self._op_log_sizes: Dict[str, int] = {}  # entity → maxlen
-        # Optional: persist (state_key, current_version) after each mutation (e.g. host SQLite).
+        # Optional: persist (state_key, current_version) after each mutation.
         self._on_version_bump = on_version_bump
 
     def hydrate_versions(self, versions: Dict[str, int]) -> None:

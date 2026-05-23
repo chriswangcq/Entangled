@@ -20,9 +20,8 @@ class SchemaValidationError(ValueError):
 _ENTITY_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 _SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# SQLite keyword list from https://www.sqlite.org/lang_keywords.html. Keep it
-# local so validation does not depend on sqlite3 optional keyword APIs.
-SQLITE_RESERVED_KEYWORDS = {
+# Conservative SQL keyword list kept local so validation has no optional DB API dependency.
+SQL_RESERVED_KEYWORDS = {
     "ABORT", "ACTION", "ADD", "AFTER", "ALL", "ALTER", "ALWAYS", "ANALYZE",
     "AND", "AS", "ASC", "ATTACH", "AUTOINCREMENT", "BEFORE", "BEGIN",
     "BETWEEN", "BY", "CASCADE", "CASE", "CAST", "CHECK", "COLLATE",
@@ -56,7 +55,7 @@ def validate_entity_name(name: str) -> None:
 def validate_sql_identifier(name: str, *, label: str = "identifier") -> None:
     if not name or not _SQL_IDENTIFIER_RE.match(name):
         raise SchemaValidationError(f"invalid SQL {label}: {name!r}")
-    if name.upper() in SQLITE_RESERVED_KEYWORDS:
+    if name.upper() in SQL_RESERVED_KEYWORDS:
         raise SchemaValidationError(f"reserved SQL {label}: {name!r}")
 
 

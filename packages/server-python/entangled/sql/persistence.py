@@ -1,4 +1,4 @@
-"""Sync version persistence — save/load SyncRegistry versions to SQLite."""
+"""Sync version persistence — save/load SyncRegistry versions to Postgres."""
 
 from __future__ import annotations
 
@@ -10,38 +10,21 @@ from ..server.sync import SyncRegistry
 logger = logging.getLogger(__name__)
 
 
-def _is_postgres(db) -> bool:
-    return getattr(db, "backend_name", "sqlite") == "postgres"
-
-
-def sync_versions_create_table_sql(db) -> str:
-    if _is_postgres(db):
-        return """
-            CREATE TABLE IF NOT EXISTS entangled_sync_versions (
-                state_key text PRIMARY KEY,
-                version bigint NOT NULL DEFAULT 0 CHECK (version >= 0)
-            )
-        """
+def sync_versions_create_table_sql(_db) -> str:
     return """
-            CREATE TABLE IF NOT EXISTS entangled_sync_versions (
-                state_key TEXT PRIMARY KEY,
-                version INTEGER NOT NULL DEFAULT 0
-            )
-        """
-
-
-def sync_version_upsert_sql(db) -> str:
-    if _is_postgres(db):
-        return (
-            "INSERT INTO entangled_sync_versions (state_key, version) "
-            "VALUES (?, ?) "
-            "ON CONFLICT(state_key) DO UPDATE SET "
-            "version = GREATEST(entangled_sync_versions.version, excluded.version)"
+        CREATE TABLE IF NOT EXISTS entangled_sync_versions (
+            state_key text PRIMARY KEY,
+            version bigint NOT NULL DEFAULT 0 CHECK (version >= 0)
         )
+    """
+
+
+def sync_version_upsert_sql(_db) -> str:
     return (
         "INSERT INTO entangled_sync_versions (state_key, version) "
         "VALUES (?, ?) "
-        "ON CONFLICT(state_key) DO UPDATE SET version = excluded.version"
+        "ON CONFLICT(state_key) DO UPDATE SET "
+        "version = GREATEST(entangled_sync_versions.version, excluded.version)"
     )
 
 

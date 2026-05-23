@@ -37,12 +37,10 @@ def create_app(config: ServiceConfig) -> FastAPI:
 
         # 1. Database
         db = init_database(
-            db_path=config.db_path,
-            backend=config.db_backend,
             postgres_dsn=config.postgres_dsn,
             postgres_dsn_file=config.postgres_dsn_file,
         )
-        logger.info("Database initialized: backend=%s path=%s", config.db_backend, config.db_path)
+        logger.info("Database initialized: backend=postgres")
 
         # 2. Sync version persistence table
         ensure_sync_versions_table(db)

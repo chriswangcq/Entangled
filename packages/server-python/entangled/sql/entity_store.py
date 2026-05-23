@@ -1,4 +1,4 @@
-"""SqlEntityStore — pure SQL storage engine backed by SQLite.
+"""SqlEntityStore — Postgres-backed SQL storage engine.
 
 Inherits Entangled's EntityStore (fn-pointer dispatch) and provides
 concrete SQL implementations for all CRUD + advanced operations.
@@ -47,9 +47,9 @@ class SqlEntityStore(BaseStore):
     - Change notification via Entangled's push system
 
     Usage:
-        from entangled.sql import SqlEntityStore, SqlEntityDef, F, Database
+        from entangled.sql import SqlEntityStore, SqlEntityDef, F, PostgresDatabase
 
-        db = Database(Path("data/app.db"))
+        db = PostgresDatabase(dsn_file=Path("/opt/novaic/postgres/secrets/novaic_entangled_dsn"))
         db.connect()
         store = SqlEntityStore(db=db)
         store.register(my_def)
@@ -70,15 +70,13 @@ class SqlEntityStore(BaseStore):
         return self._db
 
     def _dialect(self) -> str:
-        return getattr(self.db, "backend_name", "sqlite")
+        return getattr(self.db, "backend_name", "postgres")
 
     def _is_postgres(self) -> bool:
         return self._dialect() == "postgres"
 
     def _timestamp_update_expr(self) -> str:
-        if self._is_postgres():
-            return "to_char(timezone('UTC', now()), 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')"
-        return "datetime('now')"
+        return "to_char(timezone('UTC', now()), 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')"
 
     def _insert_sql(self, table: str, cols: List[str], *, returning: str = "") -> str:
         ph = ", ".join("?" for _ in cols)
@@ -108,7 +106,7 @@ class SqlEntityStore(BaseStore):
                 row[defn.id_field] = cur.lastrowid
 
     def _rowid_column(self) -> str:
-        return "entangled_rowid" if self._is_postgres() else "rowid"
+        return "entangled_rowid"
 
     def _normalize_order_by(self, defn: SqlEntityDef, order_by: str | None) -> str:
         normalized = normalize_order_by(
@@ -116,8 +114,6 @@ class SqlEntityStore(BaseStore):
             order_by,
             extra_fields=[self._rowid_column()],
         )
-        if not self._is_postgres():
-            return normalized
         parts = []
         for part in normalized.split(","):
             tokens = part.strip().split()
@@ -173,7 +169,7 @@ class SqlEntityStore(BaseStore):
         """Idempotent schema management inside an already-held transaction."""
         if not entity_def.fields:
             return
-        dialect = getattr(self.db, "backend_name", "sqlite")
+        dialect = getattr(self.db, "backend_name", "postgres")
         self.db.execute(entity_def.create_table_sql(dialect=dialect))
         # PR-21 (2026-04-20): ALTER MUST run before index_sqls.
         # Previously the order was reversed, which silently worked for
@@ -185,11 +181,7 @@ class SqlEntityStore(BaseStore):
         # the ALTER never runs, and the table is left permanently
         # half-migrated. Swap the order so every ALTER commits first
         # and index creation always sees the final column set.
-        if hasattr(self.db, "table_columns"):
-            existing_cols = self.db.table_columns(entity_def.table)
-        else:
-            existing = self.db.fetchall(f"PRAGMA table_info({entity_def.table})")
-            existing_cols = [r["name"] for r in existing]
+        existing_cols = self.db.table_columns(entity_def.table)
         for alter_sql in entity_def.alter_add_column_sqls(existing_cols, dialect=dialect):
             logger.info("[SqlEntityStore] Migrating: %s", alter_sql)
             self.db.execute(alter_sql)
@@ -876,8 +868,8 @@ class SqlEntityStore(BaseStore):
         fields the *schema* says are caller-must-provide (i.e. nullable=False
         AND default is None). Those are business invariants — we'd rather
         fail loudly at the Python layer with an actionable message than let
-        the write reach SQLite and surface as the opaque
-        ``IntegrityError: NOT NULL constraint failed: <table>.<col>``
+        the write reach the database and surface as an opaque
+        integrity error
         (which an HTTP 400 hands back to the caller with no field attribution).
 
         PR-33 §"no silent failure" motivation: the failure already happens,

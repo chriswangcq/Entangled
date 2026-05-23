@@ -2,7 +2,7 @@
 Entangled App — batteries-included standalone service.
 
 Provides a turnkey FastAPI application with:
-  - SQLite-backed entity store (from entangled.sql)
+  - Postgres-backed entity store (from entangled.sql)
   - WebSocket sync endpoint
   - REST CRUD API
   - Schema registration API

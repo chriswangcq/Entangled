@@ -14,7 +14,7 @@ packages/server-python/entangled/
 ```
 
 - `entangled.server` — 通用协议引擎，无 I/O 依赖
-- `entangled.sql` — SQLite 存储实现（`pip install entangled-server` 即可用）
+- `entangled.sql` — SQL 存储层（服务端当前使用 Postgres）
 - `entangled.app` — 开箱即用的独立服务（`pip install entangled-server[app]`）
 
 ## 快速启动（独立服务）
@@ -23,10 +23,10 @@ packages/server-python/entangled/
 # 从源码
 cd packages/server-python
 pip install -e ".[app]"
-python -m entangled.app.main --port 19900 --db-path data/entangled.db
+python -m entangled.app.main --port 19900 --postgres-dsn-file /opt/novaic/postgres/secrets/novaic_entangled_dsn
 
 # 或直接 CLI
-entangled-service --port 19900
+entangled-service --port 19900 --postgres-dsn-file /opt/novaic/postgres/secrets/novaic_entangled_dsn
 ```
 
 运行配置通过 CLI 参数传入，`packages/server-python/entangled/app/config.py`
@@ -36,7 +36,7 @@ entangled-service --port 19900
 |------|--------|------|
 | `--host` | `0.0.0.0` | 绑定地址 |
 | `--port` | `19900` | 端口 |
-| `--db-path` | `data/entangled.db` | SQLite 路径 |
+| `--postgres-dsn-file` | _(必填)_ | Postgres DSN 文件 |
 | `--service-token` | _(空)_ | 服务间认证 token，同时作为 `jwt_secret` |
 | `--log-level` | `INFO` | 日志级别 |
 

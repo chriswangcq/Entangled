@@ -138,7 +138,7 @@ def transition(
     Parameters
     ----------
     db
-        ``entangled.sql.database.Database`` (or a test double with the
+        ``entangled.sql.database.PostgresDatabase`` (or a test double with the
         same ``execute`` / ``transaction`` shape).
     subagent_id, agent_id
         Composite key into ``subagents``.
@@ -329,11 +329,7 @@ def _apply_extras(
 
 
 def _now_iso_from_ms(ms: int) -> str:
-    """``subagents.updated_at`` is declared TEXT with a ``datetime('now')``
-    default; we preserve that format so the column stays visually
-    consistent with legacy rows. SQLite's ``datetime(?, 'unixepoch')``
-    would work too, but doing the conversion here keeps the caller in
-    Python land where it's easier to unit test."""
+    """Return the canonical wire format for ``subagents.updated_at``."""
     from datetime import datetime, timezone
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S"

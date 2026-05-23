@@ -233,8 +233,7 @@ async def _entangle_one(
     registry.entangle(client_id, entity, params)
 
     state = registry.get_state(entity, params)
-    # Copy op-log/version before any await — then run resolve_sync + DB in a worker thread
-    # (Gateway Database uses thread-local SQLite connections).
+    # Copy op-log/version before any await, then run resolve_sync + DB in a worker thread.
     snap = snapshot_for_resolve(state)
 
     def fetch_data(limit=None):

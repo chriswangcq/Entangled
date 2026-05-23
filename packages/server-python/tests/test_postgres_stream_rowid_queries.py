@@ -71,20 +71,6 @@ def test_postgres_list_stream_uses_entangled_rowid_for_before_cursor():
     assert page_params == ("u1", "2026-05-22T00:00:00.000Z", "2026-05-22T00:00:00.000Z", 9, 5)
 
 
-def test_sqlite_list_stream_still_uses_rowid():
-    db = _FakeDb("sqlite")
-    db.fetchone_rows.append({"_cf": "2026-05-22T00:00:00.000Z", "_rid": 9})
-    store = SqlEntityStore(db=db)
-    store.register(_stream_def())
-
-    store.list_stream("messages", "u1", before_id="m9", limit=5)
-
-    ref_sql, _ref_params = db.fetchone_calls[0]
-    page_sql, _page_params = db.fetchall_calls[0]
-    assert "rowid AS _rid" in ref_sql
-    assert "rowid < ?" in page_sql
-
-
 def test_postgres_exists_before_uses_entangled_rowid():
     db = _FakeDb("postgres")
     db.fetchone_rows.extend([

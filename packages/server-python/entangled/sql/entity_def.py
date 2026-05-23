@@ -47,7 +47,7 @@ class SqlEntityDef(BaseEntityDef):
     default_not_in_filters: Dict[str, List[Any]] = field(default_factory=dict)
     # ── DDL ────────────────────────────────────────────────────────────────
 
-    def create_table_sql(self, dialect: str = "sqlite") -> str:
+    def create_table_sql(self, dialect: str = "postgres") -> str:
         """Generate CREATE TABLE IF NOT EXISTS SQL."""
         if not self.fields:
             raise ValueError(f"SqlEntityDef '{self.name}' has no fields, cannot generate DDL")
@@ -66,7 +66,7 @@ class SqlEntityDef(BaseEntityDef):
         cols = ",\n    ".join(all_parts)
         return f"CREATE TABLE IF NOT EXISTS {self.table} (\n    {cols}\n);"
 
-    def index_sqls(self, dialect: str = "sqlite") -> List[str]:
+    def index_sqls(self, dialect: str = "postgres") -> List[str]:
         """Generate all index DDL statements."""
         normalized = dialect.lower().strip()
         stmts = []
@@ -83,7 +83,7 @@ class SqlEntityDef(BaseEntityDef):
             )
         return stmts
 
-    def alter_add_column_sqls(self, existing_cols: List[str], dialect: str = "sqlite") -> List[str]:
+    def alter_add_column_sqls(self, existing_cols: List[str], dialect: str = "postgres") -> List[str]:
         """Generate ALTER TABLE ADD COLUMN for missing columns (idempotent migration)."""
         normalized = dialect.lower().strip()
         stmts = []

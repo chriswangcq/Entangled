@@ -19,10 +19,10 @@ class FieldKind(str, Enum):
     INTEGER = "INTEGER"
     REAL = "REAL"
     BLOB = "BLOB"
-    # Semantic types (stored as TEXT/INTEGER, with auto-serialization)
-    JSON = "JSON"           # → TEXT + json.dumps/loads
-    BOOL = "BOOL"           # → INTEGER + bool/int conversion
-    TIMESTAMP = "TIMESTAMP" # → TEXT + auto datetime('now')
+    # Semantic types (serialized by the entity store boundary)
+    JSON = "JSON"
+    BOOL = "BOOL"
+    TIMESTAMP = "TIMESTAMP"
 
 
 @dataclass
@@ -34,7 +34,7 @@ class FieldDef:
         kind:     Column type (FieldKind)
         primary:  Whether this is the primary key
         nullable: Whether NULL is allowed (False → NOT NULL)
-        default:  Default value (None → no DEFAULT clause, "NOW" → datetime('now'))
+        default:  Default value (None → no DEFAULT clause, "NOW" → current UTC timestamp)
         unique:   Whether to add a UNIQUE constraint
         index:    Whether to create a standalone index
         ref:      Foreign key reference (e.g. "agents(id) ON DELETE CASCADE")
@@ -55,20 +55,11 @@ class FieldDef:
     @property
     def sql_type(self) -> str:
         """Return the actual SQL storage type."""
-        return self.sql_type_for("sqlite")
+        return self.sql_type_for("postgres")
 
-    def sql_type_for(self, dialect: str = "sqlite") -> str:
+    def sql_type_for(self, dialect: str = "postgres") -> str:
         """Return the actual SQL storage type for a database dialect."""
         normalized = dialect.lower().strip()
-        sqlite_map = {
-            FieldKind.TEXT:      "TEXT",
-            FieldKind.INTEGER:   "INTEGER",
-            FieldKind.REAL:      "REAL",
-            FieldKind.BLOB:      "BLOB",
-            FieldKind.JSON:      "TEXT",
-            FieldKind.BOOL:      "INTEGER",
-            FieldKind.TIMESTAMP: "TEXT",
-        }
         postgres_map = {
             FieldKind.TEXT:      "text",
             FieldKind.INTEGER:   "bigint",
@@ -78,38 +69,30 @@ class FieldDef:
             FieldKind.BOOL:      "boolean",
             FieldKind.TIMESTAMP: "text",
         }
-        if normalized == "sqlite":
-            return sqlite_map[self.kind]
         if normalized == "postgres":
             return postgres_map[self.kind]
         raise ValueError(f"unsupported SQL dialect: {dialect}")
 
-    def column_ddl(self, dialect: str = "sqlite") -> str:
+    def column_ddl(self, dialect: str = "postgres") -> str:
         """Generate column DDL fragment for CREATE TABLE."""
         return self._build_ddl(dialect=dialect, include_pk=True)
 
-    def alter_column_ddl(self, dialect: str = "sqlite") -> str:
-        """Generate column DDL fragment for ALTER TABLE ADD COLUMN.
-
-        SQLite rejects ADD COLUMN with non-constant defaults such as
-        ``DEFAULT (datetime('now'))``. Migrations should add the column
-        without the non-constant SQL default and let product writers populate
-        values explicitly when the timestamp matters.
-        """
+    def alter_column_ddl(self, dialect: str = "postgres") -> str:
+        """Generate column DDL fragment for ALTER TABLE ADD COLUMN."""
         return self._build_ddl(
             dialect=dialect,
             include_pk=True,
-            include_default=(dialect != "sqlite" or self.default != "NOW"),
+            include_default=True,
         )
 
-    def column_ddl_no_pk(self, dialect: str = "sqlite") -> str:
+    def column_ddl_no_pk(self, dialect: str = "postgres") -> str:
         """DDL without PRIMARY KEY (for composite PK via table constraint)."""
         return self._build_ddl(dialect=dialect, include_pk=False)
 
     def _build_ddl(
         self,
         *,
-        dialect: str = "sqlite",
+        dialect: str = "postgres",
         include_pk: bool = True,
         include_default: bool = True,
     ) -> str:
@@ -126,13 +109,10 @@ class FieldDef:
             parts.append("UNIQUE")
         if include_default and self.default is not None:
             if self.default == "NOW":
-                if normalized == "postgres":
-                    parts.append(
-                        "DEFAULT (to_char(timezone('UTC', now()), "
-                        "'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))"
-                    )
-                else:
-                    parts.append("DEFAULT (datetime('now'))")
+                parts.append(
+                    "DEFAULT (to_char(timezone('UTC', now()), "
+                    "'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))"
+                )
             elif self.is_json and normalized == "postgres":
                 encoded = self.default if isinstance(self.default, str) else json.dumps(self.default, ensure_ascii=False)
                 escaped = encoded.replace("'", "''")
@@ -140,14 +120,9 @@ class FieldDef:
             elif isinstance(self.default, str):
                 parts.append(f"DEFAULT '{self.default}'")
             elif isinstance(self.default, bool):
-                if normalized == "postgres":
-                    parts.append(f"DEFAULT {'true' if self.default else 'false'}")
-                else:
-                    parts.append(f"DEFAULT {1 if self.default else 0}")
+                parts.append(f"DEFAULT {'true' if self.default else 'false'}")
             else:
                 parts.append(f"DEFAULT {self.default}")
-        if self.ref and normalized == "sqlite":
-            parts.append(f"REFERENCES {self.ref}")
         return " ".join(parts)
 
     # ── Serialization ─────────────────────────────────────────────────────────
@@ -171,7 +146,7 @@ class FieldDef:
         if self.is_json:
             return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
         if self.is_bool:
-            return 1 if value else 0
+            return bool(value)
         return value
 
     def deserialize(self, value: Any) -> Any:
