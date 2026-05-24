@@ -101,9 +101,24 @@ def test_postgres_dsn_file_and_transaction_boundary(tmp_path: Path):
     assert any(command[0] == "SELECT pg_advisory_xact_lock(%s)" for command in fake_pool.conn.commands)
     assert any("VALUES (%s, '?')" in command[0] for command in fake_pool.conn.commands)
     assert fake_pool.conn.commits == 1
+    assert fake_pool.returned == [fake_pool.conn]
 
     db.close()
     assert fake_pool.closed is True
+    assert fake_pool.returned == [fake_pool.conn]
+
+
+def test_postgres_non_transaction_fetch_releases_connection(tmp_path: Path):
+    dsn_file = tmp_path / "dsn"
+    dsn_file.write_text("dbname=entangled_test", encoding="utf-8")
+    fake_pool = _FakePool()
+    db = PostgresDatabase(dsn_file=dsn_file, pool_factory=lambda *_args, **_kwargs: fake_pool)
+    db.connect()
+
+    rows = db.fetchall("SELECT id FROM widgets WHERE name = ?", ("alpha",))
+
+    assert rows == [{"id": 7}]
+    assert fake_pool.conn.rollbacks == 1
     assert fake_pool.returned == [fake_pool.conn]
 
 

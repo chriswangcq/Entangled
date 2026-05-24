@@ -79,3 +79,37 @@ def test_ensure_schema_uses_postgres_catalog_path():
     assert not any("PRAGMA table_info" in sql for sql in sqls)
     assert any("ALTER TABLE widgets ADD COLUMN payload jsonb" in sql for sql in sqls)
     assert sqls[-1] == "CREATE INDEX IF NOT EXISTS idx_widgets_entangled_rowid ON widgets(entangled_rowid);"
+
+
+class _FakePostgresDbWithTypes(_FakePostgresDb):
+    def table_columns(self, table):
+        assert table == "widgets"
+        return ["id", "user_id", "payload", "enabled", "raw", "score", "created_at", "entangled_rowid"]
+
+    def table_column_types(self, table):
+        assert table == "widgets"
+        return {
+            "id": "text",
+            "user_id": "text",
+            "payload": "jsonb",
+            "enabled": "bigint",
+            "raw": "bytea",
+            "score": "double precision",
+            "created_at": "text",
+            "entangled_rowid": "bigint",
+        }
+
+
+def test_ensure_schema_migrates_legacy_postgres_bigint_bool_columns():
+    db = _FakePostgresDbWithTypes()
+    store = SqlEntityStore(db=db)
+
+    store.ensure_schema_unlocked(_sample_def())
+
+    sqls = [sql for sql, _params in db.commands]
+    assert (
+        "ALTER TABLE widgets ALTER COLUMN enabled TYPE boolean "
+        "USING CASE WHEN enabled IS NULL THEN NULL WHEN enabled = 0 THEN false ELSE true END;"
+    ) in sqls
+    assert "ALTER TABLE widgets ALTER COLUMN enabled SET DEFAULT true;" in sqls
+    assert "ALTER TABLE widgets ALTER COLUMN enabled SET NOT NULL;" in sqls

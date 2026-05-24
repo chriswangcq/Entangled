@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..server.store import EntityStore as BaseStore
 from .entity_def import SqlEntityDef
+from .field_def import FieldDef, FieldKind
 from .validation import normalize_order_by, validate_field_key_with_extras, validate_field_keys
 
 logger = logging.getLogger(__name__)
@@ -185,8 +186,69 @@ class SqlEntityStore(BaseStore):
         for alter_sql in entity_def.alter_add_column_sqls(existing_cols, dialect=dialect):
             logger.info("[SqlEntityStore] Migrating: %s", alter_sql)
             self.db.execute(alter_sql)
+        for migrate_sql in self._type_migration_sqls(entity_def, dialect=dialect):
+            logger.info("[SqlEntityStore] Reconciling column type: %s", migrate_sql)
+            self.db.execute(migrate_sql)
         for idx_sql in entity_def.index_sqls(dialect=dialect):
             self.db.execute(idx_sql)
+
+    def _type_migration_sqls(self, entity_def: SqlEntityDef, *, dialect: str) -> list[str]:
+        """Generate explicit schema-drift migrations for compatible type changes."""
+        normalized = dialect.lower().strip()
+        if normalized != "postgres" or not hasattr(self.db, "table_column_types"):
+            return []
+        existing_types = self.db.table_column_types(entity_def.table)
+        stmts: list[str] = []
+        for field in entity_def.fields:
+            actual = existing_types.get(field.name)
+            if not actual:
+                continue
+            expected = field.sql_type_for(normalized)
+            if self._column_type_matches(expected, actual):
+                continue
+            conversion = self._compatible_type_migration_sql(entity_def.table, field, actual, expected)
+            if conversion is None:
+                raise RuntimeError(
+                    "Incompatible Postgres schema drift for "
+                    f"{entity_def.table}.{field.name}: actual={actual}, expected={expected}"
+                )
+            stmts.extend(conversion)
+        return stmts
+
+    @staticmethod
+    def _column_type_matches(expected: str, actual: str) -> bool:
+        aliases = {
+            "bigint": {"bigint"},
+            "boolean": {"boolean"},
+            "text": {"text", "character varying"},
+            "jsonb": {"jsonb"},
+            "double precision": {"double precision"},
+            "bytea": {"bytea"},
+        }
+        return actual in aliases.get(expected, {expected})
+
+    @staticmethod
+    def _compatible_type_migration_sql(
+        table: str,
+        field: FieldDef,
+        actual: str,
+        expected: str,
+    ) -> list[str] | None:
+        if field.kind == FieldKind.BOOL and expected == "boolean" and actual in {"bigint", "integer", "smallint"}:
+            stmts = [
+                (
+                    f"ALTER TABLE {table} ALTER COLUMN {field.name} TYPE boolean "
+                    f"USING CASE WHEN {field.name} IS NULL THEN NULL "
+                    f"WHEN {field.name} = 0 THEN false ELSE true END;"
+                )
+            ]
+            if field.default is not None:
+                default = "true" if bool(field.default) else "false"
+                stmts.append(f"ALTER TABLE {table} ALTER COLUMN {field.name} SET DEFAULT {default};")
+            if not field.nullable:
+                stmts.append(f"ALTER TABLE {table} ALTER COLUMN {field.name} SET NOT NULL;")
+            return stmts
+        return None
 
     def ensure_all_schemas(self) -> None:
         """Run ensure_schema for all registered entities that have fields."""

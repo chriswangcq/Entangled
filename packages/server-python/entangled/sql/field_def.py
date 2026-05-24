@@ -223,7 +223,7 @@ class F:
 
     @staticmethod
     def bool_(name: str, *, default: bool = False) -> FieldDef:
-        """Boolean field — stored as 0/1, auto-converted."""
+        """Boolean field — stored as native Postgres boolean, auto-converted."""
         return FieldDef(name, FieldKind.BOOL, nullable=False, default=default)
 
     @staticmethod
