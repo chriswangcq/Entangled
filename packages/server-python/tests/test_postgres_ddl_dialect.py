@@ -91,7 +91,7 @@ class _FakePostgresDbWithTypes(_FakePostgresDb):
         return {
             "id": "text",
             "user_id": "text",
-            "payload": "jsonb",
+            "payload": "text",
             "enabled": "bigint",
             "raw": "bytea",
             "score": "double precision",
@@ -100,7 +100,7 @@ class _FakePostgresDbWithTypes(_FakePostgresDb):
         }
 
 
-def test_ensure_schema_migrates_legacy_postgres_bigint_bool_columns():
+def test_ensure_schema_migrates_legacy_postgres_compatible_column_types():
     db = _FakePostgresDbWithTypes()
     store = SqlEntityStore(db=db)
 
@@ -113,3 +113,9 @@ def test_ensure_schema_migrates_legacy_postgres_bigint_bool_columns():
     ) in sqls
     assert "ALTER TABLE widgets ALTER COLUMN enabled SET DEFAULT true;" in sqls
     assert "ALTER TABLE widgets ALTER COLUMN enabled SET NOT NULL;" in sqls
+    assert (
+        "ALTER TABLE widgets ALTER COLUMN payload TYPE jsonb "
+        "USING CASE WHEN payload IS NULL OR btrim(payload) = '' THEN NULL ELSE payload::jsonb END;"
+    ) in sqls
+    assert "ALTER TABLE widgets ALTER COLUMN payload SET DEFAULT '{}'::jsonb;" in sqls
+    assert "ALTER TABLE widgets ALTER COLUMN payload SET NOT NULL;" in sqls

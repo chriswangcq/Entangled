@@ -248,6 +248,21 @@ class SqlEntityStore(BaseStore):
             if not field.nullable:
                 stmts.append(f"ALTER TABLE {table} ALTER COLUMN {field.name} SET NOT NULL;")
             return stmts
+        if field.kind == FieldKind.JSON and expected == "jsonb" and actual == "text":
+            stmts = [
+                (
+                    f"ALTER TABLE {table} ALTER COLUMN {field.name} TYPE jsonb "
+                    f"USING CASE WHEN {field.name} IS NULL OR btrim({field.name}) = '' "
+                    f"THEN NULL ELSE {field.name}::jsonb END;"
+                )
+            ]
+            if field.default is not None:
+                encoded = field.default if isinstance(field.default, str) else json.dumps(field.default, ensure_ascii=False)
+                escaped = encoded.replace("'", "''")
+                stmts.append(f"ALTER TABLE {table} ALTER COLUMN {field.name} SET DEFAULT '{escaped}'::jsonb;")
+            if not field.nullable:
+                stmts.append(f"ALTER TABLE {table} ALTER COLUMN {field.name} SET NOT NULL;")
+            return stmts
         return None
 
     def ensure_all_schemas(self) -> None:
