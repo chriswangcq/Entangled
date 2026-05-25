@@ -99,6 +99,24 @@ def test_postgres_update_uses_postgres_timestamp_expression():
     assert "to_char(timezone('UTC', now())" in update_sql
 
 
+def test_postgres_update_does_not_duplicate_explicit_updated_at():
+    db = _FakePostgresDb()
+    store = SqlEntityStore(db=db)
+
+    store._sql_update(
+        _widget_def(),
+        "u1",
+        "w1",
+        {"name": "beta", "updated_at": "2026-05-25T00:00:00.000Z"},
+    )
+
+    update_sql, params = db.executed[0]
+    assert update_sql.startswith("UPDATE widgets SET name = ?, updated_at = ?")
+    assert "to_char(timezone('UTC', now())" not in update_sql
+    assert update_sql.count("updated_at =") == 1
+    assert params[:2] == ("beta", "2026-05-25T00:00:00.000Z")
+
+
 def test_postgres_upsert_uses_postgres_timestamp_expression():
     db = _FakePostgresDb()
     store = SqlEntityStore(db=db)
@@ -112,6 +130,24 @@ def test_postgres_upsert_uses_postgres_timestamp_expression():
     assert "to_char(timezone('UTC', now())" in upsert_sql
 
 
+def test_postgres_upsert_does_not_duplicate_explicit_updated_at():
+    db = _FakePostgresDb()
+    store = SqlEntityStore(db=db)
+
+    store._sql_upsert(
+        _widget_def(),
+        "u1",
+        "w1",
+        {"name": "gamma", "updated_at": "2026-05-25T00:00:00.000Z"},
+    )
+
+    upsert_sql, params = db.executed[0]
+    assert "updated_at = excluded.updated_at" in upsert_sql
+    assert "to_char(timezone('UTC', now())" not in upsert_sql
+    assert upsert_sql.count("updated_at =") == 1
+    assert params[1] == "2026-05-25T00:00:00.000Z"
+
+
 def test_postgres_delete_and_cas_preserve_rowcount_paths():
     db = _FakePostgresDb()
     store = SqlEntityStore(db=db)
@@ -123,6 +159,65 @@ def test_postgres_delete_and_cas_preserve_rowcount_paths():
     assert cas is None
     assert any(sql.startswith("DELETE FROM widgets") for sql, _params in db.executed)
     assert any(sql.startswith("UPDATE widgets SET name = ?") for sql, _params in db.executed)
+
+
+def test_postgres_batch_update_does_not_duplicate_explicit_updated_at():
+    db = _FakePostgresDb()
+    store = SqlEntityStore(db=db)
+    store.register(_widget_def())
+
+    store.batch_update(
+        "widgets",
+        "u1",
+        ["w1", "w2"],
+        {"name": "delta", "updated_at": "2026-05-25T00:00:00.000Z"},
+        emit_notifications=False,
+    )
+
+    update_sql, params = db.executed[0]
+    assert update_sql.startswith("UPDATE widgets SET name = ?, updated_at = ?")
+    assert "to_char(timezone('UTC', now())" not in update_sql
+    assert update_sql.count("updated_at =") == 1
+    assert params[:2] == ("delta", "2026-05-25T00:00:00.000Z")
+
+
+def test_postgres_update_where_does_not_duplicate_explicit_updated_at():
+    db = _FakePostgresDb()
+    store = SqlEntityStore(db=db)
+    store.register(_widget_def())
+
+    store.update_where(
+        "widgets",
+        "u1",
+        {"name": "epsilon", "updated_at": "2026-05-25T00:00:00.000Z"},
+        notify=False,
+    )
+
+    update_sql, params = db.executed[0]
+    assert update_sql.startswith("UPDATE widgets SET name = ?, updated_at = ?")
+    assert "to_char(timezone('UTC', now())" not in update_sql
+    assert update_sql.count("updated_at =") == 1
+    assert params[:2] == ("epsilon", "2026-05-25T00:00:00.000Z")
+
+
+def test_postgres_cas_update_does_not_duplicate_explicit_updated_at():
+    db = _FakePostgresDb()
+    store = SqlEntityStore(db=db)
+    store.register(_widget_def())
+
+    store.cas_update(
+        "widgets",
+        "u1",
+        {"id": "w1"},
+        {"name": "zeta", "updated_at": "2026-05-25T00:00:00.000Z"},
+        emit_notifications=False,
+    )
+
+    update_sql, params = db.executed[0]
+    assert update_sql.startswith("UPDATE widgets SET name = ?, updated_at = ?")
+    assert "to_char(timezone('UTC', now())" not in update_sql
+    assert update_sql.count("updated_at =") == 1
+    assert params[:2] == ("zeta", "2026-05-25T00:00:00.000Z")
 
 
 def test_postgres_bool_input_keeps_python_bool_for_boolean_columns():

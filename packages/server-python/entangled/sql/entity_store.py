@@ -79,6 +79,11 @@ class SqlEntityStore(BaseStore):
     def _timestamp_update_expr(self) -> str:
         return "to_char(timezone('UTC', now()), 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')"
 
+    @staticmethod
+    def _should_auto_set_updated_at(defn: SqlEntityDef, row: Dict[str, Any]) -> bool:
+        """Auto-touch updated_at only when the caller did not set it explicitly."""
+        return defn.tracks_updated_at_column and "updated_at" not in row
+
     def _insert_sql(self, table: str, cols: List[str], *, returning: str = "") -> str:
         ph = ", ".join("?" for _ in cols)
         sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({ph})"
@@ -532,7 +537,7 @@ class SqlEntityStore(BaseStore):
         for k, v in row.items():
             set_parts.append(f"{k} = ?")
             set_vals.append(v)
-        if defn.tracks_updated_at_column:
+        if self._should_auto_set_updated_at(defn, row):
             set_parts.append(f"updated_at = {self._timestamp_update_expr()}")
         where, where_vals = self._scope_where(defn, user_id, params)
         where += f" AND {defn.id_field} = ?"
@@ -566,7 +571,7 @@ class SqlEntityStore(BaseStore):
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
         update_parts = [f"{c} = excluded.{c}" for c in cols if c != defn.id_field]
-        if defn.tracks_updated_at_column:
+        if self._should_auto_set_updated_at(defn, row):
             update_parts.append(f"updated_at = {self._timestamp_update_expr()}")
         sql = (
             f"INSERT INTO {defn.table} ({', '.join(cols)}) VALUES ({ph})"
@@ -592,7 +597,7 @@ class SqlEntityStore(BaseStore):
         for k, v in row.items():
             set_parts.append(f"{k} = ?")
             set_vals.append(v)
-        if defn.tracks_updated_at_column:
+        if self._should_auto_set_updated_at(defn, row):
             set_parts.append(f"updated_at = {self._timestamp_update_expr()}")
         where, where_vals = self._scope_where(defn, user_id, params)
         placeholders = ",".join("?" for _ in entity_ids)
@@ -653,7 +658,7 @@ class SqlEntityStore(BaseStore):
         for k, v in row.items():
             set_parts.append(f"{k} = ?")
             set_vals.append(v)
-        if defn.tracks_updated_at_column:
+        if self._should_auto_set_updated_at(defn, row):
             set_parts.append(f"updated_at = {self._timestamp_update_expr()}")
         where, where_vals = self._scope_where(defn, user_id, params)
         if filters:
@@ -755,7 +760,7 @@ class SqlEntityStore(BaseStore):
         cols = list(row.keys())
         update_parts = [f"{c} = ?" for c in cols]
         values = [row[c] for c in cols]
-        if defn.tracks_updated_at_column:
+        if self._should_auto_set_updated_at(defn, row):
             update_parts.append(f"updated_at = {self._timestamp_update_expr()}")
         where, where_values = self._scope_where(defn, user_id, params)
         validate_field_keys(defn, where_condition.keys(), label="CAS condition field")
