@@ -66,6 +66,24 @@ HEARTBEAT_TIMEOUT_S = 90         # Close connection if no message in this time
 SYNC_CONTRACT_VERSION = 2
 
 
+def _stream_head_order_by(defn: Any) -> Optional[str]:
+    raw_order = str(getattr(defn, "default_order", "") or "").strip()
+    if not raw_order:
+        return None
+
+    terms: List[str] = []
+    for raw_term in raw_order.split(","):
+        tokens = raw_term.strip().split()
+        if not tokens:
+            continue
+        if tokens[-1].upper() in {"ASC", "DESC"}:
+            tokens = tokens[:-1]
+        expression = " ".join(tokens).strip()
+        if expression:
+            terms.append(f"{expression} DESC")
+    return ", ".join(terms) or None
+
+
 def create_ws_handler(
     store: EntityStore,
     *,
@@ -236,7 +254,17 @@ async def _entangle_one(
     # Copy op-log/version before any await, then run resolve_sync + DB in a worker thread.
     snap = snapshot_for_resolve(state)
 
+    stream_head_order_by = _stream_head_order_by(defn) if defn.sync_type == "stream" else None
+
     def fetch_data(limit=None):
+        if defn.sync_type == "stream":
+            kwargs = {
+                "params": params or {},
+                "limit": limit or defn.sync_limit or 50,
+            }
+            if stream_head_order_by:
+                kwargs["order_by"] = stream_head_order_by
+            return store.list_stream(entity, user_id, **kwargs)
         return store.list(entity, user_id, params=params or {}, limit=limit)
 
     # Build exists_before from EntityDef or store's native method
@@ -261,7 +289,7 @@ async def _entangle_one(
             sync_type=defn.sync_type,
             default_stream_depth=defn.sync_limit,
             exists_before_fn=eb_fn,
-            data_order=getattr(defn, 'data_order', 'desc'),
+            data_order="desc" if defn.sync_type == "stream" else getattr(defn, 'data_order', 'desc'),
             id_field=id_field,
         )
 

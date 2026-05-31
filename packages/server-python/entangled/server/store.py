@@ -127,6 +127,8 @@ class EntityStoreProtocol(ABC):
         before_id: Optional[str] = None,
         after_id: Optional[str] = None,
         limit: int = 50,
+        order_by: Optional[str] = None,
+        cursor_field: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Cursor-based backward pagination. Default: falls back to list()."""
         return self.list(entity, user_id, params=params, limit=limit)
@@ -247,6 +249,8 @@ class EntityStore(EntityStoreProtocol):
         before_id: Optional[str] = None,
         after_id: Optional[str] = None,
         limit: int = 50,
+        order_by: Optional[str] = None,
+        cursor_field: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Cursor-based backward pagination for stream entities.
 
@@ -256,12 +260,16 @@ class EntityStore(EntityStoreProtocol):
         self._check_access(defn, user_id, "list_stream", params=params)
         if not defn.list_stream_fn:
             raise NotImplementedError(f"{entity} does not support list_stream")
-        return defn.list_stream_fn(
-            self, user_id, params or {},
-            before_id=before_id,
-            after_id=after_id,
-            limit=limit,
-        )
+        kwargs: Dict[str, Any] = {
+            "before_id": before_id,
+            "after_id": after_id,
+            "limit": limit,
+        }
+        if order_by is not None:
+            kwargs["order_by"] = order_by
+        if cursor_field is not None:
+            kwargs["cursor_field"] = cursor_field
+        return defn.list_stream_fn(self, user_id, params or {}, **kwargs)
 
     def exists_before(
         self,

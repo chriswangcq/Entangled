@@ -312,6 +312,16 @@ fn id_field_for_entity(state: &EntangledState, entity: &str) -> String {
         .unwrap_or_else(|| "id".to_string())
 }
 
+fn is_stream_entity(state: &EntangledState, entity: &str) -> bool {
+    state
+        .registry
+        .read()
+        .unwrap()
+        .get(entity)
+        .and_then(|s| s.sync_type.as_deref())
+        == Some("stream")
+}
+
 fn filtered_user_scope_list(
     entity: &str,
     params: Option<Value>,
@@ -322,6 +332,10 @@ fn filtered_user_scope_list(
     let exact = cache.get_list(&make_key(entity, params.clone()));
 
     if params_map.is_empty() {
+        return exact;
+    }
+
+    if is_stream_entity(state, entity) {
         return exact;
     }
 
@@ -351,6 +365,10 @@ fn filtered_user_scope_item(
         return cache.get_item(&CacheKey::new_empty(entity), id);
     }
 
+    if is_stream_entity(state, entity) {
+        return cache.get_item(&make_key(entity, params), id);
+    }
+
     let global = cache.get_item(&CacheKey::new_empty(entity), id);
     if let Some(row) = global {
         if row_matches_params(&row, &params_map) {
@@ -363,12 +381,12 @@ fn filtered_user_scope_item(
 
 #[cfg(test)]
 mod user_scope_read_tests {
-    use super::{filtered_user_scope_item, filtered_user_scope_list, EntangledState};
+    use super::{filtered_user_scope_item, filtered_user_scope_list, make_key, EntangledState};
     use crate::cache::CacheKey;
     use crate::schema::EntitySchema;
     use serde_json::json;
 
-    fn state_with_messages() -> EntangledState {
+    fn state_with_messages(sync_type: &str) -> EntangledState {
         let state = EntangledState::new();
         state
             .registry
@@ -379,7 +397,7 @@ mod user_scope_read_tests {
                 key_params: vec!["agent_id".to_string()],
                 push_events: vec![],
                 id_field: Some("id".to_string()),
-                sync_type: Some("stream".to_string()),
+                sync_type: Some(sync_type.to_string()),
                 sync_limit: Some(50),
                 subscription_mode: Some("lazy".to_string()),
                 capabilities: None,
@@ -398,16 +416,16 @@ mod user_scope_read_tests {
     }
 
     #[test]
-    fn scoped_list_reads_from_unscoped_user_cache() {
-        let state = state_with_messages();
+    fn non_stream_scoped_list_reads_from_unscoped_user_cache() {
+        let state = state_with_messages("list");
         let rows = filtered_user_scope_list("messages", Some(json!({"agent_id": "a1"})), &state);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["id"], "m1");
     }
 
     #[test]
-    fn scoped_item_reads_from_unscoped_user_cache() {
-        let state = state_with_messages();
+    fn non_stream_scoped_item_reads_from_unscoped_user_cache() {
+        let state = state_with_messages("list");
         let row =
             filtered_user_scope_item("messages", "m1", Some(json!({"agent_id": "a1"})), &state)
                 .expect("row should come from unscoped cache");
@@ -416,6 +434,41 @@ mod user_scope_read_tests {
         let miss =
             filtered_user_scope_item("messages", "m2", Some(json!({"agent_id": "a1"})), &state);
         assert!(miss.is_none());
+    }
+
+    #[test]
+    fn stream_scoped_list_uses_exact_cache_key_only() {
+        let state = state_with_messages("stream");
+        let params = json!({"agent_id": "a1"});
+        state.cache.apply_snapshot(
+            &make_key("messages", Some(params.clone())),
+            &[json!({"id": "m3", "agent_id": "a1", "text": "scoped fresh"})],
+            2,
+            "id",
+            false,
+        );
+
+        let rows = filtered_user_scope_list("messages", Some(params), &state);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "m3");
+    }
+
+    #[test]
+    fn stream_scoped_item_uses_exact_cache_key_only() {
+        let state = state_with_messages("stream");
+        let params = json!({"agent_id": "a1"});
+        state.cache.apply_snapshot(
+            &make_key("messages", Some(params.clone())),
+            &[json!({"id": "m3", "agent_id": "a1", "text": "scoped fresh"})],
+            2,
+            "id",
+            false,
+        );
+
+        assert!(filtered_user_scope_item("messages", "m1", Some(params.clone()), &state).is_none());
+        let row = filtered_user_scope_item("messages", "m3", Some(params), &state)
+            .expect("row should come from exact scoped stream cache");
+        assert_eq!(row["text"], "scoped fresh");
     }
 }
 
