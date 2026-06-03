@@ -191,7 +191,7 @@ impl EntangledClient {
         };
 
         if let Some(ref t) = self.transport {
-            t.entangle(entity, params, version).await;
+            t.entangle(entity, params, version, None).await;
         }
     }
 

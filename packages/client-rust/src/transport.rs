@@ -31,6 +31,8 @@ mod ws {
             #[serde(skip_serializing_if = "Option::is_none")]
             version: Option<u64>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            depth: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             before_id: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             limit: Option<u32>,
@@ -169,6 +171,27 @@ mod ws {
                 _ => panic!("expected error ack"),
             }
         }
+
+        #[test]
+        fn serializes_standard_entangle_depth() {
+            let frame = super::OutMsg::Entangle {
+                entity: "agent-activity-records".to_string(),
+                params: Some(serde_json::json!({"agent_id": "agent-1"})),
+                version: None,
+                depth: Some(200),
+                before_id: None,
+                limit: None,
+                request_id: None,
+            };
+
+            let value = serde_json::to_value(frame).expect("frame should serialize");
+
+            assert_eq!(value["type"], "entangle");
+            assert_eq!(value["entity"], "agent-activity-records");
+            assert_eq!(value["params"]["agent_id"], "agent-1");
+            assert_eq!(value["depth"], 200);
+            assert!(value.get("limit").is_none());
+        }
     }
 
     type SplitSink = futures_util::stream::SplitSink<
@@ -225,11 +248,18 @@ mod ws {
         }
 
         /// Send an entangle frame.
-        pub async fn entangle(&self, entity: &str, params: Option<Value>, version: Option<u64>) {
+        pub async fn entangle(
+            &self,
+            entity: &str,
+            params: Option<Value>,
+            version: Option<u64>,
+            depth: Option<u64>,
+        ) {
             self.send(&OutMsg::Entangle {
                 entity: entity.to_string(),
                 params,
                 version,
+                depth,
                 before_id: None,
                 limit: None,
                 request_id: None,
@@ -238,8 +268,14 @@ mod ws {
         }
 
         /// Host-facing alias used by embedded App sync bridge.
-        pub async fn subscribe(&self, entity: &str, params: Option<Value>, version: Option<u64>) {
-            self.entangle(entity, params, version).await;
+        pub async fn subscribe(
+            &self,
+            entity: &str,
+            params: Option<Value>,
+            version: Option<u64>,
+            depth: Option<u64>,
+        ) {
+            self.entangle(entity, params, version, depth).await;
         }
 
         /// Send a disentangle frame.
@@ -299,6 +335,7 @@ mod ws {
                 entity: entity.to_string(),
                 params,
                 version: None,
+                depth: None,
                 before_id,
                 limit: Some(limit),
                 request_id: Some(request_id.clone()),
