@@ -7,9 +7,9 @@
 //!   - `entity_meta`: version, has_more_before, subscribed per (entity, params_hash)
 //!   - `entity_items`: actual entity data as JSON blobs, ordered by `seq`
 
-use rusqlite::params;
-use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use r2d2_sqlite::SqliteConnectionManager;
 use serde_json::Value;
 
 use std::hash::{Hash, Hasher};
@@ -160,6 +160,17 @@ pub struct EntityMeta {
     pub has_more_before: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CachePartitionSummary {
+    pub entity: String,
+    pub params_hash: u64,
+    pub version: u64,
+    pub subscribed: bool,
+    pub has_more_before: bool,
+    pub last_accessed: i64,
+    pub item_count: usize,
+}
+
 impl Default for EntityMeta {
     fn default() -> Self {
         Self {
@@ -251,6 +262,11 @@ impl Cache {
                 data        TEXT NOT NULL,
                 seq         INTEGER NOT NULL,
                 PRIMARY KEY (entity, params_hash, item_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS cache_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_entity_items_seq
@@ -781,6 +797,72 @@ impl Cache {
         ").ok();
     }
 
+    pub fn get_meta_value(&self, key: &str) -> Option<String> {
+        let conn = pool_conn!(self, "get_meta_value", None);
+        conn.query_row(
+            "SELECT value FROM cache_meta WHERE key = ?1",
+            params![key],
+            |row: &rusqlite::Row| row.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap_or(None)
+    }
+
+    pub fn set_meta_value(&self, key: &str, value: &str) {
+        let conn = pool_conn!(self, "set_meta_value");
+        conn.execute(
+            "INSERT INTO cache_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .ok();
+    }
+
+    pub fn partition_summaries(&self) -> Vec<CachePartitionSummary> {
+        let conn = pool_conn!(self, "partition_summaries", Vec::new());
+        let mut stmt = match conn.prepare_cached(
+            "SELECT
+                m.entity,
+                m.params_hash,
+                m.version,
+                m.subscribed,
+                m.has_more,
+                m.last_accessed,
+                COUNT(i.item_id) AS item_count
+             FROM entity_meta m
+             LEFT JOIN entity_items i
+               ON i.entity = m.entity AND i.params_hash = m.params_hash
+             GROUP BY
+                m.entity,
+                m.params_hash,
+                m.version,
+                m.subscribed,
+                m.has_more,
+                m.last_accessed
+             ORDER BY m.entity ASC, m.params_hash ASC"
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+
+        stmt.query_map([], |row: &rusqlite::Row| {
+            let params_hash: i64 = row.get(1)?;
+            let version: i64 = row.get(2)?;
+            let item_count: i64 = row.get(6)?;
+            Ok(CachePartitionSummary {
+                entity: row.get(0)?,
+                params_hash: params_hash as u64,
+                version: version as u64,
+                subscribed: row.get::<_, bool>(3)?,
+                has_more_before: row.get::<_, bool>(4)?,
+                last_accessed: row.get(5)?,
+                item_count: item_count.max(0) as usize,
+            })
+        })
+        .map(|rows| rows.filter_map(|row| row.ok()).collect())
+        .unwrap_or_default()
+    }
+
     /// Get all cache keys for a given entity name.
     pub fn keys_for_entity(&self, entity: &str) -> Vec<CacheKey> {
         let conn = pool_conn!(self, "keys_for_entity", Vec::new());
@@ -823,8 +905,57 @@ impl Cache {
 
 #[cfg(test)]
 mod item_id_tests {
-    use super::Cache;
+    use super::{Cache, CacheKey};
     use serde_json::json;
+
+    #[test]
+    fn cache_meta_survives_clear_all() {
+        let cache = Cache::new_in_memory();
+        cache.set_meta_value("app_cache_contract_version", "2");
+        cache.apply_snapshot(
+            &CacheKey::new_empty("messages"),
+            &[json!({"id": "m1", "text": "hello"})],
+            3,
+            "id",
+            false,
+        );
+
+        cache.clear_all();
+
+        assert_eq!(
+            cache.get_meta_value("app_cache_contract_version").as_deref(),
+            Some("2"),
+        );
+        assert!(cache.get_list(&CacheKey::new_empty("messages")).is_empty());
+    }
+
+    #[test]
+    fn partition_summary_is_payload_free() {
+        let cache = Cache::new_in_memory();
+        let key = CacheKey::new_empty("agent-activity-records");
+        cache.apply_snapshot(
+            &key,
+            &[
+                json!({"record_id": "r1", "text": "private payload"}),
+                json!({"record_id": "r2", "text": "another payload"}),
+            ],
+            7,
+            "record_id",
+            true,
+        );
+
+        let summaries = cache.partition_summaries();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].entity, "agent-activity-records");
+        assert_eq!(summaries[0].params_hash, 0);
+        assert_eq!(summaries[0].version, 7);
+        assert_eq!(summaries[0].item_count, 2);
+        assert!(summaries[0].has_more_before);
+
+        let rendered = serde_json::to_string(&summaries).unwrap();
+        assert!(!rendered.contains("private payload"));
+        assert!(!rendered.contains("another payload"));
+    }
 
     #[test]
     fn item_id_string_custom_field() {
