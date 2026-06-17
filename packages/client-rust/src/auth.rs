@@ -43,7 +43,9 @@ pub struct NoAuth {
 
 impl NoAuth {
     pub fn new(user_id: &str) -> Self {
-        Self { user_id: user_id.to_string() }
+        Self {
+            user_id: user_id.to_string(),
+        }
     }
 }
 

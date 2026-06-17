@@ -129,7 +129,7 @@ mod tests {
 #[serde(rename_all = "camelCase")]
 pub struct EntityChanged {
     pub entity: String,
-    pub action: String,  // "synced" | "delta" | "invalidated"
+    pub action: String, // "synced" | "delta" | "invalidated"
     /// Subscription key params (React Query invalidation).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<HashMap<String, String>>,
@@ -144,7 +144,7 @@ pub struct EntityChanged {
 pub struct SyncFrame {
     pub entity: String,
     pub params: Option<serde_json::Map<String, Value>>,
-    pub mode: String,  // "snapshot" | "delta" | "head_n" | "up_to_date"
+    pub mode: String, // "snapshot" | "delta" | "head_n" | "up_to_date"
     pub version: u64,
 
     /// Primary key field name (e.g. "id", "model_id"). Sent by server.
@@ -201,7 +201,9 @@ pub fn process_sync_with_contract(
 
             tracing::info!(
                 "[Sync] {} snapshot v{} ({} items)",
-                frame.entity, frame.version, data.len()
+                frame.entity,
+                frame.version,
+                data.len()
             );
 
             Some(entity_changed(
@@ -219,7 +221,10 @@ pub fn process_sync_with_contract(
 
             tracing::info!(
                 "[Sync] {} head_n v{} ({} items, has_more={})",
-                frame.entity, frame.version, data.len(), frame.has_more
+                frame.entity,
+                frame.version,
+                data.len(),
+                frame.has_more
             );
 
             Some(entity_changed(
@@ -236,16 +241,23 @@ pub fn process_sync_with_contract(
             let has_invalidate = ops.iter().any(|op| op.op == "invalidate");
 
             // Collect requestIds from ops for optimistic confirmation
-            let request_ids: Vec<String> = ops.iter()
-                .filter_map(|op| op.request_id.clone())
-                .collect();
+            let request_ids: Vec<String> =
+                ops.iter().filter_map(|op| op.request_id.clone()).collect();
 
             if cache.apply_delta(&key, base, ops, frame.version) {
                 tracing::debug!(
                     "[Sync] {} delta v{}→v{} ({} ops, {} requestIds)",
-                    frame.entity, base, frame.version, ops.len(), request_ids.len()
+                    frame.entity,
+                    base,
+                    frame.version,
+                    ops.len(),
+                    request_ids.len()
                 );
-                let action = if has_invalidate { "invalidated" } else { "delta" };
+                let action = if has_invalidate {
+                    "invalidated"
+                } else {
+                    "delta"
+                };
                 Some(entity_changed(
                     &frame.entity,
                     action,

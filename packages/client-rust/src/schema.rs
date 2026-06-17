@@ -62,7 +62,8 @@ impl SchemaRegistry {
         self.event_to_entity.clear();
         for schema in schemas {
             for event in &schema.push_events {
-                self.event_to_entity.insert(event.clone(), schema.name.clone());
+                self.event_to_entity
+                    .insert(event.clone(), schema.name.clone());
             }
             tracing::info!("[Entangled] Registered entity: {}", schema.name);
             self.schemas.insert(schema.name.clone(), schema);

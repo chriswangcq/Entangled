@@ -106,7 +106,11 @@ impl EntangledClient {
 
         // Spawn sync frame processor
         let client_clone = Arc::clone(&client);
-        let mut sync_rx = transport.sync_rx.lock().await.take()
+        let mut sync_rx = transport
+            .sync_rx
+            .lock()
+            .await
+            .take()
             .expect("sync_rx already taken");
         tokio::spawn(async move {
             while let Some(val) = sync_rx.recv().await {
@@ -206,7 +210,11 @@ impl EntangledClient {
     // ── Cache reads (both modes) ─────────────────────────────────────────────
 
     /// Get a list of items for an entity.
-    pub fn get_list(&self, entity: &str, params: Option<&serde_json::Map<String, Value>>) -> Vec<Value> {
+    pub fn get_list(
+        &self,
+        entity: &str,
+        params: Option<&serde_json::Map<String, Value>>,
+    ) -> Vec<Value> {
         let key = match params {
             Some(p) => CacheKey::new(entity, p),
             None => CacheKey::new_empty(entity),
@@ -216,7 +224,12 @@ impl EntangledClient {
     }
 
     /// Get a single item by ID.
-    pub fn get_item(&self, entity: &str, item_id: &str, params: Option<&serde_json::Map<String, Value>>) -> Option<Value> {
+    pub fn get_item(
+        &self,
+        entity: &str,
+        item_id: &str,
+        params: Option<&serde_json::Map<String, Value>>,
+    ) -> Option<Value> {
         let key = match params {
             Some(p) => CacheKey::new(entity, p),
             None => CacheKey::new_empty(entity),
@@ -236,7 +249,11 @@ impl EntangledClient {
     }
 
     /// Get cached version for an entity.
-    pub fn get_version(&self, entity: &str, params: Option<&serde_json::Map<String, Value>>) -> Option<u64> {
+    pub fn get_version(
+        &self,
+        entity: &str,
+        params: Option<&serde_json::Map<String, Value>>,
+    ) -> Option<u64> {
         let key = match params {
             Some(p) => CacheKey::new(entity, p),
             None => CacheKey::new_empty(entity),

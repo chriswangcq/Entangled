@@ -829,6 +829,8 @@ class SqlEntityStore(BaseStore):
         service_token = getattr(self, "_service_token", None)
         if service_token:
             headers["X-Service-Token"] = service_token
+            headers["X-Internal-Service"] = "entangled"
+            headers["Authorization"] = f"Bearer {service_token}"
 
         def _do_request() -> Any:
             import urllib.error

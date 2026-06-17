@@ -37,9 +37,9 @@
 
 pub mod auth;
 pub mod cache;
+pub mod client;
 pub mod push;
 pub mod schema;
-pub mod client;
 
 #[cfg(feature = "transport")]
 pub mod transport;
@@ -49,8 +49,8 @@ pub mod commands;
 
 // Re-exports for convenience
 pub use auth::AuthProvider;
-pub use client::{EntangledClient, EntangledConfig};
-pub use push::{EntityChanged, SyncFrame, SYNC_CONTRACT_V2_MIN, process_sync_with_contract};
 pub use cache::{Cache, CacheKey};
+pub use client::{EntangledClient, EntangledConfig};
 #[cfg(feature = "tauri")]
-pub use commands::{SubscriptionRegistry, SubscriptionEntry};
+pub use commands::{SubscriptionEntry, SubscriptionRegistry};
+pub use push::{process_sync_with_contract, EntityChanged, SyncFrame, SYNC_CONTRACT_V2_MIN};

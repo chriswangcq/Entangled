@@ -7,7 +7,7 @@
 #[cfg(feature = "transport")]
 mod ws {
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use futures_util::{SinkExt, StreamExt};
     use serde_json::Value;
@@ -131,9 +131,44 @@ mod ws {
         }
     }
 
+    const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(3);
+    const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+    const RECONNECT_JITTER_PCT: u128 = 20;
+
+    fn reconnect_seed() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0xE17A_6EED)
+    }
+
+    fn reconnect_delay(attempt: u32, seed: u64) -> Duration {
+        let exponent = attempt.min(8);
+        let base_ms = RECONNECT_BASE_DELAY
+            .as_millis()
+            .saturating_mul(1u128 << exponent);
+        let capped_ms = base_ms.min(RECONNECT_MAX_DELAY.as_millis());
+        let jitter_window = capped_ms.saturating_mul(RECONNECT_JITTER_PCT) / 100;
+        let jitter = if jitter_window == 0 {
+            0
+        } else {
+            deterministic_jitter(seed, attempt) as u128 % (jitter_window + 1)
+        };
+        Duration::from_millis((capped_ms + jitter).min(RECONNECT_MAX_DELAY.as_millis()) as u64)
+    }
+
+    fn deterministic_jitter(seed: u64, attempt: u32) -> u64 {
+        let mut x = seed ^ ((attempt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::InMsg;
+        use super::{reconnect_delay, InMsg, OutMsg, WsTransport, RECONNECT_MAX_DELAY};
 
         #[test]
         fn parses_ack_with_canonical_request_id() {
@@ -192,6 +227,37 @@ mod ws {
             assert_eq!(value["depth"], 200);
             assert!(value.get("limit").is_none());
         }
+
+        #[test]
+        fn reconnect_delay_is_bounded_and_deterministic() {
+            assert_eq!(reconnect_delay(0, 7), reconnect_delay(0, 7));
+            assert!(reconnect_delay(1, 7) >= reconnect_delay(0, 7));
+            assert!(reconnect_delay(20, 7) <= RECONNECT_MAX_DELAY);
+        }
+
+        #[tokio::test]
+        async fn send_fails_fast_when_disconnected() {
+            let (transport, _) = WsTransport::new();
+
+            let error = transport
+                .send(&OutMsg::Pong)
+                .await
+                .expect_err("disconnected send should fail immediately");
+
+            assert!(error.contains("disconnected"));
+        }
+
+        #[tokio::test]
+        async fn action_fails_fast_when_disconnected() {
+            let (transport, _) = WsTransport::new();
+
+            let error = transport
+                .send_action("agents", "update", None, None, None)
+                .await
+                .expect_err("disconnected action should fail immediately");
+
+            assert!(error.contains("disconnected"));
+        }
     }
 
     type SplitSink = futures_util::stream::SplitSink<
@@ -238,13 +304,15 @@ mod ws {
         }
 
         /// Send a message to the server.
-        pub async fn send(&self, msg: &OutMsg) {
+        pub async fn send(&self, msg: &OutMsg) -> Result<(), String> {
             let mut guard = self.sink.lock().await;
-            if let Some(ref mut sink) = *guard {
-                if let Ok(json) = serde_json::to_string(msg) {
-                    let _ = sink.send(Message::Text(json)).await;
-                }
-            }
+            let sink = guard
+                .as_mut()
+                .ok_or_else(|| "Entangled transport disconnected".to_string())?;
+            let json = serde_json::to_string(msg).map_err(|e| format!("serialize failed: {e}"))?;
+            sink.send(Message::Text(json))
+                .await
+                .map_err(|e| format!("Entangled send failed: {e}"))
         }
 
         /// Send an entangle frame.
@@ -255,16 +323,20 @@ mod ws {
             version: Option<u64>,
             depth: Option<u64>,
         ) {
-            self.send(&OutMsg::Entangle {
-                entity: entity.to_string(),
-                params,
-                version,
-                depth,
-                before_id: None,
-                limit: None,
-                request_id: None,
-            })
-            .await;
+            if let Err(e) = self
+                .send(&OutMsg::Entangle {
+                    entity: entity.to_string(),
+                    params,
+                    version,
+                    depth,
+                    before_id: None,
+                    limit: None,
+                    request_id: None,
+                })
+                .await
+            {
+                tracing::warn!("[Entangled] entangle send failed: {}", e);
+            }
         }
 
         /// Host-facing alias used by embedded App sync bridge.
@@ -280,11 +352,15 @@ mod ws {
 
         /// Send a disentangle frame.
         pub async fn disentangle(&self, entity: &str, params: Option<Value>) {
-            self.send(&OutMsg::Disentangle {
-                entity: entity.to_string(),
-                params,
-            })
-            .await;
+            if let Err(e) = self
+                .send(&OutMsg::Disentangle {
+                    entity: entity.to_string(),
+                    params,
+                })
+                .await
+            {
+                tracing::warn!("[Entangled] disentangle send failed: {}", e);
+            }
         }
 
         /// Send a first-class action (mutation) and wait for ack.
@@ -307,7 +383,7 @@ mod ws {
                 params,
                 data,
             })
-            .await;
+            .await?;
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             loop {
@@ -340,7 +416,7 @@ mod ws {
                 limit: Some(limit),
                 request_id: Some(request_id.clone()),
             })
-            .await;
+            .await?;
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             loop {
@@ -380,24 +456,41 @@ mod ws {
                 .replace("http://", "ws://")
                 .replace("https://", "wss://");
 
+            let mut retry_attempt: u32 = 0;
+            let retry_seed = reconnect_seed();
             loop {
-                tokio::select! {
+                let retry_delay = tokio::select! {
                     biased;
                     _ = shutdown.notified() => {
                         tracing::info!("[Entangled] Shutdown requested");
                         return;
                     }
                     _ = self.run_single_connection(&ws_base, &auth, &sync_tx) => {
+                        let was_connected = self.connected.load(std::sync::atomic::Ordering::Relaxed);
                         self.connected.store(false, std::sync::atomic::Ordering::Relaxed);
+                        *self.sink.lock().await = None;
                         let _ = self.connected_tx.send(false);
-                        tracing::warn!("[Entangled] Disconnected, retrying in 3s...");
+                        let retry_delay = if was_connected {
+                            retry_attempt = 0;
+                            RECONNECT_BASE_DELAY
+                        } else {
+                            let delay = reconnect_delay(retry_attempt, retry_seed);
+                            retry_attempt = retry_attempt.saturating_add(1);
+                            delay
+                        };
+                        tracing::warn!(
+                            retry_delay_ms = retry_delay.as_millis(),
+                            was_connected,
+                            "[Entangled] Disconnected; retrying after backoff"
+                        );
+                        retry_delay
                     }
-                }
+                };
 
                 tokio::select! {
                     biased;
                     _ = shutdown.notified() => return,
-                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                    _ = tokio::time::sleep(retry_delay) => {}
                 }
             }
         }
@@ -530,7 +623,7 @@ mod ws {
                         let _ = self.response_tx.send((request_id, result));
                     }
                     InMsg::Ping => {
-                        self.send(&OutMsg::Pong).await;
+                        let _ = self.send(&OutMsg::Pong).await;
                     }
                     InMsg::Push { event, data } => {
                         let _ = self.push_tx.send((event, data));
