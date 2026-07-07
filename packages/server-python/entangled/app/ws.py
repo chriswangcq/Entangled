@@ -39,6 +39,16 @@ logger = logging.getLogger(__name__)
 _sync_registry: Optional[SyncRegistry] = None
 _initialized = False
 
+# 用户存在性检查(Xiaoniu 跨环境事故,2026-07-07 纵深防御):factory 注入一个
+# checker(user_id) -> bool | None。True=存在;False=本环境无此用户,拒连;
+# None=无法判定(users 表尚未建等 bootstrap 场景),放行并由 checker 侧记警告。
+_user_existence_checker = None
+
+
+def set_user_existence_checker(checker) -> None:
+    global _user_existence_checker
+    _user_existence_checker = checker
+
 
 def init_sync_engine(on_version_bump=None) -> SyncRegistry:
     """Initialize the Entangled sync engine with our EntityStore.
@@ -94,6 +104,16 @@ async def ws_sync_handler(websocket: WebSocket):
     if not user_id:
         await websocket.close(code=4001, reason="Authentication required")
         return
+
+    # 纵深防御:签名有效但本环境不存在的用户,拒连(Xiaoniu 事故里 prod 曾为一个
+    # prod 用户表中不存在的 staging 用户建了孤儿 agent)。checker 返回 None(无法
+    # 判定,如 users 表未建)时放行 —— fail-open 只对 bootstrap,fail-closed 对已知不存在。
+    if _user_existence_checker is not None:
+        exists = _user_existence_checker(user_id)
+        if exists is False:
+            logger.warning("[WS] rejected unknown user %s (not in this environment)", user_id)
+            await websocket.close(code=4403, reason="Unknown user in this environment")
+            return
 
     await websocket.accept()
 

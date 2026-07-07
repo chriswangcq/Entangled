@@ -29,6 +29,30 @@ from ..sql.state_transitions import ensure_state_transitions_schema
 logger = logging.getLogger(__name__)
 
 
+def _make_user_existence_checker(db):
+    """构造 WS 建连用的用户存在性 checker(纵深防御,Xiaoniu 事故 2026-07-07)。
+
+    返回 checker(user_id) -> bool | None:
+    * True/False:users 表可查,按行存在与否判定(False → ws 拒连 4403);
+    * None:无法判定(users 表未建等 bootstrap 场景)→ 放行,记一次警告。
+    ``users`` 表由 novaic business 的 auth 流维护;app 层本就是 novaic 胶水,
+    表名在此硬编码与 auth.py 的 "Gateway signs HS256 JWTs" 同一耦合层级。
+    """
+    warned = {"missing_table": False}
+
+    def _checker(user_id: str):
+        try:
+            row = db.fetchone("SELECT 1 FROM users WHERE id = %s", (user_id,))
+            return row is not None
+        except Exception as e:  # noqa: BLE001 — 表未建/查询失败:fail-open 并警告
+            if not warned["missing_table"]:
+                warned["missing_table"] = True
+                logger.warning("[Auth] user existence check unavailable (%s) — allowing", e)
+            return None
+
+    return _checker
+
+
 def create_app(config: ServiceConfig) -> FastAPI:
 
     @asynccontextmanager
@@ -57,8 +81,15 @@ def create_app(config: ServiceConfig) -> FastAPI:
         store._service_token = config.service_token or ""
         logger.info("EntityStore ready (0 entities — waiting for schema registration)")
 
-        # 4. Auth
-        configure_auth(jwt_secret=config.jwt_secret, service_token=config.service_token)
+        # 4. Auth(环境绑定 + 用户存在性:Xiaoniu 跨环境事故,2026-07-07)
+        configure_auth(
+            jwt_secret=config.jwt_secret,
+            service_token=config.service_token,
+            expected_namespace=config.namespace,
+        )
+        from .ws import set_user_existence_checker
+
+        set_user_existence_checker(_make_user_existence_checker(db))
 
         # 5. Sync engine (with version persistence)
         from .ws import init_sync_engine

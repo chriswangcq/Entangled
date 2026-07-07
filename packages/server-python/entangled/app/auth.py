@@ -15,12 +15,33 @@ logger = logging.getLogger(__name__)
 
 _jwt_secret: str = ""
 _service_token: str = ""
+_expected_namespace: str = ""
 
 
-def configure_auth(*, jwt_secret: str, service_token: str) -> None:
-    global _jwt_secret, _service_token
+def configure_auth(*, jwt_secret: str, service_token: str, expected_namespace: str = "") -> None:
+    global _jwt_secret, _service_token, _expected_namespace
     _jwt_secret = jwt_secret
     _service_token = service_token
+    _expected_namespace = expected_namespace
+
+
+def check_namespace_claim(payload: dict, expected_namespace: str) -> "str | None":
+    """**纯核**:环境绑定判定(Xiaoniu 跨环境事故,2026-07-07)。
+
+    返回 None = 放行;返回 str = 拒绝理由。规则:
+    * expected 未配置 → 放行(未启用绑定);
+    * token 无 ns 声明 → 放行(旧 token 兼容;跨环境已由每环境独立 jwt_secret 止血,
+      本检查是纵深防御 —— 防的是将来密钥又被配成一样);
+    * token 有 ns 且 != expected → 拒绝(别的环境签的 token,签名再有效也不认)。
+    """
+    if not expected_namespace:
+        return None
+    token_ns = payload.get("ns")
+    if token_ns is None:
+        return None
+    if str(token_ns) != expected_namespace:
+        return f"token namespace {token_ns!r} does not match this environment {expected_namespace!r}"
+    return None
 
 
 def _decode_jwt(token: str) -> dict:
@@ -28,9 +49,14 @@ def _decode_jwt(token: str) -> dict:
     if not _jwt_secret:
         raise HTTPException(status_code=503, detail="JWT_SECRET not configured on Entangled Service")
     try:
-        return jwt.decode(token, _jwt_secret, algorithms=["HS256"])
+        payload = jwt.decode(token, _jwt_secret, algorithms=["HS256"])
     except JWTError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+    reason = check_namespace_claim(payload, _expected_namespace)
+    if reason:
+        logger.warning("[Auth] cross-namespace token rejected: %s", reason)
+        raise HTTPException(status_code=401, detail=f"Invalid token: {reason}")
+    return payload
 
 
 def verify_user_token(authorization: Optional[str] = Header(None)) -> str:

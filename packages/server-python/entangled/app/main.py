@@ -22,6 +22,12 @@ def main():
     parser.add_argument("--service-token", default=None, help="Service-to-service auth token (shared JWT secret)")
     parser.add_argument("--service-token-file", default=None, help="File containing service-to-service auth token")
     parser.add_argument("--log-level", default=None, help="Log level")
+    parser.add_argument(
+        "--namespace",
+        default=None,
+        help="Deployment namespace (staging/prod); user JWTs carrying a "
+        "mismatched ns claim are rejected (cross-environment binding)",
+    )
     args = parser.parse_args()
 
     config = ServiceConfig.from_env()
@@ -42,6 +48,8 @@ def main():
         config.jwt_secret = token
     if args.log_level:
         config.log_level = args.log_level
+    if args.namespace:
+        config.namespace = args.namespace
 
     logging.basicConfig(
         level=getattr(logging, config.log_level.upper(), logging.INFO),
