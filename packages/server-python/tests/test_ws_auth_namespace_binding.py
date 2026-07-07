@@ -65,3 +65,11 @@ def test_checker_none_when_table_unavailable():
     checker = _make_user_existence_checker(db)
     assert checker("u1") is None
     assert checker("u2") is None  # 不因首错短路,每次仍探测(表建好即恢复 fail-closed)
+
+
+def test_user_existence_enforcement_is_opt_in():
+    # prod 的 entangled 自库 users 表只有遗留行、非权威用户源 —— 默认启用会拒掉
+    # 所有真用户(部署前实查发现)。守卫:默认必须 False,启用是显式运维决定。
+    from entangled.app.config import ServiceConfig
+
+    assert ServiceConfig().enforce_user_exists is False

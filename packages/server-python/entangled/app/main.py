@@ -28,6 +28,13 @@ def main():
         help="Deployment namespace (staging/prod); user JWTs carrying a "
         "mismatched ns claim are rejected (cross-environment binding)",
     )
+    parser.add_argument(
+        "--enforce-user-exists",
+        action="store_true",
+        help="Reject WS connections for users absent from this instance's "
+        "users table (opt-in: requires the table to be the authoritative "
+        "user store — see app/config.py)",
+    )
     args = parser.parse_args()
 
     config = ServiceConfig.from_env()
@@ -50,6 +57,8 @@ def main():
         config.log_level = args.log_level
     if args.namespace:
         config.namespace = args.namespace
+    if args.enforce_user_exists:
+        config.enforce_user_exists = True
 
     logging.basicConfig(
         level=getattr(logging, config.log_level.upper(), logging.INFO),

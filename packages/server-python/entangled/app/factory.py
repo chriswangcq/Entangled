@@ -87,9 +87,11 @@ def create_app(config: ServiceConfig) -> FastAPI:
             service_token=config.service_token,
             expected_namespace=config.namespace,
         )
-        from .ws import set_user_existence_checker
+        if config.enforce_user_exists:
+            # opt-in(见 config 注释):Entangled 自库 users 今天非权威源,默认不装。
+            from .ws import set_user_existence_checker
 
-        set_user_existence_checker(_make_user_existence_checker(db))
+            set_user_existence_checker(_make_user_existence_checker(db))
 
         # 5. Sync engine (with version persistence)
         from .ws import init_sync_engine
