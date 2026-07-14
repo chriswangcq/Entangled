@@ -10,9 +10,9 @@ else → 500.
 
 Authentication
 --------------
-The endpoint sits behind ``verify_service_or_user``. A direct client couldn't
-even hit this surface from outside the cluster (Entangled binds to 127.0.0.1),
-but the service-token check keeps Business the only writer even inside.
+The endpoint sits behind ``verify_service_token``. Public reverse proxies may
+expose ``/v1/*``, so a valid end-user JWT is deliberately insufficient for
+control-plane history access.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 
 from ..sql.state_transitions import list_subagent_transitions
-from .auth import verify_service_or_user
+from .auth import verify_service_token
 from .state import get_db
 
 router = APIRouter(prefix="/v1/state_transitions", tags=["StateTransitions"])
@@ -57,7 +57,7 @@ def history_subagent(
     subagent_id: str,
     limit: int = Query(50, ge=1, le=500),
     db=Depends(get_db),
-    _: dict = Depends(verify_service_or_user),
+    _: str = Depends(verify_service_token),
 ) -> TransitionHistoryResponse:
     rows = list_subagent_transitions(db, subagent_id, limit=limit)
     return TransitionHistoryResponse(

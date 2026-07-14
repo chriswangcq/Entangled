@@ -1,7 +1,7 @@
 """
 entangled/server/sync.py — Git-like sync engine.
 
-Manages per-(entity, params) version tracking, op-log, and sync decisions.
+Manages per-(entity, user, params) version tracking, op-log, and sync decisions.
 This is the "smart protocol" that decides whether to send a snapshot,
 delta pack, head_n (bounded stream window), or up_to_date.
 
@@ -59,11 +59,11 @@ class SyncOp:
         return d
 
 
-# ── Per-(entity, params) sync state ──────────────────────────────
+# ── Per-(entity, user, params) sync state ────────────────────────
 
 @dataclass
 class SyncState:
-    """Version + op-log for one (entity, params) combination."""
+    """Version + op-log for one (entity, optional user, params) partition."""
     current_version: int = 0
     op_log: deque = field(default_factory=lambda: deque(maxlen=1000))
     # client_id → subscribed_at_version
@@ -153,8 +153,26 @@ def _normalize_params(params: Optional[Dict[str, str]]) -> Optional[Dict[str, st
     return params
 
 
-def _state_key(entity: str, params: Optional[Dict[str, str]] = None) -> str:
+def _state_key(
+    entity: str,
+    params: Optional[Dict[str, str]] = None,
+    *,
+    user_id: Optional[str] = None,
+) -> str:
+    """Return the durable sync partition key.
+
+    ``user_id=None`` deliberately preserves the original global-entity key so
+    global subscriptions remain shared. User-owned entities must pass their
+    authenticated owner explicitly; their key uses a structured payload so a
+    user id can never collide with a business ``params`` key.
+    """
     params = _normalize_params(params)
+    if user_id is not None:
+        payload = {
+            "params": sorted(params.items()) if params is not None else [],
+            "user_id": user_id,
+        }
+        return f"{entity}:{json.dumps(payload, sort_keys=True, separators=(',', ':'))}"
     if params is None:
         return entity
     sorted_params = sorted(params.items())
@@ -193,28 +211,62 @@ class SyncRegistry:
         """Configure op_log size for an entity."""
         self._op_log_sizes[entity] = size
 
-    def get_state(self, entity: str, params: Optional[Dict[str, str]] = None) -> SyncState:
+    def get_state(
+        self,
+        entity: str,
+        params: Optional[Dict[str, str]] = None,
+        *,
+        user_id: Optional[str] = None,
+    ) -> SyncState:
         params = _normalize_params(params)
-        key = _state_key(entity, params)
+        key = _state_key(entity, params, user_id=user_id)
         if key not in self._states:
             maxlen = self._op_log_sizes.get(entity, 1000)
-            self._states[key] = SyncState.with_maxlen(maxlen)
+            state = SyncState.with_maxlen(maxlen)
+            if user_id is not None:
+                # Migration fence: the pre-user-partition implementation stored
+                # every tenant under the legacy (entity, params) key. Start each
+                # new user partition one version beyond that history so an old
+                # cache can never compare equal and be called up-to-date. The
+                # empty op-log then deliberately forces snapshot/head_n.
+                legacy_key = _state_key(entity, params)
+                legacy_state = self._states.get(legacy_key)
+                state.current_version = (
+                    legacy_state.current_version if legacy_state is not None else 0
+                ) + 1
+            self._states[key] = state
         return self._states[key]
 
-    def entangle(self, client_id: str, entity: str, params: Optional[Dict[str, str]] = None) -> None:
+    def entangle(
+        self,
+        client_id: str,
+        entity: str,
+        params: Optional[Dict[str, str]] = None,
+        *,
+        user_id: Optional[str] = None,
+    ) -> None:
         params = _normalize_params(params)
-        state = self.get_state(entity, params)
+        state = self.get_state(entity, params, user_id=user_id)
         state.entangle(client_id)
         if client_id not in self._client_subs:
             self._client_subs[client_id] = set()
-        self._client_subs[client_id].add(_state_key(entity, params))
+        self._client_subs[client_id].add(_state_key(entity, params, user_id=user_id))
 
-    def disentangle(self, client_id: str, entity: str, params: Optional[Dict[str, str]] = None) -> None:
+    def disentangle(
+        self,
+        client_id: str,
+        entity: str,
+        params: Optional[Dict[str, str]] = None,
+        *,
+        user_id: Optional[str] = None,
+    ) -> None:
         params = _normalize_params(params)
-        state = self.get_state(entity, params)
+        state = self.get_state(entity, params, user_id=user_id)
         state.disentangle(client_id)
         if client_id in self._client_subs:
-            self._client_subs[client_id].discard(_state_key(entity, params))
+            self._client_subs[client_id].discard(
+                _state_key(entity, params, user_id=user_id)
+            )
 
     def disentangle_all(self, client_id: str) -> None:
         keys = self._client_subs.pop(client_id, set())
@@ -230,12 +282,13 @@ class SyncRegistry:
         params: Optional[Dict[str, str]] = None,
         data: Optional[dict] = None,
         request_id: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> Tuple[SyncState, SyncOp]:
         params = _normalize_params(params)
-        state = self.get_state(entity, params)
+        state = self.get_state(entity, params, user_id=user_id)
         entry = state.append_op(op, entity_id, data, request_id=request_id)
         if self._on_version_bump is not None:
-            key = _state_key(entity, params)
+            key = _state_key(entity, params, user_id=user_id)
             try:
                 self._on_version_bump(key, state.current_version)
             except Exception as e:
@@ -251,9 +304,11 @@ class SyncRegistry:
         self,
         entity: str,
         params: Optional[Dict[str, str]] = None,
+        *,
+        user_id: Optional[str] = None,
     ) -> List[str]:
         params = _normalize_params(params)
-        state = self.get_state(entity, params)
+        state = self.get_state(entity, params, user_id=user_id)
         return list(state.subscribers.keys())
 
     def reset(self) -> None:
@@ -356,7 +411,7 @@ def resolve_sync(
     """Decide sync mode (like git smart protocol).
 
     Args:
-        state: Per-(entity, params) version and op-log.
+        state: Per-(entity, optional user, params) version and op-log.
         client_version: Client's last known server version (None = first entangle).
         client_head: Reserved for stream cursors; None uses version-based sync.
         depth: Client-requested head_n window (WS ``depth``); may be None.
@@ -398,7 +453,28 @@ def resolve_sync(
     # Case 2: Reconnect with version (git pull)
     since = client_version or 0
 
-    if since >= state.current_version:
+    # A scoped-state migration (or disaster recovery) may reset the server
+    # partition below a cached client version. Treat that as a divergent history,
+    # never as "up to date", so stale/cross-tenant cache entries are replaced.
+    if since > state.current_version:
+        if sync_type == "stream":
+            return _stream_head_n_sync(
+                state,
+                fetch_data_fn,
+                depth,
+                default_stream_depth,
+                reason="client_version_ahead",
+                exists_before_fn=exists_before_fn,
+                data_order=data_order,
+                id_field=id_field,
+            )
+        return {
+            "mode": "snapshot",
+            "version": state.current_version,
+            "data": fetch_data_fn(),
+        }
+
+    if since == state.current_version:
         return {
             "mode": "up_to_date",
             "version": state.current_version,

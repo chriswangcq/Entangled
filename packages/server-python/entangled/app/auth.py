@@ -6,6 +6,7 @@ Service-to-service calls use a shared ENTANGLED_SERVICE_TOKEN header.
 
 from __future__ import annotations
 
+import hmac
 import logging
 from typing import Optional
 
@@ -70,6 +71,25 @@ def verify_user_token(authorization: Optional[str] = Header(None)) -> str:
     return user_id
 
 
+def verify_service_token(
+    x_service_token: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
+) -> str:
+    """FastAPI dependency for control-plane routes.
+
+    A user JWT is intentionally not an alternative on this boundary. Service
+    callers may still provide ``X-User-ID`` when the operation targets a tenant;
+    schema/state-machine control routes normally leave it empty.
+    """
+    if not _service_token:
+        raise HTTPException(status_code=503, detail="ENTANGLED_SERVICE_TOKEN not configured")
+    if not x_service_token:
+        raise HTTPException(status_code=401, detail="Missing service token")
+    if not hmac.compare_digest(x_service_token, _service_token):
+        raise HTTPException(status_code=401, detail="Invalid service token")
+    return x_user_id or ""
+
+
 def verify_service_or_user(
     authorization: Optional[str] = Header(None),
     x_service_token: Optional[str] = Header(None),
@@ -77,11 +97,7 @@ def verify_service_or_user(
 ) -> str:
     """Accept either a service token (with X-User-ID) or a user JWT."""
     if x_service_token:
-        if not _service_token:
-            raise HTTPException(status_code=503, detail="ENTANGLED_SERVICE_TOKEN not configured")
-        if x_service_token != _service_token:
-            raise HTTPException(status_code=401, detail="Invalid service token")
-        return x_user_id or ""
+        return verify_service_token(x_service_token, x_user_id)
 
     if authorization and authorization.startswith("Bearer "):
         return verify_user_token(authorization)

@@ -14,7 +14,7 @@ from ..sql.entity_def import SqlEntityDef
 from ..sql.validation import SchemaValidationError, validate_schema_batch
 from ..server.notifier import notify_all
 from ..server.ws_handler import SYNC_CONTRACT_VERSION
-from .auth import verify_service_or_user
+from .auth import verify_service_token
 from .state import get_store
 
 logger = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ class RegisterRequest(BaseModel):
 
 
 @router.post("/v1/schema/register")
-def register_schema(req: RegisterRequest, _user: str = Depends(verify_service_or_user)):
+def register_schema(req: RegisterRequest, _service: str = Depends(verify_service_token)):
     store = get_store()
     try:
         defs = [SqlEntityDef.from_spec(spec) for spec in req.entities]

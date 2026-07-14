@@ -98,34 +98,36 @@ def reset_state() -> None:
 
 # ── User-scope resolution ────────────────────────────────────────
 
-_user_owned_cache: Dict[str, bool] = {}
-
-
-def _is_user_owned(entity: str) -> bool:
+def is_user_owned(entity: str, *, store=None) -> bool:
     """Return True if this entity is user-scoped directly or via parent chain.
 
     User-owned entities must only push deltas to the owning user's clients.
     Global entities (e.g. models) push to all subscribers.
     """
-    if entity in _user_owned_cache:
-        return _user_owned_cache[entity]
-    result = _resolve_user_owned(entity, depth=0)
-    _user_owned_cache[entity] = result
-    return result
+    owner_store = store if store is not None else _store
+    return _resolve_user_owned(entity, owner_store, depth=0, seen=set())
 
 
-def _resolve_user_owned(entity: str, depth: int) -> bool:
-    if _store is None or depth > 8:
+# Private alias retained for hosts that imported the pre-existing helper.
+_is_user_owned = is_user_owned
+
+
+def _resolve_user_owned(entity: str, store, depth: int, seen: set[str]) -> bool:
+    if store is None:
         return False
+    if depth > 32 or entity in seen:
+        raise ValueError(f"Invalid parent ownership chain at '{entity}'")
+    seen = set(seen)
+    seen.add(entity)
     try:
-        defn = _store.get_def(entity)
-    except KeyError:
-        return False
-    if defn.user_scoped:
+        defn = store.get_def(entity)
+    except KeyError as exc:
+        raise ValueError(f"Entity '{entity}' is not registered") from exc
+    if getattr(defn, "user_scoped", False):
         return True
-    if defn.parent:
+    if getattr(defn, "parent", None):
         parent_name = defn.parent[0]
-        return _resolve_user_owned(parent_name, depth + 1)
+        return _resolve_user_owned(parent_name, store, depth + 1, seen)
     return False
 
 
@@ -160,7 +162,13 @@ def _push_delta_to_entangled_clients(
     state,
     sync_op: SyncOp,
 ) -> int:
-    entangled = registry.get_entangled_clients(entity, params)
+    user_owned = is_user_owned(entity)
+    sync_user_id = user_id if user_owned else None
+    entangled = registry.get_entangled_clients(
+        entity,
+        params,
+        user_id=sync_user_id,
+    )
     if not entangled:
         return 0
 
@@ -175,13 +183,12 @@ def _push_delta_to_entangled_clients(
         "ops": [sync_op.to_dict()],
     }
 
-    user_owned = _is_user_owned(entity)
     sent = 0
     for cid in entangled:
         if cid not in _clients:
             continue
         client_uid, push_fn = _clients[cid]
-        if user_owned and user_id and client_uid != user_id:
+        if user_owned and client_uid != user_id:
             continue
         try:
             push_fn("sync", delta_frame)
@@ -214,11 +221,13 @@ def _inproc_notify_entity_change(
     """In-process implementation: record op, push delta to entangled peers."""
     registry = _get_registry()
     op_type = _action_to_op(action)
+    sync_user_id = user_id if is_user_owned(entity) else None
 
     # 1. Record in scoped op_log (with request_id for optimistic correlation).
     state, sync_op = registry.record_op(
         entity, op_type, entity_id or "", params=params, data=data,
         request_id=request_id,
+        user_id=sync_user_id,
     )
 
     # 2. Push exact scoped delta for focused subscribers.
@@ -237,6 +246,7 @@ def _inproc_notify_entity_change(
         global_state, global_sync_op = registry.record_op(
             entity, op_type, entity_id or "", params=None, data=data,
             request_id=request_id,
+            user_id=sync_user_id,
         )
         _push_delta_to_entangled_clients(
             registry=registry,

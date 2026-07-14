@@ -24,7 +24,7 @@ from ..sql.subagent_state import (
     VALID_STATES,
     transition,
 )
-from .auth import verify_service_or_user
+from .auth import verify_service_token
 from .state import get_db
 
 router = APIRouter(prefix="/v1/subagents", tags=["SubagentState"])
@@ -73,7 +73,7 @@ def transition_subagent(
     subagent_id: str,
     req: SubagentTransitionRequest,
     db=Depends(get_db),
-    _: dict = Depends(verify_service_or_user),
+    _: str = Depends(verify_service_token),
 ):
     """Single chokepoint for ``subagents.status`` transitions.
 
@@ -109,7 +109,7 @@ def transition_subagent(
 
 
 @router.get("/states", response_model=SubagentStatesResponse)
-def list_states(_: dict = Depends(verify_service_or_user)):
+def list_states(_: str = Depends(verify_service_token)):
     return SubagentStatesResponse(
         states=sorted(VALID_STATES),
         allowed={k: sorted(v) for k, v in ALLOWED_TRANSITIONS.items()},

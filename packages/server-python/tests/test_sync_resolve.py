@@ -5,6 +5,7 @@ from __future__ import annotations
 from entangled.server.sync import (
     DEFAULT_STREAM_HEAD_DEPTH,
     MAX_STREAM_HEAD_DEPTH,
+    SyncRegistry,
     SyncState,
     resolve_sync,
 )
@@ -139,3 +140,44 @@ def test_list_op_log_gap_still_full_snapshot():
     )
     assert out["mode"] == "snapshot"
     assert limits == [None]
+
+
+def test_client_version_ahead_of_new_partition_forces_snapshot():
+    """A state-key migration resets the server partition; stale clients must re-clone."""
+    state = SyncState(current_version=0)
+
+    out = resolve_sync(
+        state,
+        client_version=17,
+        client_head=None,
+        depth=None,
+        fetch_data_fn=lambda limit=None: [{"id": "owned-row"}],
+        sync_type="list",
+    )
+
+    assert out == {
+        "mode": "snapshot",
+        "version": 0,
+        "data": [{"id": "owned-row"}],
+    }
+
+
+def test_user_partition_migration_fence_forces_snapshot_from_legacy_version():
+    registry = SyncRegistry()
+    registry.hydrate_versions({"messages": 17})
+    state = registry.get_state("messages", user_id="user-1")
+
+    out = resolve_sync(
+        state,
+        client_version=17,
+        client_head=None,
+        depth=None,
+        fetch_data_fn=lambda limit=None: [{"id": "user-1-row"}],
+        sync_type="list",
+    )
+
+    assert out == {
+        "mode": "snapshot",
+        "version": 18,
+        "data": [{"id": "user-1-row"}],
+    }

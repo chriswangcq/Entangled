@@ -135,6 +135,8 @@ def update_where_entity(
         )
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     return {"affected": affected}
 
 
@@ -180,6 +182,8 @@ def create_entity(
         item = store.create(entity, user_id, body, params=params, notify=notify)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"data": item}
@@ -202,6 +206,8 @@ def update_entity(
         item = store.update(entity, user_id, entity_id, body, params=params, notify=notify)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     if item is None:
         raise HTTPException(status_code=404, detail=f"{entity}/{entity_id} not found")
     return {"data": item}
@@ -245,6 +251,8 @@ def upsert_entity(
         item = store.upsert(entity, user_id, entity_id, body, params=params, notify=notify)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     return {"data": item}
 
 
@@ -324,6 +332,8 @@ def append_entity(
         item = store.append(entity, user_id, body, params=params, notify=notify)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     return {"data": item}
 
 
@@ -350,6 +360,8 @@ def batch_update_entities(
         )
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     return {"affected": affected}
 
 
@@ -376,6 +388,8 @@ def cas_update_entity(
         )
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     if result is None:
         raise HTTPException(status_code=409, detail="cas_failed")
     return {"data": result}
@@ -450,5 +464,3 @@ def delete_where(
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"affected": affected}
-
-

@@ -39,7 +39,13 @@ except ImportError:  # pragma: no cover
 class WsSender(Protocol):
     async def send_json(self, data: Any) -> None: ...
 
-from .notifier import register_client, unregister_client, set_store, get_sync_registry
+from .notifier import (
+    get_sync_registry,
+    is_user_owned,
+    register_client,
+    set_store,
+    unregister_client,
+)
 from .protocol import (
     build_ack_frame,
     build_error_frame,
@@ -204,7 +210,12 @@ def create_ws_handler(
                         websocket, store, user_id, client_id, msg,
                     )
                 elif msg_type == "disentangle":
-                    handle_disentangle(client_id, msg, store=store)
+                    handle_disentangle(
+                        client_id,
+                        msg,
+                        store=store,
+                        user_id=user_id,
+                    )
                 elif msg_type == "action":
                     await handle_action(websocket, store, user_id, client_id, msg)
                 elif msg_type in ("ping", "pong", "heartbeat"):
@@ -248,9 +259,10 @@ async def _entangle_one(
         return
 
     registry = get_sync_registry()
-    registry.entangle(client_id, entity, params)
+    sync_user_id = user_id if is_user_owned(entity, store=store) else None
+    registry.entangle(client_id, entity, params, user_id=sync_user_id)
 
-    state = registry.get_state(entity, params)
+    state = registry.get_state(entity, params, user_id=sync_user_id)
     # Copy op-log/version before any await, then run resolve_sync + DB in a worker thread.
     snap = snapshot_for_resolve(state)
 
@@ -305,7 +317,7 @@ async def _entangle_one(
     )
 
     # Reconcile: version may have advanced while the thread ran; delta ops must match live op_log.
-    fresh = registry.get_state(entity, params)
+    fresh = registry.get_state(entity, params, user_id=sync_user_id)
     sync_result["version"] = fresh.current_version
     if sync_result.get("mode") == "delta" and client_version is not None:
         ops2 = fresh.get_ops_since(client_version)
@@ -432,13 +444,20 @@ async def _entangle_deepen(
 
 # ── Disentangle ──────────────────────────────────────────────────
 
-def handle_disentangle(client_id: str, msg: dict, store: Optional[EntityStore] = None) -> None:
+def handle_disentangle(
+    client_id: str,
+    msg: dict,
+    store: Optional[EntityStore] = None,
+    *,
+    user_id: Optional[str] = None,
+) -> None:
     entity, params = parse_disentangle_frame(msg)
     if not entity:
         return
 
     registry = get_sync_registry()
-    registry.disentangle(client_id, entity, params)
+    sync_user_id = user_id if is_user_owned(entity, store=store) else None
+    registry.disentangle(client_id, entity, params, user_id=sync_user_id)
     logger.debug("[WS] %s disentangled from %s", client_id[:8], entity)
 
 # ── Action (first-class mutation verb) ────────────────────────────

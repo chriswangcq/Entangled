@@ -521,6 +521,7 @@ class SqlEntityStore(BaseStore):
         self._apply_defaults(defn, row)
         self._check_required(defn, row)
         with self.db.transaction(defn.lock_type, resource_id=res_id or ""):
+            self._assert_parent_owned(defn, user_id, row)
             self._insert_row(defn, row, is_auto_int=bool(is_auto_int))
             if is_auto_int and row.get(defn.id_field):
                 res_id = str(row[defn.id_field])
@@ -531,6 +532,7 @@ class SqlEntityStore(BaseStore):
     def _sql_update(self, defn: SqlEntityDef, user_id: str, entity_id: str,
                     data: Dict[str, Any], *, params: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
         row = self._in(defn, data)
+        self._discard_immutable_mutations(defn, row)
         if not row:
             return self._sql_get(defn, user_id, entity_id, params=params)
         set_parts, set_vals = [], []
@@ -544,6 +546,7 @@ class SqlEntityStore(BaseStore):
         where_vals.append(entity_id)
         sql = f"UPDATE {defn.table} SET {', '.join(set_parts)} WHERE {where}"
         with self.db.transaction(defn.lock_type, resource_id=entity_id):
+            self._assert_parent_move_owned(defn, user_id, row)
             self.db.execute(sql, tuple(set_vals + where_vals))
         return self._sql_get(defn, user_id, entity_id, params=params)
 
@@ -570,15 +573,30 @@ class SqlEntityStore(BaseStore):
         self._check_required(defn, row)
         cols = list(row.keys())
         ph = ", ".join("?" for _ in cols)
-        update_parts = [f"{c} = excluded.{c}" for c in cols if c != defn.id_field]
+        immutable_cols = {defn.id_field}
+        if defn.user_scoped:
+            immutable_cols.add("user_id")
+        update_parts = [f"{c} = excluded.{c}" for c in cols if c not in immutable_cols]
         if self._should_auto_set_updated_at(defn, row):
             update_parts.append(f"updated_at = {self._timestamp_update_expr()}")
+        ownership_guard, ownership_values = self._upsert_ownership_guard(defn, user_id)
+        target_alias = " AS target" if ownership_guard else ""
         sql = (
-            f"INSERT INTO {defn.table} ({', '.join(cols)}) VALUES ({ph})"
+            f"INSERT INTO {defn.table}{target_alias} ({', '.join(cols)}) VALUES ({ph})"
             f" ON CONFLICT({defn.id_field}) DO UPDATE SET {', '.join(update_parts)}"
         )
+        if ownership_guard:
+            sql += f" WHERE {ownership_guard}"
         with self.db.transaction(defn.lock_type, resource_id=entity_id):
-            self.db.execute(sql, tuple(row[c] for c in cols))
+            self._assert_parent_owned(defn, user_id, row)
+            cur = self.db.execute(
+                sql,
+                tuple(row[c] for c in cols) + tuple(ownership_values),
+            )
+            if ownership_guard and cur.rowcount == 0:
+                raise PermissionError(
+                    f"ownership conflict: {defn.name}/{entity_id} is not owned by user {user_id!r}"
+                )
         result = self._sql_get(defn, user_id, entity_id, params=params)
         return result or row
 
@@ -591,6 +609,7 @@ class SqlEntityStore(BaseStore):
         if not entity_ids:
             return 0
         row = self._in(defn, data)
+        self._discard_immutable_mutations(defn, row)
         if not row:
             return 0
         set_parts, set_vals = [], []
@@ -606,11 +625,20 @@ class SqlEntityStore(BaseStore):
         sql = f"UPDATE {defn.table} SET {', '.join(set_parts)} WHERE {where}"
         res_id = entity_ids[0] if entity_ids else "batch"
         with self.db.transaction("global", resource_id=res_id, timeout=10.0):
+            self._assert_parent_move_owned(defn, user_id, row)
             cur = self.db.execute(sql, tuple(set_vals + where_vals))
             rowcount = cur.rowcount
         if emit_notifications and rowcount > 0:
+            notify_data = self._out(defn, row)
             for eid in entity_ids:
-                self._notify_change(entity, "updated", user_id, entity_id=eid, params=params, data=data)
+                self._notify_change(
+                    entity,
+                    "updated",
+                    user_id,
+                    entity_id=eid,
+                    params=params,
+                    data=notify_data,
+                )
         return rowcount
 
     def count(self, entity: str, user_id: str, *, params: Optional[Dict[str, str]] = None,
@@ -652,6 +680,7 @@ class SqlEntityStore(BaseStore):
                      notify: bool = True) -> int:
         defn = self.get_def(entity)
         row = self._in(defn, data)
+        self._discard_immutable_mutations(defn, row)
         if not row:
             return 0
         set_parts, set_vals = [], []
@@ -669,10 +698,17 @@ class SqlEntityStore(BaseStore):
         sql = f"UPDATE {defn.table} SET {', '.join(set_parts)} WHERE {where}"
         res_id = (params or {}).get(defn.key_params[0] if defn.key_params else "", "batch") or "batch"
         with self.db.transaction("global", resource_id=res_id):
+            self._assert_parent_move_owned(defn, user_id, row)
             cur = self.db.execute(sql, tuple(set_vals + where_vals))
         rowcount = cur.rowcount
         if notify and rowcount > 0:
-            self._notify_change(entity, "updated", user_id, params=params, data=data)
+            self._notify_change(
+                entity,
+                "updated",
+                user_id,
+                params=params,
+                data=self._out(defn, row),
+            )
         return rowcount
 
     def cleanup(self, entity: str, user_id: str, keep_count: int,
@@ -733,6 +769,7 @@ class SqlEntityStore(BaseStore):
         self._apply_defaults(defn, row)
         self._check_required(defn, row)
         with self.db.transaction(defn.lock_type, resource_id=lock_id):
+            self._assert_parent_owned(defn, user_id, row)
             self._insert_row(defn, row, is_auto_int=bool(is_auto_int))
             if is_auto_int and row.get(defn.id_field):
                 res_id = str(row[defn.id_field])
@@ -755,6 +792,7 @@ class SqlEntityStore(BaseStore):
         """Atomic CAS (Compare-And-Swap) update."""
         defn = self.get_def(entity)
         row = self._in(defn, update_data)
+        self._discard_immutable_mutations(defn, row)
         if not row:
             return None
         cols = list(row.keys())
@@ -770,14 +808,15 @@ class SqlEntityStore(BaseStore):
         sql = f"UPDATE {defn.table} SET {', '.join(update_parts)} WHERE {where}"
         resource_id = where_condition.get(defn.id_field, "")
         with self.db.transaction(defn.lock_type, resource_id=str(resource_id)):
+            self._assert_parent_move_owned(defn, user_id, row)
             cur = self.db.execute(sql, tuple(values + where_values))
             if cur.rowcount == 0:
                 return None
-            id_val = update_data.get(defn.id_field) or resource_id
+            id_val = row.get(defn.id_field) or resource_id
             if not id_val:
                 return {"_cas_success": True, "rowcount": cur.rowcount}
         result = self.get(entity, user_id, str(id_val), params=params)
-        notify_data = result if result is not None else self._out(defn, update_data)
+        notify_data = result if result is not None else self._out(defn, row)
         if emit_notifications:
             self._notify_change(entity, "updated", user_id, entity_id=str(id_val), params=params, data=notify_data)
         return result
@@ -855,6 +894,135 @@ class SqlEntityStore(BaseStore):
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
+    @staticmethod
+    def _discard_immutable_mutations(
+        defn: SqlEntityDef,
+        row: Dict[str, Any],
+    ) -> None:
+        """Keep primary keys and direct ownership immutable on update paths.
+
+        Full-row clients commonly echo their primary key and ``user_id`` back,
+        so ignoring those fields is safer and more compatible than rejecting
+        the whole update. Explicit identity/tenant transfers require a separate
+        privileged workflow; generic CRUD never changes either value.
+        """
+        row.pop(defn.id_field, None)
+        if defn.user_scoped:
+            row.pop("user_id", None)
+
+    def _assert_parent_move_owned(
+        self,
+        defn: SqlEntityDef,
+        user_id: str,
+        row: Dict[str, Any],
+    ) -> None:
+        """Validate a new parent FK when an update attempts to move a child."""
+        if not defn.parent:
+            return
+        _parent_name, local_fk, _parent_pk = defn.parent
+        if local_fk in row:
+            self._assert_parent_owned(defn, user_id, row)
+
+    def _ownership_where(
+        self,
+        defn: SqlEntityDef,
+        user_id: str,
+        *,
+        seen: Optional[set[str]] = None,
+    ) -> Tuple[Optional[str], List[Any]]:
+        """Build the recursive user-ownership predicate for ``defn``.
+
+        ``None`` means the entity is truly global. Missing definitions and
+        parent cycles fail closed because silently returning ``1=1`` would turn
+        malformed schema into an authorization bypass.
+        """
+        if not user_id:
+            return None, []
+        if defn.user_scoped:
+            return "user_id = ?", [user_id]
+        if not defn.parent:
+            return None, []
+
+        visited = set(seen or ())
+        if defn.name in visited:
+            raise ValueError(f"Parent ownership cycle detected at '{defn.name}'.")
+        visited.add(defn.name)
+
+        parent_name, local_fk, parent_pk = defn.parent
+        try:
+            parent_def = self.get_def(parent_name)
+        except KeyError as exc:
+            logger.error(
+                "[SqlEntityStore] SECURITY: parent entity '%s' not registered for '%s'.",
+                parent_name,
+                defn.name,
+            )
+            raise ValueError(f"Parent entity '{parent_name}' not registered.") from exc
+
+        parent_where, values = self._ownership_where(
+            parent_def,
+            user_id,
+            seen=visited,
+        )
+        if parent_where is None:
+            return None, []
+        return (
+            f"{local_fk} IN (SELECT {parent_pk} FROM {parent_def.table} "
+            f"WHERE {parent_where})",
+            values,
+        )
+
+    def _assert_parent_owned(
+        self,
+        defn: SqlEntityDef,
+        user_id: str,
+        row: Dict[str, Any],
+    ) -> None:
+        """Reject inserts/moves beneath a parent outside the caller's tenant."""
+        if not defn.parent or not user_id:
+            return
+        parent_name, local_fk, parent_pk = defn.parent
+        parent_def = self.get_def(parent_name)
+        parent_where, owner_values = self._ownership_where(parent_def, user_id)
+        if parent_where is None:
+            return
+        parent_id = row.get(local_fk)
+        if parent_id is None:
+            raise ValueError(
+                f"missing parent key '{local_fk}' for entity '{defn.name}'"
+            )
+        owned = self.db.fetchone(
+            f"SELECT 1 AS owned FROM {parent_def.table} "
+            f"WHERE {parent_pk} = ? AND {parent_where} LIMIT 1",
+            (parent_id, *owner_values),
+        )
+        if not owned:
+            raise PermissionError(
+                f"parent ownership denied: {parent_name}/{parent_id} is not owned by user {user_id!r}"
+            )
+
+    def _upsert_ownership_guard(
+        self,
+        defn: SqlEntityDef,
+        user_id: str,
+    ) -> Tuple[Optional[str], List[Any]]:
+        """Return an atomic ``ON CONFLICT DO UPDATE`` ownership guard."""
+        if defn.user_scoped:
+            return "target.user_id = excluded.user_id", []
+        if not defn.parent or not user_id:
+            return None, []
+
+        parent_name, local_fk, parent_pk = defn.parent
+        parent_def = self.get_def(parent_name)
+        parent_where, values = self._ownership_where(parent_def, user_id)
+        if parent_where is None:
+            return None, []
+        return (
+            f"target.{local_fk} IN (SELECT {parent_pk} FROM {parent_def.table} "
+            f"WHERE {parent_where})",
+            values,
+        )
+
     def _scope_where(self, defn: SqlEntityDef, user_id: str,
                      params: Optional[Dict[str, str]]) -> Tuple[str, List[Any]]:
         clauses, values = [], []
@@ -866,31 +1034,12 @@ class SqlEntityStore(BaseStore):
                 if kp in params:
                     clauses.append(f"{kp} = ?")
                     values.append(params[kp])
-        # Cascading ownership via parent tuple
+        # Cascading ownership via an arbitrary registered parent chain.
         if defn.parent and not defn.user_scoped and user_id:
-            parent_name, local_fk, parent_pk = defn.parent
-            try:
-                parent_def = self.get_def(parent_name)
-                if parent_def.user_scoped:
-                    clauses.append(
-                        f"{local_fk} IN (SELECT {parent_pk} FROM {parent_def.table} WHERE user_id = ?)"
-                    )
-                    values.append(user_id)
-                elif parent_def.parent:
-                    gp_name, gp_fk, gp_pk = parent_def.parent
-                    gp_def = self.get_def(gp_name)
-                    if gp_def.user_scoped:
-                        clauses.append(
-                            f"{local_fk} IN (SELECT {parent_pk} FROM {parent_def.table} "
-                            f"WHERE {gp_fk} IN (SELECT {gp_pk} FROM {gp_def.table} WHERE user_id = ?))"
-                        )
-                        values.append(user_id)
-            except KeyError:
-                logger.error(
-                    "[SqlEntityStore] SECURITY: parent entity '%s' not registered for '%s'.",
-                    parent_name, defn.name,
-                )
-                raise ValueError(f"Parent entity '{parent_name}' not registered.")
+            ownership_where, ownership_values = self._ownership_where(defn, user_id)
+            if ownership_where:
+                clauses.append(ownership_where)
+                values.extend(ownership_values)
         return (" AND ".join(clauses) if clauses else "1=1"), values
 
     def _in(self, defn: SqlEntityDef, data: Dict[str, Any]) -> Dict[str, Any]:
