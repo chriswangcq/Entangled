@@ -14,7 +14,7 @@ mod ws {
     use tokio::sync::{broadcast, mpsc, Mutex, Notify};
     use tokio_tungstenite::{
         connect_async,
-        tungstenite::{client::IntoClientRequest, Message},
+        tungstenite::{client::IntoClientRequest, Error as WsError, Message},
     };
 
     use crate::auth::AuthProvider;
@@ -135,6 +135,21 @@ mod ws {
     const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
     const RECONNECT_JITTER_PCT: u128 = 20;
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ConnectFailure {
+        AuthRejected(u16),
+        Other,
+    }
+
+    fn classify_connect_failure(error: &WsError) -> ConnectFailure {
+        match error {
+            WsError::Http(response) if matches!(response.status().as_u16(), 401 | 403) => {
+                ConnectFailure::AuthRejected(response.status().as_u16())
+            }
+            _ => ConnectFailure::Other,
+        }
+    }
+
     fn reconnect_seed() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -168,7 +183,14 @@ mod ws {
 
     #[cfg(test)]
     mod tests {
-        use super::{reconnect_delay, InMsg, OutMsg, WsTransport, RECONNECT_MAX_DELAY};
+        use super::{
+            classify_connect_failure, reconnect_delay, ConnectFailure, InMsg, OutMsg, WsTransport,
+            RECONNECT_MAX_DELAY,
+        };
+        use tokio_tungstenite::tungstenite::{
+            http::{Response, StatusCode},
+            Error as WsError,
+        };
 
         #[test]
         fn parses_ack_with_canonical_request_id() {
@@ -258,6 +280,49 @@ mod ws {
 
             assert!(error.contains("disconnected"));
         }
+
+        #[test]
+        fn classifies_only_http_401_and_403_as_auth_rejection() {
+            let http_error = |status| {
+                WsError::Http(
+                    Response::builder()
+                        .status(status)
+                        .body(None)
+                        .expect("valid HTTP response"),
+                )
+            };
+
+            assert_eq!(
+                classify_connect_failure(&http_error(StatusCode::UNAUTHORIZED)),
+                ConnectFailure::AuthRejected(401)
+            );
+            assert_eq!(
+                classify_connect_failure(&http_error(StatusCode::FORBIDDEN)),
+                ConnectFailure::AuthRejected(403)
+            );
+            assert_eq!(
+                classify_connect_failure(&http_error(StatusCode::BAD_REQUEST)),
+                ConnectFailure::Other
+            );
+            assert_eq!(
+                classify_connect_failure(&WsError::ConnectionClosed),
+                ConnectFailure::Other
+            );
+        }
+
+        #[tokio::test]
+        async fn reconnect_request_keeps_a_permit_until_the_run_loop_observes_it() {
+            let (transport, _) = WsTransport::new();
+
+            transport.request_reconnect();
+
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                transport.reconnect_requested.notified(),
+            )
+            .await
+            .expect("reconnect request should wake the connection loop");
+        }
     }
 
     type SplitSink = futures_util::stream::SplitSink<
@@ -279,6 +344,8 @@ mod ws {
         pub(crate) push_tx: broadcast::Sender<(String, Option<Value>)>,
         /// Connection state change
         pub(crate) connected_tx: broadcast::Sender<bool>,
+        /// Explicitly interrupts either an active connection or reconnect backoff.
+        reconnect_requested: Notify,
     }
 
     impl WsTransport {
@@ -295,12 +362,32 @@ mod ws {
                 response_tx,
                 push_tx,
                 connected_tx,
+                reconnect_requested: Notify::new(),
             };
             (transport, sync_tx)
         }
 
         pub fn is_connected(&self) -> bool {
-            self.connected.load(std::sync::atomic::Ordering::Relaxed)
+            self.connected.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        /// Interrupt the current connection/backoff so the next handshake reads
+        /// fresh credentials from the shared AuthProvider.
+        pub fn request_reconnect(&self) {
+            // notify_one stores one permit when the run loop is between select
+            // points, so a token update cannot be lost in that race window.
+            self.reconnect_requested.notify_one();
+        }
+
+        async fn mark_disconnected(&self) -> bool {
+            let was_connected = self
+                .connected
+                .swap(false, std::sync::atomic::Ordering::AcqRel);
+            *self.sink.lock().await = None;
+            if was_connected {
+                let _ = self.connected_tx.send(false);
+            }
+            was_connected
         }
 
         /// Send a message to the server.
@@ -462,14 +549,18 @@ mod ws {
                 let retry_delay = tokio::select! {
                     biased;
                     _ = shutdown.notified() => {
+                        self.mark_disconnected().await;
                         tracing::info!("[Entangled] Shutdown requested");
                         return;
                     }
+                    _ = self.reconnect_requested.notified() => {
+                        self.mark_disconnected().await;
+                        retry_attempt = 0;
+                        tracing::info!("[Entangled] Reconnect requested");
+                        continue;
+                    }
                     _ = self.run_single_connection(&ws_base, &auth, &sync_tx) => {
-                        let was_connected = self.connected.load(std::sync::atomic::Ordering::Relaxed);
-                        self.connected.store(false, std::sync::atomic::Ordering::Relaxed);
-                        *self.sink.lock().await = None;
-                        let _ = self.connected_tx.send(false);
+                        let was_connected = self.mark_disconnected().await;
                         let retry_delay = if was_connected {
                             retry_attempt = 0;
                             RECONNECT_BASE_DELAY
@@ -489,7 +580,14 @@ mod ws {
 
                 tokio::select! {
                     biased;
-                    _ = shutdown.notified() => return,
+                    _ = shutdown.notified() => {
+                        self.mark_disconnected().await;
+                        return;
+                    },
+                    _ = self.reconnect_requested.notified() => {
+                        retry_attempt = 0;
+                        tracing::info!("[Entangled] Reconnect requested during backoff");
+                    },
                     _ = tokio::time::sleep(retry_delay) => {}
                 }
             }
@@ -526,17 +624,25 @@ mod ws {
                     s
                 }
                 Err(e) => {
+                    if let ConnectFailure::AuthRejected(status) = classify_connect_failure(&e) {
+                        tracing::warn!(
+                            status,
+                            "[Entangled] Authentication rejected during WebSocket handshake"
+                        );
+                        auth.on_auth_rejected();
+                    }
                     tracing::warn!("[Entangled] Connect failed: {}", e);
                     return;
                 }
             };
 
-            self.connected
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = self.connected_tx.send(true);
-
             let (sink, mut stream) = ws.split();
             *self.sink.lock().await = Some(sink);
+            self.connected
+                .store(true, std::sync::atomic::Ordering::Release);
+            // Publish connected only after send() can observe the sink. Reconnect
+            // subscribers use this edge to restore subscriptions immediately.
+            let _ = self.connected_tx.send(true);
 
             let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
             heartbeat.tick().await;
