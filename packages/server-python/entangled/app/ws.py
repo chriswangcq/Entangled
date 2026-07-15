@@ -190,7 +190,12 @@ async def ws_sync_handler(websocket: WebSocket):
             if msg_type == "entangle":
                 await handle_entangle(sender, store, user_id, client_id, data)
             elif msg_type == "disentangle":
-                handle_disentangle(client_id, data, store=store)
+                handle_disentangle(
+                    client_id,
+                    data,
+                    store=store,
+                    user_id=user_id,
+                )
             elif msg_type == "action":
                 await handle_action(sender, store, user_id, client_id, data)
             elif msg_type == "ping":

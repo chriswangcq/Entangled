@@ -53,7 +53,7 @@ class EntityDef:
     # ── Sync strategy ────────────────────────────────────────────
     sync_type: str = "list"             # "list" (mutable CRUD) | "stream" (append-only)
     sync_limit: Optional[int] = None    # stream only; host should set (e.g. 50)
-    op_log_size: int = 1000             # max op-log entries per (entity, params)
+    op_log_size: int = 1000             # max entries per (entity, optional user, params)
 
     # ── Client entanglement (declared on server, exposed via get_schema()) ───
     # lazy: entangle only when a hook mounts (default).
