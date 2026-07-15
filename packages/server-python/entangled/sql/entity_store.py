@@ -663,6 +663,11 @@ class SqlEntityStore(BaseStore):
         """
 
         defn = self.get_def(entity)
+        if defn.ownership_refs:
+            raise ValueError(
+                "tenant ownership migration does not support additional "
+                "ownership references"
+            )
         source = str(source_user_id or "").strip()
         if source not in _ALLOWED_QUARANTINE_SOURCE_TENANTS:
             raise PermissionError("source owner is not a reserved quarantine tenant")
@@ -1152,9 +1157,16 @@ class SqlEntityStore(BaseStore):
                 f"missing {'ownership' if strict else 'parent'} key "
                 f"'{local_fk}' for entity '{defn.name}'"
             )
+        # Keep the referenced owner stable until the surrounding write
+        # transaction commits. Without a row lock, PostgreSQL READ COMMITTED
+        # permits a delete/recreate race that can replace the same globally
+        # unique id with a different tenant between this check and the child
+        # mutation. Other dialects omit this unsupported syntax and retain
+        # their existing transaction semantics.
+        ownership_lock = " FOR KEY SHARE" if self._is_postgres() else ""
         owned = self.db.fetchone(
             f"SELECT 1 AS owned FROM {parent_def.table} "
-            f"WHERE {parent_pk} = ? AND {parent_where} LIMIT 1",
+            f"WHERE {parent_pk} = ? AND {parent_where} LIMIT 1{ownership_lock}",
             (parent_id, *owner_values),
         )
         if not owned:
