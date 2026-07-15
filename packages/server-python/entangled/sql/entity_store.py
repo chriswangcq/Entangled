@@ -1021,12 +1021,34 @@ class SqlEntityStore(BaseStore):
         user_id: str,
         row: Dict[str, Any],
     ) -> None:
-        """Validate a new parent FK when an update attempts to move a child."""
-        if not defn.parent:
+        """Validate every changed ownership reference before updating a row."""
+        if defn.ownership_refs and not user_id:
+            raise PermissionError(
+                f"tenant identity required for ownership-guarded entity {defn.name!r}"
+            )
+        relationships = self._ownership_relationships(defn)
+        if not relationships:
             return
-        _parent_name, local_fk, _parent_pk = defn.parent
-        if local_fk in row:
-            self._assert_parent_owned(defn, user_id, row)
+        for relationship in relationships:
+            _parent_name, local_fk, _parent_pk = relationship
+            if local_fk in row:
+                self._assert_relationship_owned(
+                    defn,
+                    user_id,
+                    row,
+                    relationship,
+                    strict=relationship in defn.ownership_refs,
+                )
+
+    @staticmethod
+    def _ownership_relationships(
+        defn: SqlEntityDef,
+    ) -> List[Tuple[str, str, str]]:
+        relationships: List[Tuple[str, str, str]] = []
+        if defn.parent:
+            relationships.append(defn.parent)
+        relationships.extend(defn.ownership_refs)
+        return relationships
 
     def _ownership_where(
         self,
@@ -1083,18 +1105,52 @@ class SqlEntityStore(BaseStore):
         user_id: str,
         row: Dict[str, Any],
     ) -> None:
-        """Reject inserts/moves beneath a parent outside the caller's tenant."""
-        if not defn.parent or not user_id:
+        """Reject inserts beneath any ownership relationship outside the tenant."""
+        if defn.ownership_refs and not user_id:
+            raise PermissionError(
+                f"tenant identity required for ownership-guarded entity {defn.name!r}"
+            )
+        relationships = self._ownership_relationships(defn)
+        if not relationships or not user_id:
             return
-        parent_name, local_fk, parent_pk = defn.parent
-        parent_def = self.get_def(parent_name)
+        for relationship in relationships:
+            self._assert_relationship_owned(
+                defn,
+                user_id,
+                row,
+                relationship,
+                strict=relationship in defn.ownership_refs,
+            )
+
+    def _assert_relationship_owned(
+        self,
+        defn: SqlEntityDef,
+        user_id: str,
+        row: Dict[str, Any],
+        relationship: Tuple[str, str, str],
+        *,
+        strict: bool,
+    ) -> None:
+        """Validate one parent/reference against the authenticated tenant."""
+        parent_name, local_fk, parent_pk = relationship
+        try:
+            parent_def = self.get_def(parent_name)
+        except KeyError as exc:
+            raise ValueError(
+                f"ownership entity {parent_name!r} is not registered for {defn.name!r}"
+            ) from exc
         parent_where, owner_values = self._ownership_where(parent_def, user_id)
         if parent_where is None:
+            if strict:
+                raise ValueError(
+                    f"ownership entity {parent_name!r} is not tenant-owned"
+                )
             return
         parent_id = row.get(local_fk)
         if parent_id is None:
             raise ValueError(
-                f"missing parent key '{local_fk}' for entity '{defn.name}'"
+                f"missing {'ownership' if strict else 'parent'} key "
+                f"'{local_fk}' for entity '{defn.name}'"
             )
         owned = self.db.fetchone(
             f"SELECT 1 AS owned FROM {parent_def.table} "
@@ -1103,7 +1159,8 @@ class SqlEntityStore(BaseStore):
         )
         if not owned:
             raise PermissionError(
-                f"parent ownership denied: {parent_name}/{parent_id} is not owned by user {user_id!r}"
+                f"{'ownership' if strict else 'parent ownership'} denied: "
+                f"{parent_name}/{parent_id} is not owned by user {user_id!r}"
             )
 
     def _upsert_ownership_guard(

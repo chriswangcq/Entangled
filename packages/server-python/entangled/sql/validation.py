@@ -170,6 +170,36 @@ def validate_entity_def(
         if known_defs and parent_name in known_defs:
             validate_field_key(known_defs[parent_name], parent_pk, label="parent pk field")
 
+    seen_ownership_refs: set[tuple[str, str, str]] = set()
+    for index, ownership_ref in enumerate(defn.ownership_refs):
+        if not isinstance(ownership_ref, (list, tuple)) or len(ownership_ref) != 3:
+            raise SchemaValidationError(
+                f"invalid ownership_refs[{index}] tuple on entity {defn.name!r}"
+            )
+        parent_name, local_fk, parent_pk = ownership_ref
+        if not all(isinstance(value, str) and value.strip() for value in ownership_ref):
+            raise SchemaValidationError(
+                f"invalid ownership_refs[{index}] values on entity {defn.name!r}"
+            )
+        normalized_ref = (parent_name, local_fk, parent_pk)
+        if normalized_ref == defn.parent:
+            raise SchemaValidationError(
+                f"ownership reference duplicates parent on entity {defn.name!r}"
+            )
+        if normalized_ref in seen_ownership_refs:
+            raise SchemaValidationError(
+                f"duplicate ownership reference {normalized_ref!r} on entity {defn.name!r}"
+            )
+        seen_ownership_refs.add(normalized_ref)
+        validate_entity_name(parent_name)
+        validate_field_key(defn, local_fk, label="ownership reference local field")
+        if known_defs and parent_name in known_defs:
+            validate_field_key(
+                known_defs[parent_name],
+                parent_pk,
+                label="ownership reference parent field",
+            )
+
 
 def validate_schema_batch(
     defs: Iterable[SqlEntityDef],

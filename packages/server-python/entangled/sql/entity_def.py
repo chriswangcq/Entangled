@@ -32,6 +32,8 @@ class SqlEntityDef(BaseEntityDef):
         lock_type:      Transaction lock type (default: "global")
         auto_timestamps: Auto-set updated_at on UPDATE
         parent:         Cascading ownership: (parent_entity, fk_col, parent_pk_col)
+        ownership_refs: Additional tenant-owned references validated on writes.
+                        Unlike ``parent``, these do not affect read scoping.
         default_not_in_filters: Default NOT IN filters for list/list_stream
     """
     table: str = ""
@@ -44,6 +46,9 @@ class SqlEntityDef(BaseEntityDef):
     auto_timestamps: bool = True
     # (parent_entity_name, local_fk_column, parent_pk_column)
     parent: Optional[Tuple[str, str, str]] = None
+    # Extra references whose target row must belong to the authenticated tenant.
+    # These are write guards, not cascade/read-scope relationships.
+    ownership_refs: List[Tuple[str, str, str]] = field(default_factory=list)
     default_not_in_filters: Dict[str, List[Any]] = field(default_factory=dict)
     # ── DDL ────────────────────────────────────────────────────────────────
 
@@ -142,6 +147,7 @@ class SqlEntityDef(BaseEntityDef):
             "subscription_mode": self.subscription_mode,
             "data_order": self.data_order,
             "default_not_in_filters": dict(self.default_not_in_filters),
+            "ownership_refs": [list(ref) for ref in self.ownership_refs],
         }
         if self.parent:
             spec["parent"] = list(self.parent)
@@ -152,6 +158,20 @@ class SqlEntityDef(BaseEntityDef):
     @classmethod
     def from_spec(cls, spec: dict) -> SqlEntityDef:
         fields = [FieldDef.from_spec(f) for f in spec.get("fields", [])]
+        raw_ownership_refs = spec.get("ownership_refs", [])
+        if not isinstance(raw_ownership_refs, list):
+            raise ValueError("ownership_refs must be a list")
+        ownership_refs: List[Tuple[str, str, str]] = []
+        for index, raw_ref in enumerate(raw_ownership_refs):
+            if (
+                not isinstance(raw_ref, (list, tuple))
+                or len(raw_ref) != 3
+                or not all(isinstance(value, str) and value.strip() for value in raw_ref)
+            ):
+                raise ValueError(
+                    f"ownership_refs[{index}] must contain three non-empty strings"
+                )
+            ownership_refs.append((raw_ref[0], raw_ref[1], raw_ref[2]))
         return cls(
             name=spec["name"],
             table=spec.get("table", spec["name"].replace("-", "_")),
@@ -170,5 +190,6 @@ class SqlEntityDef(BaseEntityDef):
             data_order=spec.get("data_order", "desc"),
             default_not_in_filters=spec.get("default_not_in_filters", {}),
             parent=tuple(spec["parent"]) if spec.get("parent") else None,
+            ownership_refs=ownership_refs,
             action_hooks=spec.get("action_hooks", {}),
         )
