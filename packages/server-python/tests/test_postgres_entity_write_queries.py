@@ -4,6 +4,7 @@ import pytest
 from fastapi import HTTPException
 
 from entangled.app import crud
+from entangled.server.ws_handler import _dispatch_action_blocking
 from entangled.sql.entity_def import SqlEntityDef
 from entangled.sql.entity_store import SqlEntityStore
 from entangled.sql.field_def import F
@@ -25,12 +26,20 @@ class _Cursor:
 class _FakePostgresDb:
     backend_name = "postgres"
 
-    def __init__(self, *, rowcount=1, owned_parent_users=None, fetchall_rows=None):
+    def __init__(
+        self,
+        *,
+        rowcount=1,
+        owned_parent_users=None,
+        fetchall_rows=None,
+        fetchone_rows=None,
+    ):
         self.executed = []
         self.returning = []
         self.rowcount = rowcount
         self.owned_parent_users = set(owned_parent_users or [])
         self.fetchall_rows = list(fetchall_rows or [])
+        self.fetchone_rows = list(fetchone_rows or [])
 
     @contextmanager
     def transaction(self, lock_type="global", resource_id="", timeout=None):
@@ -46,6 +55,8 @@ class _FakePostgresDb:
             value in self.owned_parent_users for value in params
         ):
             return {"owned": 1}
+        if self.fetchone_rows:
+            return self.fetchone_rows.pop(0)
         return None
 
     def fetchall(self, sql, params=()):
@@ -215,6 +226,109 @@ def test_postgres_update_does_not_duplicate_explicit_updated_at():
     assert "to_char(timezone('UTC', now())" not in update_sql
     assert update_sql.count("updated_at =") == 1
     assert params[:2] == ("beta", "2026-05-25T00:00:00.000Z")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"name": "cross-tenant"},
+        {"id": "victim-id", "user_id": "attacker"},
+    ],
+)
+def test_user_scoped_update_rejects_missing_or_foreign_target(payload):
+    db = _FakePostgresDb(rowcount=0)
+    store = SqlEntityStore(db=db)
+    widget_def = _widget_def()
+    store.register(widget_def)
+
+    with pytest.raises(PermissionError, match="missing or not owned"):
+        store._sql_update(widget_def, "attacker", "victim-id", payload)
+
+    update_queries = [
+        (sql, params)
+        for sql, params in db.executed
+        if sql.startswith("UPDATE widgets")
+    ]
+    if "name" in payload:
+        assert len(update_queries) == 1
+        sql, params = update_queries[0]
+        assert "WHERE user_id = ? AND id = ?" in sql
+        assert params[-2:] == ("attacker", "victim-id")
+    else:
+        assert update_queries == []
+
+
+def test_user_scoped_owner_noop_update_returns_owned_row():
+    owned_row = {"id": "widget-1", "user_id": "owner", "name": "unchanged"}
+    db = _FakePostgresDb(fetchone_rows=[owned_row])
+    store = SqlEntityStore(db=db)
+    widget_def = _widget_def()
+    store.register(widget_def)
+
+    result = store._sql_update(
+        widget_def,
+        "owner",
+        "widget-1",
+        {"id": "widget-1", "user_id": "owner"},
+    )
+
+    assert result == owned_row
+    assert not any(sql.startswith("UPDATE widgets") for sql, _ in db.executed)
+
+
+def test_global_update_miss_retains_not_found_result():
+    db = _FakePostgresDb(rowcount=0)
+    store = SqlEntityStore(db=db)
+
+    result = store._sql_update(_auto_def(), "service", "404", {"name": "missing"})
+
+    assert result is None
+
+
+def test_websocket_update_rejects_foreign_target_without_notification():
+    db = _FakePostgresDb(rowcount=0)
+    store = SqlEntityStore(db=db)
+    store.register(_widget_def())
+    notifications = []
+    store._notify_change = lambda *args, **kwargs: notifications.append((args, kwargs))
+
+    result = _dispatch_action_blocking(
+        store,
+        "attacker",
+        "widgets",
+        "update",
+        "victim-id",
+        {},
+        {"name": "cross-tenant"},
+        "request-cross-tenant",
+    )
+
+    assert result["success"] is False
+    assert "missing or not owned" in result["error"]
+    assert notifications == []
+
+
+def test_websocket_update_still_allows_owned_target():
+    owned_row = {"id": "widget-1", "user_id": "owner", "name": "updated"}
+    db = _FakePostgresDb(rowcount=1, fetchone_rows=[owned_row])
+    store = SqlEntityStore(db=db)
+    store.register(_widget_def())
+    notifications = []
+    store._notify_change = lambda *args, **kwargs: notifications.append((args, kwargs))
+
+    result = _dispatch_action_blocking(
+        store,
+        "owner",
+        "widgets",
+        "update",
+        "widget-1",
+        {},
+        {"name": "updated"},
+        "request-owner",
+    )
+
+    assert result == {"success": True, "data": owned_row}
+    assert len(notifications) == 1
 
 
 def test_postgres_upsert_uses_postgres_timestamp_expression():
