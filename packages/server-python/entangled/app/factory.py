@@ -20,7 +20,11 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
 from .config import ServiceConfig
-from .auth import configure_auth
+from .auth import (
+    configure_auth,
+    deployment_auth_is_strict,
+    validate_auth_configuration,
+)
 from .state import init_database, close_database, init_store
 from ..metrics import render_metrics
 from ..sql.persistence import ensure_sync_versions_table, load_all_sync_versions, make_version_bump_handler
@@ -54,6 +58,16 @@ def _make_user_existence_checker(db):
 
 
 def create_app(config: ServiceConfig) -> FastAPI:
+    strict_auth = config.strict_auth or deployment_auth_is_strict(config.namespace)
+    # Fail before opening a database or serving a health check. A production
+    # process with collapsed/missing auth domains must never become partially
+    # ready.
+    access_jwt_secret, service_token, namespace = validate_auth_configuration(
+        access_jwt_secret=config.access_jwt_secret,
+        service_token=config.service_token,
+        expected_namespace=config.namespace,
+        strict=strict_auth,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -78,14 +92,15 @@ def create_app(config: ServiceConfig) -> FastAPI:
 
         # 3. EntityStore
         store = init_store(db=db)
-        store._service_token = config.service_token or ""
+        store._service_token = service_token
         logger.info("EntityStore ready (0 entities — waiting for schema registration)")
 
         # 4. Auth(环境绑定 + 用户存在性:Xiaoniu 跨环境事故,2026-07-07)
         configure_auth(
-            jwt_secret=config.jwt_secret,
-            service_token=config.service_token,
-            expected_namespace=config.namespace,
+            access_jwt_secret=access_jwt_secret,
+            service_token=service_token,
+            expected_namespace=namespace,
+            strict=strict_auth,
         )
         if config.enforce_user_exists:
             # opt-in(见 config 注释):Entangled 自库 users 今天非权威源,默认不装。

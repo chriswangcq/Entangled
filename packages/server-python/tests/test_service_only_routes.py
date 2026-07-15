@@ -3,6 +3,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from entangled.app import auth
+from entangled.app.crud import router as crud_router
 from entangled.app.schema import router as schema_router
 from entangled.app.state_transitions import router as state_transitions_router
 from entangled.app.subagent_state import router as subagent_state_router
@@ -21,6 +22,11 @@ def _dependency_names(router, path, method):
     ("router", "path", "method"),
     [
         (schema_router, "/v1/schema/register", "POST"),
+        (
+            crud_router,
+            "/v1/entities/{entity}/migrate-tenant-ownership",
+            "POST",
+        ),
         (
             subagent_state_router,
             "/v1/subagents/{agent_id}/{subagent_id}/transition",
@@ -43,7 +49,11 @@ def test_service_only_dependency_rejects_missing_service_header():
     dependency = getattr(auth, "verify_service_token", None)
     assert dependency is not None
 
-    auth.configure_auth(jwt_secret="jwt-secret", service_token="service-secret")
+    auth.configure_auth(
+        access_jwt_secret="jwt-secret",
+        service_token="service-secret",
+        expected_namespace="test",
+    )
     with pytest.raises(HTTPException) as exc:
         dependency(x_service_token=None, x_user_id=None)
 
@@ -54,7 +64,11 @@ def test_service_only_dependency_accepts_configured_service_header():
     dependency = getattr(auth, "verify_service_token", None)
     assert dependency is not None
 
-    auth.configure_auth(jwt_secret="jwt-secret", service_token="service-secret")
+    auth.configure_auth(
+        access_jwt_secret="jwt-secret",
+        service_token="service-secret",
+        expected_namespace="test",
+    )
     assert dependency(
         x_service_token="service-secret",
         x_user_id="tenant-user",
@@ -62,7 +76,11 @@ def test_service_only_dependency_accepts_configured_service_header():
 
 
 def test_user_bearer_cannot_register_schema():
-    auth.configure_auth(jwt_secret="jwt-secret", service_token="service-secret")
+    auth.configure_auth(
+        access_jwt_secret="jwt-secret",
+        service_token="service-secret",
+        expected_namespace="test",
+    )
     app = FastAPI()
     app.include_router(schema_router)
 

@@ -1,9 +1,20 @@
+import asyncio
+
+from jose import jwt
 import pytest
 
+from entangled.app.auth import (
+    ACCESS_TOKEN_TYPE,
+    access_token_audience,
+    access_token_issuer,
+)
 from entangled.tools.ws_smoke import (
+    build_jwt,
+    build_parser,
     parse_key_values,
     quote_identifier,
     report_contains_secret,
+    run_smoke,
     summarize_frame,
 )
 
@@ -78,3 +89,64 @@ def test_quote_identifier_rejects_unsafe_table_name():
     assert quote_identifier("ws_smoke_stream_events") == '"ws_smoke_stream_events"'
     with pytest.raises(ValueError):
         quote_identifier("ws_smoke_stream_events;drop table x")
+
+
+def test_build_jwt_uses_complete_gateway_contract():
+    token = build_jwt(
+        "jwt-secret",
+        "user-1",
+        "staging",
+        now=1_800_000_000,
+        ttl_seconds=60,
+        jti="smoke-jti-1",
+    )
+    claims = jwt.decode(
+        token,
+        "jwt-secret",
+        algorithms=["HS256"],
+        audience=access_token_audience("staging"),
+        issuer=access_token_issuer("staging"),
+        options={"verify_exp": False},
+    )
+    assert claims == {
+        "typ": ACCESS_TOKEN_TYPE,
+        "iss": access_token_issuer("staging"),
+        "aud": access_token_audience("staging"),
+        "sub": "user-1",
+        "iat": 1_800_000_000,
+        "exp": 1_800_000_060,
+        "ns": "staging",
+        "jti": "smoke-jti-1",
+    }
+
+
+def test_smoke_parser_has_no_shared_token_file_fallback():
+    args = build_parser().parse_args(
+        [
+            "--endpoint", "ws://127.0.0.1:19910/v1/sync",
+            "--jwt-secret-file", "/tmp/jwt-secret",
+            "--service-token-file", "/tmp/service-token",
+            "--namespace", "staging",
+            "--output", "/tmp/report.json",
+        ]
+    )
+    assert not hasattr(args, "token_file")
+
+
+def test_smoke_rejects_equal_jwt_and_service_secrets(tmp_path):
+    jwt_path = tmp_path / "jwt-secret"
+    service_path = tmp_path / "service-token"
+    jwt_path.write_text("same-secret", encoding="utf-8")
+    service_path.write_text("same-secret", encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "--endpoint", "ws://127.0.0.1:19910/v1/sync",
+            "--jwt-secret-file", str(jwt_path),
+            "--service-token-file", str(service_path),
+            "--namespace", "staging",
+            "--output", str(tmp_path / "report.json"),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="must be different"):
+        asyncio.run(run_smoke(args))

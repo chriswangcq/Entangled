@@ -23,6 +23,10 @@ from .validation import normalize_order_by, validate_field_key_with_extras, vali
 
 logger = logging.getLogger(__name__)
 
+TENANT_OWNERSHIP_MIGRATION_MAX_ITEMS = 5000
+_QUARANTINE_TENANT_PREFIX = "__legacy_unowned_"
+_ALLOWED_QUARANTINE_SOURCE_TENANTS = frozenset({"__legacy_unowned__"})
+
 
 def _iso_now_utc() -> str:
     """ISO-8601 UTC timestamp with millisecond precision and 'Z' suffix.
@@ -640,6 +644,107 @@ class SqlEntityStore(BaseStore):
                     data=notify_data,
                 )
         return rowcount
+
+    def migrate_quarantined_tenant_ownership(
+        self,
+        entity: str,
+        source_user_id: str,
+        items: List[Dict[str, str]],
+        *,
+        emit_notifications: bool = True,
+    ) -> Dict[str, Any]:
+        """Atomically assign quarantined rows to verified tenant parents.
+
+        This is deliberately narrower than generic owner transfer.  Only rows
+        held under a reserved legacy-quarantine owner can move, and each target
+        parent must already belong to the requested tenant.  A single SQL
+        statement handles the whole bounded batch, so startup migrations do not
+        perform thousands of HTTP read/delete/create round trips.
+        """
+
+        defn = self.get_def(entity)
+        source = str(source_user_id or "").strip()
+        if source not in _ALLOWED_QUARANTINE_SOURCE_TENANTS:
+            raise PermissionError("source owner is not a reserved quarantine tenant")
+        if not defn.user_scoped or not defn.parent:
+            raise ValueError("tenant ownership migration requires a parent-scoped entity")
+        if not items:
+            return {"completed_ids": [], "completed": 0, "skipped": 0}
+        if len(items) > TENANT_OWNERSHIP_MIGRATION_MAX_ITEMS:
+            raise ValueError(
+                f"tenant ownership migration is limited to "
+                f"{TENANT_OWNERSHIP_MIGRATION_MAX_ITEMS} items"
+            )
+
+        parent_name, local_parent_field, parent_id_field = defn.parent
+        parent_def = self.get_def(parent_name)
+        if not parent_def.user_scoped:
+            raise ValueError("tenant ownership migration requires a user-scoped parent")
+        if "user_id" not in defn.field_map or "user_id" not in parent_def.field_map:
+            raise ValueError("tenant ownership migration requires direct user_id fields")
+        if local_parent_field not in defn.field_map:
+            raise ValueError("tenant ownership migration parent field is not registered")
+
+        normalized: List[tuple[str, str, str]] = []
+        seen_ids: set[str] = set()
+        for item in items:
+            entity_id = str(item.get("entity_id") or "").strip()
+            target_user_id = str(item.get("user_id") or "").strip()
+            target_parent_id = str(item.get("parent_id") or "").strip()
+            if not entity_id or not target_user_id or not target_parent_id:
+                raise ValueError("migration items require entity_id, user_id, and parent_id")
+            if target_user_id.startswith(_QUARANTINE_TENANT_PREFIX):
+                raise PermissionError("target owner cannot be a quarantine tenant")
+            if entity_id in seen_ids:
+                raise ValueError(f"duplicate migration entity_id: {entity_id}")
+            seen_ids.add(entity_id)
+            normalized.append((entity_id, target_user_id, target_parent_id))
+
+        value_rows = ", ".join("(?, ?, ?)" for _ in normalized)
+        values: List[str] = []
+        for entity_id, target_user_id, target_parent_id in normalized:
+            values.extend((entity_id, target_user_id, target_parent_id))
+        values.append(source)
+
+        sql = f"""
+            WITH requested(entity_id, target_user_id, target_parent_id) AS (
+                VALUES {value_rows}
+            ), eligible AS (
+                SELECT requested.entity_id,
+                       requested.target_user_id,
+                       requested.target_parent_id
+                  FROM requested
+                  JOIN {parent_def.table} AS parent
+                    ON parent.{parent_id_field} = requested.target_parent_id
+                   AND parent.user_id = requested.target_user_id
+            )
+            UPDATE {defn.table} AS target
+               SET user_id = eligible.target_user_id,
+                   {local_parent_field} = eligible.target_parent_id
+              FROM eligible
+             WHERE target.{defn.id_field} = eligible.entity_id
+               AND (
+                    target.user_id = ?
+                    OR (
+                        target.user_id = eligible.target_user_id
+                        AND target.{local_parent_field} = eligible.target_parent_id
+                    )
+               )
+            RETURNING target.{defn.id_field} AS entity_id,
+                      target.user_id AS user_id
+        """
+        with self.db.transaction("global", resource_id=f"tenant-migration:{entity}", timeout=15.0):
+            completed_rows = self.db.fetchall(sql, tuple(values))
+
+        completed_ids = sorted(str(row["entity_id"]) for row in completed_rows)
+        if emit_notifications:
+            for tenant_id in sorted({str(row["user_id"]) for row in completed_rows}):
+                self._notify_change(entity, "clear", tenant_id)
+        return {
+            "completed_ids": completed_ids,
+            "completed": len(completed_ids),
+            "skipped": len(normalized) - len(completed_ids),
+        }
 
     def count(self, entity: str, user_id: str, *, params: Optional[Dict[str, str]] = None,
               filters: Optional[Dict[str, Any]] = None) -> int:

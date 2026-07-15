@@ -14,11 +14,14 @@ class ServiceConfig:
     port: int = 19900
     postgres_dsn: str = ""
     postgres_dsn_file: str = ""
-    jwt_secret: str = ""
+    access_jwt_secret: str = ""
     service_token: str = ""
+    # Explicit strict mode is useful before a namespace is assigned. Any
+    # non-empty deployment namespace enables it automatically in app.factory.
+    strict_auth: bool = False
     log_level: str = "INFO"
-    # 环境绑定(Xiaoniu 跨环境事故,2026-07-07):非空时,携带 ns 声明的用户 JWT
-    # 必须与本环境一致才放行;缺 ns 的旧 token 容忍(跨环境已由密钥分叉止血)。
+    # Access JWTs always carry this exact namespace. Staging/prod reject a
+    # missing namespace and cannot start without one.
     namespace: str = ""
     # WS 建连用户存在性检查(默认关):Entangled 自库的 users 表今天不是权威用户
     # 存储(prod 该表仅 1 条遗留行,真用户在别处)—— 开着会拒掉所有真用户。启用
