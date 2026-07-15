@@ -3,6 +3,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from entangled.app import auth
+from entangled.app.crud import router as crud_router
 from entangled.app.schema import router as schema_router
 from entangled.app.state_transitions import router as state_transitions_router
 from entangled.app.subagent_state import router as subagent_state_router
@@ -21,6 +22,11 @@ def _dependency_names(router, path, method):
     ("router", "path", "method"),
     [
         (schema_router, "/v1/schema/register", "POST"),
+        (
+            crud_router,
+            "/v1/entities/{entity}/migrate-tenant-ownership",
+            "POST",
+        ),
         (
             subagent_state_router,
             "/v1/subagents/{agent_id}/{subagent_id}/transition",

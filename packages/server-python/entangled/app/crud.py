@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 
-from .auth import verify_service_or_user
+from .auth import verify_service_or_user, verify_service_token
 from .state import get_store
 
 logger = logging.getLogger(__name__)
@@ -338,6 +338,46 @@ def append_entity(
 
 
 # ── Batch update ──────────────────────────────────────────────────────────
+
+
+class TenantOwnershipMigrationItem(BaseModel):
+    entity_id: str
+    user_id: str
+    parent_id: str
+
+
+class TenantOwnershipMigrationBody(BaseModel):
+    source_user_id: str
+    items: List[TenantOwnershipMigrationItem]
+
+
+@router.post("/{entity}/migrate-tenant-ownership")
+def migrate_tenant_ownership(
+    entity: str,
+    body: TenantOwnershipMigrationBody,
+    _service_user: str = Depends(verify_service_token),
+):
+    """Move reserved quarantine rows to verified tenant parents in one batch."""
+
+    store = get_store()
+    migrate = getattr(store, "migrate_quarantined_tenant_ownership", None)
+    if not callable(migrate):
+        raise HTTPException(
+            status_code=409,
+            detail="storage backend does not support tenant ownership migration",
+        )
+    try:
+        return migrate(
+            entity,
+            body.source_user_id,
+            [item.model_dump() for item in body.items],
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 class BatchUpdateBody(BaseModel):

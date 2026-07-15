@@ -25,11 +25,12 @@ class _Cursor:
 class _FakePostgresDb:
     backend_name = "postgres"
 
-    def __init__(self, *, rowcount=1, owned_parent_users=None):
+    def __init__(self, *, rowcount=1, owned_parent_users=None, fetchall_rows=None):
         self.executed = []
         self.returning = []
         self.rowcount = rowcount
         self.owned_parent_users = set(owned_parent_users or [])
+        self.fetchall_rows = list(fetchall_rows or [])
 
     @contextmanager
     def transaction(self, lock_type="global", resource_id="", timeout=None):
@@ -49,7 +50,7 @@ class _FakePostgresDb:
 
     def fetchall(self, sql, params=()):
         self.executed.append((sql, params))
-        return []
+        return list(self.fetchall_rows)
 
     def insert_returning_id(self, sql, params=()):
         self.returning.append((sql, params))
@@ -140,6 +141,35 @@ def _task_def(*, sync_type="list") -> SqlEntityDef:
         fields=[
             F.text("id", primary=True),
             F.text("project_id", nullable=False, index=True),
+            F.text("name", nullable=False),
+        ],
+    )
+
+
+def _api_key_def() -> SqlEntityDef:
+    return SqlEntityDef(
+        name="api-keys",
+        table="api_keys",
+        id_field="id",
+        user_scoped=True,
+        fields=[
+            F.text("id", primary=True),
+            F.text("user_id", nullable=False, index=True),
+        ],
+    )
+
+
+def _model_def() -> SqlEntityDef:
+    return SqlEntityDef(
+        name="models",
+        table="models",
+        id_field="model_id",
+        user_scoped=True,
+        parent=("api-keys", "api_key_id", "id"),
+        fields=[
+            F.text("model_id", primary=True),
+            F.text("user_id", nullable=False, index=True),
+            F.text("api_key_id", nullable=False, index=True),
             F.text("name", nullable=False),
         ],
     )
@@ -278,6 +308,105 @@ def test_global_upsert_remains_shared_and_has_no_owner_guard():
     upsert_sql, _ = db.executed[0]
     assert " AS target" not in upsert_sql
     assert " WHERE " not in upsert_sql
+
+
+def test_quarantined_tenant_migration_is_one_atomic_parent_verified_update():
+    db = _FakePostgresDb(
+        fetchall_rows=[{"entity_id": "model-1", "user_id": "owner"}]
+    )
+    store = SqlEntityStore(db=db)
+    store.register(_api_key_def())
+    store.register(_model_def())
+
+    result = store.migrate_quarantined_tenant_ownership(
+        "models",
+        "__legacy_unowned__",
+        [
+            {
+                "entity_id": "model-1",
+                "user_id": "owner",
+                "parent_id": "owner-key",
+            },
+            {
+                "entity_id": "model-2",
+                "user_id": "other-owner",
+                "parent_id": "other-key",
+            },
+        ],
+        emit_notifications=False,
+    )
+
+    assert result == {
+        "completed_ids": ["model-1"],
+        "completed": 1,
+        "skipped": 1,
+    }
+    assert len(db.executed) == 1
+    sql, params = db.executed[0]
+    assert "WITH requested" in sql
+    assert "JOIN api_keys AS parent" in sql
+    assert "parent.user_id = requested.target_user_id" in sql
+    assert "UPDATE models AS target" in sql
+    assert "target.user_id = ?" in sql
+    assert params == (
+        "model-1",
+        "owner",
+        "owner-key",
+        "model-2",
+        "other-owner",
+        "other-key",
+        "__legacy_unowned__",
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_user_id", "items", "message"),
+    [
+        (
+            "victim-user",
+            [{"entity_id": "m1", "user_id": "owner", "parent_id": "key"}],
+            "reserved quarantine",
+        ),
+        (
+            "__legacy_unowned__",
+            [
+                {"entity_id": "m1", "user_id": "owner", "parent_id": "key"},
+                {"entity_id": "m1", "user_id": "owner", "parent_id": "key"},
+            ],
+            "duplicate",
+        ),
+        (
+            "__legacy_unowned__",
+            [
+                {
+                    "entity_id": "m1",
+                    "user_id": "__legacy_unowned_attacker__",
+                    "parent_id": "key",
+                }
+            ],
+            "quarantine tenant",
+        ),
+    ],
+)
+def test_quarantined_tenant_migration_rejects_owner_transfer_expansion(
+    source_user_id,
+    items,
+    message,
+):
+    db = _FakePostgresDb()
+    store = SqlEntityStore(db=db)
+    store.register(_api_key_def())
+    store.register(_model_def())
+
+    with pytest.raises((PermissionError, ValueError), match=message):
+        store.migrate_quarantined_tenant_ownership(
+            "models",
+            source_user_id,
+            items,
+            emit_notifications=False,
+        )
+
+    assert db.executed == []
 
 
 @pytest.mark.parametrize(
