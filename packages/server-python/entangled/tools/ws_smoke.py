@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import re
+import secrets
 import time
 from pathlib import Path
 from typing import Any
@@ -34,10 +36,41 @@ def load_secret_file(path: str | None) -> str | None:
     return Path(path).read_text(encoding="utf-8").strip()
 
 
-def build_jwt(secret: str, user_id: str) -> str:
+def build_jwt(
+    secret: str,
+    user_id: str,
+    namespace: str,
+    *,
+    now: int | None = None,
+    ttl_seconds: int = 300,
+    jti: str | None = None,
+) -> str:
     from jose import jwt
+    from entangled.app.auth import (
+        ACCESS_TOKEN_ALGORITHM,
+        ACCESS_TOKEN_TYPE,
+        access_token_audience,
+        access_token_issuer,
+    )
 
-    return jwt.encode({"sub": user_id, "iat": int(time.time())}, secret, algorithm="HS256")
+    issued_at = int(time.time() if now is None else now)
+    if not secret.strip() or not user_id.strip() or not namespace.strip():
+        raise ValueError("JWT secret, user id, and namespace are required")
+    if not 1 <= ttl_seconds <= 300:
+        raise ValueError("smoke JWT ttl must be between 1 and 300 seconds")
+    claims = {
+        "typ": ACCESS_TOKEN_TYPE,
+        "iss": access_token_issuer(namespace.strip()),
+        "aud": access_token_audience(namespace.strip()),
+        "sub": user_id.strip(),
+        "iat": issued_at,
+        "exp": issued_at + ttl_seconds,
+        "ns": namespace.strip(),
+        "jti": (jti or secrets.token_urlsafe(24)).strip(),
+    }
+    if not claims["jti"]:
+        raise ValueError("smoke JWT jti is required")
+    return jwt.encode(claims, secret.strip(), algorithm=ACCESS_TOKEN_ALGORITHM)
 
 
 def _entity_names_from_schema(frame: dict[str, Any]) -> list[str]:
@@ -216,11 +249,20 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
     if "token=" in args.endpoint:
         raise ValueError("endpoint must not contain query-string tokens; use Authorization-header JWT auth")
-    jwt_secret = load_secret_file(args.jwt_secret_file or args.token_file)
-    service_token = load_secret_file(args.service_token_file or args.token_file)
+    jwt_secret = load_secret_file(args.jwt_secret_file)
+    service_token = load_secret_file(args.service_token_file)
     if not jwt_secret:
-        raise ValueError("jwt secret file or token file is required")
-    ws_jwt = build_jwt(jwt_secret, args.user_id)
+        raise ValueError("independent JWT secret file is required")
+    if not service_token:
+        raise ValueError("independent service token file is required")
+    if hmac.compare_digest(jwt_secret.encode(), service_token.encode()):
+        raise ValueError("JWT secret and service token must be different")
+    ws_jwt = build_jwt(
+        jwt_secret,
+        args.user_id,
+        args.namespace,
+        ttl_seconds=args.jwt_ttl_seconds,
+    )
     params = parse_key_values(args.stream_param)
     frame_summaries: list[dict[str, Any]] = []
     request_id_prefix = f"ws-smoke-{int(time.time())}"
@@ -360,8 +402,16 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             "raw_dsn_recorded": False,
         },
     }
-    secrets = [jwt_secret, service_token, ws_jwt, load_secret_file(args.postgres_dsn_file)]
-    report["secret_policy"]["report_contains_secret"] = report_contains_secret(report, [s for s in secrets if s])
+    sensitive_values = [
+        jwt_secret,
+        service_token,
+        ws_jwt,
+        load_secret_file(args.postgres_dsn_file),
+    ]
+    report["secret_policy"]["report_contains_secret"] = report_contains_secret(
+        report,
+        [value for value in sensitive_values if value],
+    )
     return report
 
 
@@ -369,9 +419,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run an Entangled WebSocket sync smoke.")
     parser.add_argument("--endpoint", required=True, help="WebSocket endpoint, e.g. ws://127.0.0.1:19910/v1/sync")
     parser.add_argument("--http-base", default=None, help="HTTP base URL used for optional REST write, e.g. http://127.0.0.1:19910")
-    parser.add_argument("--token-file", default=None, help="Shared staging secret file used for JWT signing and service-token REST auth")
-    parser.add_argument("--jwt-secret-file", default=None, help="JWT signing secret file for WebSocket auth")
-    parser.add_argument("--service-token-file", default=None, help="Service token file for REST writes")
+    parser.add_argument("--jwt-secret-file", required=True, help="Independent JWT signing secret file for WebSocket auth")
+    parser.add_argument("--service-token-file", required=True, help="Independent service token file for REST writes")
+    parser.add_argument("--namespace", required=True, help="Exact access-token namespace (staging/prod)")
+    parser.add_argument("--jwt-ttl-seconds", type=int, default=300, help="Smoke access-token TTL (1..300 seconds)")
     parser.add_argument("--postgres-dsn-file", default=None, help="Optional Postgres DSN file for version/rowid evidence")
     parser.add_argument("--user-id", default=DEFAULT_USER_ID)
     parser.add_argument("--list-entity", default="rest-smoke-events")

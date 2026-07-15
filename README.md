@@ -23,10 +23,18 @@ packages/server-python/entangled/
 # 从源码
 cd packages/server-python
 pip install -e ".[app]"
-python -m entangled.app.main --port 19900 --postgres-dsn-file /opt/novaic/postgres/secrets/novaic_entangled_dsn
+python -m entangled.app.main --port 19900 \
+  --postgres-dsn-file /opt/novaic/postgres/secrets/novaic_entangled_dsn \
+  --jwt-secret-file /run/secrets/access_jwt_secret \
+  --service-token-file /run/secrets/entangled_service_token \
+  --namespace staging
 
 # 或直接 CLI
-entangled-service --port 19900 --postgres-dsn-file /opt/novaic/postgres/secrets/novaic_entangled_dsn
+entangled-service --port 19900 \
+  --postgres-dsn-file /opt/novaic/postgres/secrets/novaic_entangled_dsn \
+  --jwt-secret-file /run/secrets/access_jwt_secret \
+  --service-token-file /run/secrets/entangled_service_token \
+  --namespace staging
 ```
 
 运行配置通过 CLI 参数传入，`packages/server-python/entangled/app/config.py`
@@ -37,7 +45,9 @@ entangled-service --port 19900 --postgres-dsn-file /opt/novaic/postgres/secrets/
 | `--host` | `0.0.0.0` | 绑定地址 |
 | `--port` | `19900` | 端口 |
 | `--postgres-dsn-file` | _(必填)_ | Postgres DSN 文件 |
-| `--service-token` | _(空)_ | 服务间认证 token，同时作为 `jwt_secret` |
+| `--jwt-secret-file` | _(空)_ | Gateway 用户 access JWT 验签密钥文件 |
+| `--service-token-file` | _(空)_ | 独立的服务间认证 token 文件，不得与 JWT 密钥相同 |
+| `--namespace` | _(空)_ | access JWT 精确环境绑定；配置后自动启用严格模式 |
 | `--log-level` | `INFO` | 日志级别 |
 
 ## 作为库使用

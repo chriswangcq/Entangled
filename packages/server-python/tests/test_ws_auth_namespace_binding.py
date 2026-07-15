@@ -4,8 +4,8 @@
 HS256 签名 + sub 非空,既不识别 token 的签发环境、也不查用户是否存在于本环境
 → 为一个 prod 用户表中不存在的 staging 用户建了孤儿 agent。
 
-纵深防御两层(独立于"每环境独立 jwt_secret"的止血):
-* ns 环境绑定:token 携带异环境 ns 一律拒;缺 ns 容忍(旧 token 兼容)。
+纵深防御两层(独立于"每环境独立 access JWT secret"的止血):
+ * ns 环境绑定:token 必须精确匹配;缺 ns/异环境一律拒绝。
 * 用户存在性:WS 建连时本环境 users 表查无此人 → 拒连;表不可用(bootstrap)放行。
 """
 from entangled.app.auth import check_namespace_claim
@@ -23,14 +23,12 @@ def test_ns_match_allowed():
     assert check_namespace_claim({"sub": "u1", "ns": "prod"}, "prod") is None
 
 
-def test_legacy_token_without_ns_allowed():
-    # 旧 token 兼容:跨环境已由密钥分叉止血,这里不强制全员重登。
-    assert check_namespace_claim({"sub": "u1"}, "prod") is None
+def test_legacy_token_without_ns_rejected():
+    assert check_namespace_claim({"sub": "u1"}, "prod") is not None
 
 
-def test_binding_disabled_when_expected_empty():
-    # 未配置 --namespace(dev/单环境)= 不启用绑定。
-    assert check_namespace_claim({"sub": "u1", "ns": "staging"}, "") is None
+def test_missing_expected_namespace_rejected():
+    assert check_namespace_claim({"sub": "u1", "ns": "staging"}, "") is not None
 
 
 # ── 用户存在性 checker ───────────────────────────────────────────────────────

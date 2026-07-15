@@ -1,63 +1,268 @@
-"""JWT + Service Token authentication middleware.
+"""Strict user access JWT and independent service-token authentication.
 
-Gateway signs HS256 JWTs; Entangled Service verifies them.
-Service-to-service calls use a shared ENTANGLED_SERVICE_TOKEN header.
+Gateway signs HS256 user access JWTs; Entangled verifies the exact token
+contract. Service-to-service calls use a separate opaque token. The two
+secrets are deliberately different trust domains.
 """
 
 from __future__ import annotations
 
 import hmac
 import logging
+import time
 from typing import Optional
 
 from fastapi import Header, HTTPException
 
 logger = logging.getLogger(__name__)
 
-_jwt_secret: str = ""
+ACCESS_TOKEN_TYPE = "novaic-access+jwt"
+ACCESS_TOKEN_ISSUER_PREFIX = "novaic-gateway:"
+ACCESS_TOKEN_AUDIENCE_PREFIX = "novaic-api:"
+ACCESS_TOKEN_ALGORITHM = "HS256"
+
+_REQUIRED_ACCESS_CLAIMS = frozenset(
+    {
+        "typ",
+        "iss",
+        "aud",
+        "sub",
+        "exp",
+        "iat",
+        "ns",
+        "jti",
+    }
+)
+_ALLOWED_ACCESS_CLAIMS = _REQUIRED_ACCESS_CLAIMS | {"email"}
+
+_access_jwt_secret: str = ""
 _service_token: str = ""
 _expected_namespace: str = ""
 
 
-def configure_auth(*, jwt_secret: str, service_token: str, expected_namespace: str = "") -> None:
-    global _jwt_secret, _service_token, _expected_namespace
-    _jwt_secret = jwt_secret
-    _service_token = service_token
-    _expected_namespace = expected_namespace
+class AuthConfigurationError(RuntimeError):
+    """The process cannot establish independent authentication domains."""
+
+
+class AccessTokenClaimsError(ValueError):
+    """A signed token does not satisfy the user access-token contract."""
+
+
+def access_token_issuer(namespace: str) -> str:
+    return f"{ACCESS_TOKEN_ISSUER_PREFIX}{namespace}"
+
+
+def access_token_audience(namespace: str) -> str:
+    return f"{ACCESS_TOKEN_AUDIENCE_PREFIX}{namespace}"
+
+
+def deployment_auth_is_strict(namespace: str) -> bool:
+    """Every explicitly named deployment uses strict authentication."""
+
+    return isinstance(namespace, str) and bool(namespace.strip())
+
+
+def validate_auth_configuration(
+    *,
+    access_jwt_secret: str,
+    service_token: str,
+    expected_namespace: str,
+    strict: bool,
+) -> tuple[str, str, str]:
+    """Validate and normalize authentication configuration without side effects."""
+
+    if not isinstance(access_jwt_secret, str):
+        raise AuthConfigurationError("access JWT verifier secret must be a string")
+    if not isinstance(service_token, str):
+        raise AuthConfigurationError("service token must be a string")
+    if not isinstance(expected_namespace, str):
+        raise AuthConfigurationError("namespace must be a string")
+    access_secret = access_jwt_secret.strip()
+    internal_secret = service_token.strip()
+    namespace = expected_namespace.strip()
+    if namespace and namespace != expected_namespace:
+        raise AuthConfigurationError("namespace must be a canonical string")
+
+    if strict:
+        missing = [
+            name
+            for name, value in (
+                ("access JWT verifier secret", access_secret),
+                ("service token", internal_secret),
+                ("namespace", namespace),
+            )
+            if not value
+        ]
+        if missing:
+            raise AuthConfigurationError(
+                "strict auth requires non-empty " + ", ".join(missing)
+            )
+    if access_secret and internal_secret and hmac.compare_digest(
+        access_secret.encode("utf-8"),
+        internal_secret.encode("utf-8"),
+    ):
+        raise AuthConfigurationError(
+            "access JWT verifier secret and service token must be different"
+        )
+    return access_secret, internal_secret, namespace
+
+
+def configure_auth(
+    *,
+    access_jwt_secret: str,
+    service_token: str,
+    expected_namespace: str = "",
+    strict: bool = False,
+) -> None:
+    global _access_jwt_secret, _service_token, _expected_namespace
+    access_secret, internal_secret, namespace = validate_auth_configuration(
+        access_jwt_secret=access_jwt_secret,
+        service_token=service_token,
+        expected_namespace=expected_namespace,
+        strict=strict,
+    )
+    _access_jwt_secret = access_secret
+    _service_token = internal_secret
+    _expected_namespace = namespace
 
 
 def check_namespace_claim(payload: dict, expected_namespace: str) -> "str | None":
-    """**纯核**:环境绑定判定(Xiaoniu 跨环境事故,2026-07-07)。
+    """Return a rejection reason unless ``ns`` exactly matches deployment."""
 
-    返回 None = 放行;返回 str = 拒绝理由。规则:
-    * expected 未配置 → 放行(未启用绑定);
-    * token 无 ns 声明 → 放行(旧 token 兼容;跨环境已由每环境独立 jwt_secret 止血,
-      本检查是纵深防御 —— 防的是将来密钥又被配成一样);
-    * token 有 ns 且 != expected → 拒绝(别的环境签的 token,签名再有效也不认)。
-    """
-    if not expected_namespace:
-        return None
+    if (
+        not isinstance(expected_namespace, str)
+        or not expected_namespace
+        or expected_namespace != expected_namespace.strip()
+    ):
+        return "access-token namespace is not configured"
+    expected = expected_namespace
     token_ns = payload.get("ns")
-    if token_ns is None:
-        return None
-    if str(token_ns) != expected_namespace:
-        return f"token namespace {token_ns!r} does not match this environment {expected_namespace!r}"
+    if (
+        not isinstance(token_ns, str)
+        or not token_ns
+        or token_ns != token_ns.strip()
+    ):
+        return "token namespace is missing or invalid"
+    if token_ns != expected:
+        return f"token namespace {token_ns!r} does not match this environment {expected!r}"
     return None
 
 
-def _decode_jwt(token: str) -> dict:
-    from jose import jwt, JWTError
-    if not _jwt_secret:
-        raise HTTPException(status_code=503, detail="JWT_SECRET not configured on Entangled Service")
-    try:
-        payload = jwt.decode(token, _jwt_secret, algorithms=["HS256"])
-    except JWTError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
-    reason = check_namespace_claim(payload, _expected_namespace)
+def _required_text(payload: dict, claim: str) -> str:
+    value = payload.get(claim)
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+    ):
+        raise AccessTokenClaimsError(
+            f"{claim} must be a non-empty canonical string"
+        )
+    return value
+
+
+def _numeric_date(payload: dict, claim: str) -> int:
+    value = payload.get(claim)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AccessTokenClaimsError(f"{claim} must be an integer NumericDate")
+    return value
+
+
+def _verification_time(now: int | float | None) -> int:
+    if now is None:
+        return int(time.time())
+    if isinstance(now, bool) or not isinstance(now, (int, float)):
+        raise AccessTokenClaimsError("verification time must be a numeric timestamp")
+    return int(now)
+
+
+def validate_access_token_claims(
+    payload: dict,
+    *,
+    expected_namespace: str,
+    now: int | float | None = None,
+) -> dict:
+    """Validate the signed claim payload against an explicit clock."""
+
+    verified_at = _verification_time(now)
+    if (
+        not isinstance(expected_namespace, str)
+        or not expected_namespace
+        or expected_namespace != expected_namespace.strip()
+    ):
+        raise AccessTokenClaimsError(
+            "expected namespace must be a non-empty canonical string"
+        )
+    namespace = expected_namespace
+    missing = sorted(_REQUIRED_ACCESS_CLAIMS - payload.keys())
+    if missing:
+        raise AccessTokenClaimsError(
+            "access token missing required claims: " + ", ".join(missing)
+        )
+    unexpected = sorted(payload.keys() - _ALLOWED_ACCESS_CLAIMS)
+    if unexpected:
+        raise AccessTokenClaimsError(
+            "access token contains unsupported claims: " + ", ".join(unexpected)
+        )
+    if _required_text(payload, "typ") != ACCESS_TOKEN_TYPE:
+        raise AccessTokenClaimsError("unexpected token type")
+    if _required_text(payload, "iss") != access_token_issuer(namespace):
+        raise AccessTokenClaimsError("unexpected token issuer")
+    if _required_text(payload, "aud") != access_token_audience(namespace):
+        raise AccessTokenClaimsError("unexpected token audience")
+    _required_text(payload, "sub")
+    _required_text(payload, "jti")
+    if "email" in payload:
+        _required_text(payload, "email")
+
+    reason = check_namespace_claim(payload, expected_namespace)
     if reason:
-        logger.warning("[Auth] cross-namespace token rejected: %s", reason)
-        raise HTTPException(status_code=401, detail=f"Invalid token: {reason}")
+        raise AccessTokenClaimsError(reason)
+
+    issued_at = _numeric_date(payload, "iat")
+    expires_at = _numeric_date(payload, "exp")
+    if issued_at > verified_at:
+        raise AccessTokenClaimsError("token was issued in the future")
+    if expires_at <= issued_at:
+        raise AccessTokenClaimsError("token expiry must be after issuance")
+    if expires_at <= verified_at:
+        raise AccessTokenClaimsError("token has expired")
+
     return payload
+
+
+def _decode_jwt(token: str, *, now: int | float | None = None) -> dict:
+    from jose import jwt, JWTError
+
+    if not _access_jwt_secret or not _expected_namespace:
+        raise HTTPException(
+            status_code=503,
+            detail="Access JWT verification is not configured on Entangled Service",
+        )
+    try:
+        payload = jwt.decode(
+            token,
+            _access_jwt_secret,
+            algorithms=[ACCESS_TOKEN_ALGORITHM],
+            audience=access_token_audience(_expected_namespace),
+            issuer=access_token_issuer(_expected_namespace),
+            options={
+                **{f"require_{claim}": True for claim in _REQUIRED_ACCESS_CLAIMS},
+                # The pure validator below uses the injected clock.
+                "verify_exp": False,
+                "verify_iat": False,
+                "verify_nbf": False,
+                "verify_at_hash": False,
+            },
+        )
+        return validate_access_token_claims(
+            payload,
+            expected_namespace=_expected_namespace,
+            now=now,
+        )
+    except (JWTError, AccessTokenClaimsError, TypeError, ValueError) as exc:
+        logger.debug("[Auth] user access token rejected: %s", exc)
+        raise HTTPException(status_code=401, detail="Invalid user access token") from exc
 
 
 def verify_user_token(authorization: Optional[str] = Header(None)) -> str:
@@ -65,10 +270,7 @@ def verify_user_token(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
     payload = _decode_jwt(authorization[7:])
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Token missing subject")
-    return user_id
+    return _required_text(payload, "sub")
 
 
 def verify_service_token(
@@ -109,6 +311,6 @@ def decode_jwt_from_raw(token: str) -> Optional[str]:
     """Decode a raw JWT string and return user_id, or None on failure."""
     try:
         payload = _decode_jwt(token)
-        return payload.get("sub")
+        return _required_text(payload, "sub")
     except Exception:
         return None

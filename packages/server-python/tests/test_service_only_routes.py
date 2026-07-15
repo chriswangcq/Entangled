@@ -43,7 +43,11 @@ def test_service_only_dependency_rejects_missing_service_header():
     dependency = getattr(auth, "verify_service_token", None)
     assert dependency is not None
 
-    auth.configure_auth(jwt_secret="jwt-secret", service_token="service-secret")
+    auth.configure_auth(
+        access_jwt_secret="jwt-secret",
+        service_token="service-secret",
+        expected_namespace="test",
+    )
     with pytest.raises(HTTPException) as exc:
         dependency(x_service_token=None, x_user_id=None)
 
@@ -54,7 +58,11 @@ def test_service_only_dependency_accepts_configured_service_header():
     dependency = getattr(auth, "verify_service_token", None)
     assert dependency is not None
 
-    auth.configure_auth(jwt_secret="jwt-secret", service_token="service-secret")
+    auth.configure_auth(
+        access_jwt_secret="jwt-secret",
+        service_token="service-secret",
+        expected_namespace="test",
+    )
     assert dependency(
         x_service_token="service-secret",
         x_user_id="tenant-user",
@@ -62,7 +70,11 @@ def test_service_only_dependency_accepts_configured_service_header():
 
 
 def test_user_bearer_cannot_register_schema():
-    auth.configure_auth(jwt_secret="jwt-secret", service_token="service-secret")
+    auth.configure_auth(
+        access_jwt_secret="jwt-secret",
+        service_token="service-secret",
+        expected_namespace="test",
+    )
     app = FastAPI()
     app.include_router(schema_router)
 
