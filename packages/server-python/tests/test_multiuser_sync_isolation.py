@@ -8,7 +8,11 @@ from entangled.server.notifier import (
     set_store,
 )
 from entangled.server.sync import SyncRegistry
-from entangled.server.ws_handler import _entangle_one, handle_disentangle
+from entangled.server.ws_handler import (
+    _dispatch_action_blocking,
+    _entangle_one,
+    handle_disentangle,
+)
 
 
 class _Ws:
@@ -31,6 +35,16 @@ class _Store:
 
     def list(self, entity, user_id, *, params=None, limit=None):
         return [{"id": f"{user_id}-snapshot"}]
+
+
+class _ActionStore(_Store):
+    def __init__(self, defs):
+        super().__init__(defs)
+        self.created = []
+
+    def create(self, entity, user_id, payload, *, params=None, request_id=None):
+        self.created.append((entity, user_id, payload, params, request_id))
+        return {"id": payload.get("id", "created")}
 
 
 def _def(name, *, user_scoped, parent=None):
@@ -229,3 +243,44 @@ def test_entity_beneath_global_parent_still_uses_shared_partition():
         assert frame["ops"][0]["data"]["name"] == "shared-entry"
     finally:
         reset_state()
+
+
+def test_user_websocket_cannot_mutate_global_entity_with_builtin_crud():
+    store = _ActionStore([_def("models", user_scoped=False)])
+
+    result = _dispatch_action_blocking(
+        store,
+        "user-1",
+        "models",
+        "create",
+        None,
+        {},
+        {"id": "model-1", "name": "tampered"},
+        "request-1",
+    )
+
+    assert result == {
+        "success": False,
+        "error": "global entity 'models' is read-only for user clients",
+    }
+    assert store.created == []
+
+
+def test_user_websocket_builtin_crud_still_allows_user_owned_entity():
+    store = _ActionStore([_def("notes", user_scoped=True)])
+
+    result = _dispatch_action_blocking(
+        store,
+        "user-1",
+        "notes",
+        "create",
+        None,
+        {},
+        {"id": "note-1", "body": "owned"},
+        "request-2",
+    )
+
+    assert result == {"success": True, "data": {"id": "note-1"}}
+    assert store.created == [
+        ("notes", "user-1", {"id": "note-1", "body": "owned"}, {}, "request-2")
+    ]

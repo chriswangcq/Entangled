@@ -522,6 +522,18 @@ def _dispatch_action_blocking(
     try:
         store.get_def(entity)
 
+        # The public sync socket always represents an end user. Truly global
+        # entities (currently the shared model registry) are readable by every
+        # tenant, but their canonical rows are maintained by internal services.
+        # Letting a user invoke the generic CRUD verbs here would turn a shared
+        # catalog into a cross-tenant write surface. Custom actions remain
+        # available and must enforce their own business ownership rules.
+        if not is_user_owned(entity, store=store):
+            return {
+                "success": False,
+                "error": f"global entity '{entity}' is read-only for user clients",
+            }
+
         if op == "create":
             result = store.create(entity, user_id, payload, params=params, request_id=request_id or None)
             return {"success": True, "data": result}
