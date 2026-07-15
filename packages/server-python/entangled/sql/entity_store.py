@@ -538,7 +538,14 @@ class SqlEntityStore(BaseStore):
         row = self._in(defn, data)
         self._discard_immutable_mutations(defn, row)
         if not row:
-            return self._sql_get(defn, user_id, entity_id, params=params)
+            result = self._sql_get(defn, user_id, entity_id, params=params)
+            self._assert_tenant_update_matched(
+                defn,
+                user_id,
+                entity_id,
+                matched=result is not None,
+            )
+            return result
         set_parts, set_vals = [], []
         for k, v in row.items():
             set_parts.append(f"{k} = ?")
@@ -551,7 +558,13 @@ class SqlEntityStore(BaseStore):
         sql = f"UPDATE {defn.table} SET {', '.join(set_parts)} WHERE {where}"
         with self.db.transaction(defn.lock_type, resource_id=entity_id):
             self._assert_parent_move_owned(defn, user_id, row)
-            self.db.execute(sql, tuple(set_vals + where_vals))
+            cur = self.db.execute(sql, tuple(set_vals + where_vals))
+            self._assert_tenant_update_matched(
+                defn,
+                user_id,
+                entity_id,
+                matched=cur.rowcount > 0,
+            )
         return self._sql_get(defn, user_id, entity_id, params=params)
 
     def _sql_delete(self, defn: SqlEntityDef, user_id: str, entity_id: str,
@@ -1003,6 +1016,31 @@ class SqlEntityStore(BaseStore):
         return await asyncio.to_thread(_do_request)
 
     # ── Internal helpers ──────────────────────────────────────────────────
+
+    def _assert_tenant_update_matched(
+        self,
+        defn: SqlEntityDef,
+        user_id: str,
+        entity_id: str,
+        *,
+        matched: bool,
+    ) -> None:
+        """Fail closed when a tenant-scoped single-row update misses its target.
+
+        The SQL predicate already contains the authenticated ownership scope, so
+        a miss means either that the row is absent or that another tenant owns
+        it. Keep those cases deliberately indistinguishable to the caller and
+        reject before the generic store can emit a successful ACK/notification.
+        Truly global entities retain their existing not-found behavior.
+        """
+        if matched:
+            return
+        ownership_where, _ = self._ownership_where(defn, user_id)
+        if ownership_where is not None:
+            raise PermissionError(
+                f"ownership denied: {defn.name}/{entity_id} is missing or not owned "
+                f"by user {user_id!r}"
+            )
 
     @staticmethod
     def _discard_immutable_mutations(
