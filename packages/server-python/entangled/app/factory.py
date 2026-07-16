@@ -39,8 +39,8 @@ def _make_user_existence_checker(db):
     返回 checker(user_id) -> bool | None:
     * True/False:users 表可查,按行存在与否判定(False → ws 拒连 4403);
     * None:无法判定(users 表未建等 bootstrap 场景)→ 放行,记一次警告。
-    ``users`` 表由 novaic business 的 auth 流维护;app 层本就是 novaic 胶水,
-    表名在此硬编码与 auth.py 的 "Gateway signs HS256 JWTs" 同一耦合层级。
+    这是遗留的 opt-in checker:它查询 Entangled 本地的非权威 ``users`` 表,
+    且查询异常时 fail-open,因此不满足生产启用条件。启用前置条件见 config.py。
     """
     warned = {"missing_table": False}
 

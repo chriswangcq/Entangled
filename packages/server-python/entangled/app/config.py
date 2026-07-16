@@ -23,9 +23,12 @@ class ServiceConfig:
     # Access JWTs always carry this exact namespace. Staging/prod reject a
     # missing namespace and cannot start without one.
     namespace: str = ""
-    # WS 建连用户存在性检查(默认关):Entangled 自库的 users 表今天不是权威用户
-    # 存储(prod 该表仅 1 条遗留行,真用户在别处)—— 开着会拒掉所有真用户。启用
-    # 前提:users 同步进 Entangled 库,或 checker 改查权威源。保留为 opt-in。
+    # Intentionally OFF: Entangled's local ``users`` table isn't authoritative;
+    # each environment's Gateway Postgres is the account authority. Public WS
+    # access is already fail-closed at Gateway (namespace + active user), then
+    # Entangled independently validates typ/iss/aud/ns for defense in depth.
+    # Enable only after the checker reads Gateway authority, or a complete
+    # projection with an integrity watermark, and lookup failures fail closed.
     enforce_user_exists: bool = False
 
     @classmethod
