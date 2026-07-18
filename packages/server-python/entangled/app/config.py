@@ -29,6 +29,9 @@ class ServiceConfig:
     revocation_authority_service_token: str = ""
     revocation_authority_response_max_age_seconds: float = 10.0
     require_revocation_stream: bool = False
+    # Dedicated account-lifecycle trust domain.  main.py only populates this
+    # value from an owner-only file; it is never shared with CRUD or JWT auth.
+    account_deletion_service_token: str = ""
     # Intentionally OFF: Entangled's local ``users`` table isn't authoritative;
     # each environment's Gateway Postgres is the account authority. Public WS
     # access is already fail-closed at Gateway (namespace + active user), then

@@ -83,6 +83,25 @@ def get_connected_count() -> int:
     return len(_clients)
 
 
+def get_user_client_count(user_id: str) -> int:
+    """Return process-local notifier clients for exactly one account."""
+
+    return sum(1 for owner, _push in _clients.values() if owner == user_id)
+
+
+def unregister_user_clients(user_id: str) -> int:
+    """Drop one account's subscriptions immediately; WS cleanup is idempotent."""
+
+    client_ids = [
+        client_id
+        for client_id, (owner, _push) in list(_clients.items())
+        if owner == user_id
+    ]
+    for client_id in client_ids:
+        unregister_client(client_id)
+    return len(client_ids)
+
+
 def reset_state() -> None:
     """Clear all runtime state (for testing)."""
     global _store, _sync_registry

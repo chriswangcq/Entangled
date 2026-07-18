@@ -83,6 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fail startup unless the long-lived-session revocation plane is configured",
     )
+    parser.add_argument(
+        "--account-deletion-token-file",
+        default=None,
+        help="Owner-only file containing the dedicated account-deletion v2 token",
+    )
     return parser
 
 
@@ -148,6 +153,12 @@ def config_from_args(args: argparse.Namespace) -> ServiceConfig:
         )
     if args.require_revocation_stream:
         config.require_revocation_stream = True
+    if args.account_deletion_token_file:
+        from .account_deletion import read_owner_only_secret_file
+
+        config.account_deletion_service_token = read_owner_only_secret_file(
+            args.account_deletion_token_file
+        )
     return config
 
 

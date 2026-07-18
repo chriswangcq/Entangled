@@ -49,6 +49,14 @@ class AuthenticatedConnectionRegistry:
         async with self._lock:
             return len(self._connections)
 
+    async def count_user(self, user_id: str) -> int:
+        async with self._lock:
+            return sum(
+                1
+                for connection in self._connections.values()
+                if connection.principal.user_id == user_id
+            )
+
     async def contains(self, connection_id: str) -> bool:
         async with self._lock:
             return connection_id in self._connections
@@ -86,6 +94,16 @@ class AuthenticatedConnectionRegistry:
             return False
         await self._close_all([connection], code=code, reason=reason)
         return True
+
+    async def close_user(self, user_id: str) -> int:
+        """Atomically detach and close every socket owned by one account."""
+
+        selected = await self._take_matching(
+            lambda principal: principal.user_id == user_id
+        )
+        return await self._close_all(
+            selected, code=4403, reason="Account deleted"
+        )
 
     async def apply(self, event: RevocationEvent) -> int:
         if event.kind == "session_revoked":

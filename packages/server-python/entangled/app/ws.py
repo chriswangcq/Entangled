@@ -55,6 +55,7 @@ _user_existence_checker = None
 _authenticated_connections = AuthenticatedConnectionRegistry()
 _revocation_ready: Callable[[], bool] = lambda: True
 _principal_is_current: Callable[[SessionPrincipal], Awaitable[bool]]
+_account_is_active: Callable[[str], bool] = lambda _user_id: True
 _wall_clock: Callable[[], float] = time.time
 _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
@@ -76,16 +77,19 @@ def configure_connection_security(
     registry: AuthenticatedConnectionRegistry,
     revocation_ready: Callable[[], bool],
     principal_is_current: Callable[[SessionPrincipal], Awaitable[bool]] = _allow_principal,
+    account_is_active: Callable[[str], bool] = lambda _user_id: True,
     wall_clock: Callable[[], float] = time.time,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> None:
     """Install explicit long-lived-session dependencies at process startup."""
 
     global _authenticated_connections, _revocation_ready, _principal_is_current
+    global _account_is_active
     global _wall_clock, _sleep
     _authenticated_connections = registry
     _revocation_ready = revocation_ready
     _principal_is_current = principal_is_current
+    _account_is_active = account_is_active
     _wall_clock = wall_clock
     _sleep = sleep
 
@@ -189,7 +193,17 @@ async def ws_sync_handler(websocket: WebSocket):
             reason="Authentication authority unavailable",
         )
         return
-    if not principal_current or principal.expires_at <= int(_wall_clock()):
+    try:
+        account_active = _account_is_active(user_id)
+    except Exception:
+        logger.error("[WS] account deletion barrier lookup failed; rejecting connection")
+        await _authenticated_connections.close_connection(
+            client_id,
+            code=1013,
+            reason="Account authority unavailable",
+        )
+        return
+    if not principal_current or principal.expires_at <= int(_wall_clock()) or not account_active:
         await _authenticated_connections.close_connection(
             client_id,
             code=4401,

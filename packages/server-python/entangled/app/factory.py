@@ -29,6 +29,14 @@ from .auth import (
     validate_auth_configuration,
 )
 from .connection_registry import AuthenticatedConnectionRegistry
+from .account_deletion import (
+    AccountDeletionWriteBarrier,
+    EntangledDeletionDomain,
+    EntangledDeletionService,
+    PostgresDeletionLedger,
+    create_account_deletion_router,
+    ensure_account_deletion_schema,
+)
 from .state import init_database, close_database, init_store
 from ..metrics import render_metrics
 from ..sql.persistence import ensure_sync_versions_table, load_all_sync_versions, make_version_bump_handler
@@ -108,6 +116,23 @@ def create_app(config: ServiceConfig) -> FastAPI:
         raise AuthConfigurationError(
             "revocation authority response max age must be positive"
         )
+    account_deletion_token = config.account_deletion_service_token.strip()
+    if account_deletion_token:
+        if len(account_deletion_token) < 32:
+            raise AuthConfigurationError(
+                "account deletion service token must be at least 32 characters"
+            )
+        for other_secret in (
+            access_jwt_secret,
+            service_token,
+            config.revocation_authority_service_token,
+        ):
+            if other_secret and hmac.compare_digest(
+                account_deletion_token, other_secret
+            ):
+                raise AuthConfigurationError(
+                    "account deletion token must use an independent trust domain"
+                )
 
     revocation_configured = all(revocation_parts)
     authenticated_connections = AuthenticatedConnectionRegistry(
@@ -127,6 +152,7 @@ def create_app(config: ServiceConfig) -> FastAPI:
 
         # 2. Sync version persistence table
         ensure_sync_versions_table(db)
+        ensure_account_deletion_schema(db)
 
         # 2b. PR-31 state-transition log tables. Dynamic schema registration
         # via POST /v1/schema/register only covers SqlEntityDef-backed tables;
@@ -138,6 +164,8 @@ def create_app(config: ServiceConfig) -> FastAPI:
         # 3. EntityStore
         store = init_store(db=db)
         store._service_token = service_token
+        account_deletion_barrier = AccountDeletionWriteBarrier(db)
+        store.configure_account_deletion_guard(account_deletion_barrier)
         logger.info("EntityStore ready (0 entities — waiting for schema registration)")
 
         # 4. Auth(环境绑定 + 用户存在性:Xiaoniu 跨环境事故,2026-07-07)
@@ -200,6 +228,9 @@ def create_app(config: ServiceConfig) -> FastAPI:
                 if session_authority is not None
                 else _allow_principal
             ),
+            account_is_active=(
+                lambda user_id: not account_deletion_barrier.is_blocked(user_id)
+            ),
         )
         from .ws import set_user_existence_checker
 
@@ -213,6 +244,15 @@ def create_app(config: ServiceConfig) -> FastAPI:
 
         registry = init_sync_engine(on_version_bump=make_version_bump_handler(db))
         load_all_sync_versions(db, registry)
+        if account_deletion_token:
+            app.state.account_deletion_service = EntangledDeletionService(
+                ledger=PostgresDeletionLedger(db, account_deletion_barrier),
+                domain=EntangledDeletionDomain(
+                    db, store, account_deletion_barrier
+                ),
+                connections=authenticated_connections,
+                sync_registry_provider=lambda: registry,
+            )
         logger.info("Sync engine initialized")
 
         logger.info("Entangled Service ready")
@@ -255,6 +295,15 @@ def create_app(config: ServiceConfig) -> FastAPI:
     # the status UPDATE + subagent_state_transitions INSERT in one global-lock
     # transaction.
     app.include_router(subagent_state_router)
+    if account_deletion_token:
+        app.include_router(
+            create_account_deletion_router(
+                service_token=account_deletion_token,
+                service_provider=lambda: getattr(
+                    app.state, "account_deletion_service", None
+                ),
+            )
+        )
 
     # PR-32 — Prometheus exposition endpoint. Deliberately unauthenticated
     # so ops can scrape without wiring service tokens into the scraper;
