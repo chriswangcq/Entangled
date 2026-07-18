@@ -31,6 +31,7 @@ _REQUIRED_ACCESS_CLAIMS = frozenset(
         "sub",
         "exp",
         "iat",
+        "auth_time",
         "ns",
         "jti",
         "auth_version",
@@ -263,9 +264,14 @@ def validate_access_token_claims(
         raise AccessTokenClaimsError(reason)
 
     issued_at = _numeric_date(payload, "iat")
+    authenticated_at = _numeric_date(payload, "auth_time")
     expires_at = _numeric_date(payload, "exp")
     if issued_at > verified_at:
         raise AccessTokenClaimsError("token was issued in the future")
+    if authenticated_at > issued_at:
+        raise AccessTokenClaimsError(
+            "token authentication time must not be after issuance"
+        )
     if expires_at <= issued_at:
         raise AccessTokenClaimsError("token expiry must be after issuance")
     if expires_at <= verified_at:

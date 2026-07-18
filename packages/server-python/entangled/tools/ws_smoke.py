@@ -64,6 +64,7 @@ def build_jwt(
         "iss": access_token_issuer(namespace.strip()),
         "aud": access_token_audience(namespace.strip()),
         "sub": user_id.strip(),
+        "auth_time": issued_at,
         "iat": issued_at,
         "exp": issued_at + ttl_seconds,
         "ns": namespace.strip(),

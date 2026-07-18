@@ -114,6 +114,7 @@ def test_build_jwt_uses_complete_gateway_contract():
         "iss": access_token_issuer("staging"),
         "aud": access_token_audience("staging"),
         "sub": "user-1",
+        "auth_time": 1_800_000_000,
         "iat": 1_800_000_000,
         "exp": 1_800_000_060,
         "ns": "staging",

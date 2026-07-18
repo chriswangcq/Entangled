@@ -22,6 +22,7 @@ def _claims(**overrides) -> dict:
         "iss": auth.access_token_issuer(NAMESPACE),
         "aud": auth.access_token_audience(NAMESPACE),
         "sub": "user-1",
+        "auth_time": NOW,
         "iat": NOW,
         "exp": NOW + 300,
         "ns": NAMESPACE,
@@ -71,8 +72,8 @@ def test_optional_canonical_email_is_accepted() -> None:
 @pytest.mark.parametrize(
     "claim",
     [
-        "typ", "iss", "aud", "sub", "exp", "iat", "ns", "jti",
-        "auth_version", "sid", "auth_epoch",
+        "typ", "iss", "aud", "sub", "exp", "iat", "auth_time", "ns",
+        "jti", "auth_version", "sid", "auth_epoch",
     ],
 )
 def test_every_access_claim_is_required(claim: str) -> None:
@@ -115,10 +116,14 @@ def test_future_issued_at_is_rejected() -> None:
     _assert_unauthorized(_token(iat=NOW + 1, exp=NOW + 10), now=NOW)
 
 
-@pytest.mark.parametrize("claim", ["iat", "exp"])
+@pytest.mark.parametrize("claim", ["auth_time", "iat", "exp"])
 @pytest.mark.parametrize("value", [True, 1.5, "1800000000"])
 def test_numeric_dates_must_be_integer(claim: str, value: object) -> None:
     _assert_unauthorized(_token(**{claim: value}))
+
+
+def test_authentication_time_must_not_be_after_issuance() -> None:
+    _assert_unauthorized(_token(auth_time=NOW + 1))
 
 
 @pytest.mark.parametrize("claim", ["role", "nbf"])
