@@ -99,6 +99,7 @@ def test_build_jwt_uses_complete_gateway_contract():
         now=1_800_000_000,
         ttl_seconds=60,
         jti="smoke-jti-1",
+        sid="smoke-session-1",
     )
     claims = jwt.decode(
         token,
@@ -117,6 +118,9 @@ def test_build_jwt_uses_complete_gateway_contract():
         "exp": 1_800_000_060,
         "ns": "staging",
         "jti": "smoke-jti-1",
+        "auth_version": 3,
+        "sid": "smoke-session-1",
+        "auth_epoch": 0,
     }
 
 

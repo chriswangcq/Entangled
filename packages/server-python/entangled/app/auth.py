@@ -10,6 +10,7 @@ from __future__ import annotations
 import hmac
 import logging
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import Header, HTTPException
@@ -20,6 +21,7 @@ ACCESS_TOKEN_TYPE = "novaic-access+jwt"
 ACCESS_TOKEN_ISSUER_PREFIX = "novaic-gateway:"
 ACCESS_TOKEN_AUDIENCE_PREFIX = "novaic-api:"
 ACCESS_TOKEN_ALGORITHM = "HS256"
+ACCESS_TOKEN_AUTH_VERSION = 3
 
 _REQUIRED_ACCESS_CLAIMS = frozenset(
     {
@@ -31,6 +33,9 @@ _REQUIRED_ACCESS_CLAIMS = frozenset(
         "iat",
         "ns",
         "jti",
+        "auth_version",
+        "sid",
+        "auth_epoch",
     }
 )
 _ALLOWED_ACCESS_CLAIMS = _REQUIRED_ACCESS_CLAIMS | {"email"}
@@ -46,6 +51,33 @@ class AuthConfigurationError(RuntimeError):
 
 class AccessTokenClaimsError(ValueError):
     """A signed token does not satisfy the user access-token contract."""
+
+
+@dataclass(frozen=True)
+class SessionPrincipal:
+    """Authenticated long-lived-session identity captured at handshake.
+
+    The raw bearer token is deliberately not retained.  Long-lived connection
+    revocation needs only this immutable, namespace-bound projection.
+    """
+
+    user_id: str
+    session_id: str
+    auth_epoch: int
+    expires_at: int
+    namespace: str
+
+
+def principal_from_claims(payload: dict) -> SessionPrincipal:
+    """Build a token-free principal from already validated v3 claims."""
+
+    return SessionPrincipal(
+        user_id=_required_text(payload, "sub"),
+        session_id=_required_text(payload, "sid"),
+        auth_epoch=_nonnegative_integer(payload, "auth_epoch"),
+        expires_at=_numeric_date(payload, "exp"),
+        namespace=_required_text(payload, "ns"),
+    )
 
 
 def access_token_issuer(namespace: str) -> str:
@@ -168,6 +200,13 @@ def _numeric_date(payload: dict, claim: str) -> int:
     return value
 
 
+def _nonnegative_integer(payload: dict, claim: str) -> int:
+    value = payload.get(claim)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise AccessTokenClaimsError(f"{claim} must be a non-negative integer")
+    return value
+
+
 def _verification_time(now: int | float | None) -> int:
     if now is None:
         return int(time.time())
@@ -210,8 +249,12 @@ def validate_access_token_claims(
         raise AccessTokenClaimsError("unexpected token issuer")
     if _required_text(payload, "aud") != access_token_audience(namespace):
         raise AccessTokenClaimsError("unexpected token audience")
+    if _nonnegative_integer(payload, "auth_version") != ACCESS_TOKEN_AUTH_VERSION:
+        raise AccessTokenClaimsError("unexpected auth protocol version")
     _required_text(payload, "sub")
     _required_text(payload, "jti")
+    _required_text(payload, "sid")
+    _nonnegative_integer(payload, "auth_epoch")
     if "email" in payload:
         _required_text(payload, "email")
 
@@ -312,5 +355,14 @@ def decode_jwt_from_raw(token: str) -> Optional[str]:
     try:
         payload = _decode_jwt(token)
         return _required_text(payload, "sub")
+    except Exception:
+        return None
+
+
+def decode_principal_from_raw(token: str) -> Optional[SessionPrincipal]:
+    """Decode a raw access JWT into a token-free v3 session principal."""
+
+    try:
+        return principal_from_claims(_decode_jwt(token))
     except Exception:
         return None

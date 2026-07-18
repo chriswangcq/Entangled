@@ -26,6 +26,9 @@ def _claims(**overrides) -> dict:
         "exp": NOW + 300,
         "ns": NAMESPACE,
         "jti": "access-jti-1",
+        "auth_version": 3,
+        "sid": "session-1",
+        "auth_epoch": 0,
     }
     claims.update(overrides)
     return claims
@@ -67,7 +70,10 @@ def test_optional_canonical_email_is_accepted() -> None:
 
 @pytest.mark.parametrize(
     "claim",
-    ["typ", "iss", "aud", "sub", "exp", "iat", "ns", "jti"],
+    [
+        "typ", "iss", "aud", "sub", "exp", "iat", "ns", "jti",
+        "auth_version", "sid", "auth_epoch",
+    ],
 )
 def test_every_access_claim_is_required(claim: str) -> None:
     claims = _claims()
@@ -91,6 +97,16 @@ def test_cross_namespace_token_is_rejected_even_with_same_key() -> None:
     _assert_unauthorized(_token(ns="staging"))
 
 
+def test_complete_staging_token_cannot_handshake_with_prod_entangled() -> None:
+    _assert_unauthorized(
+        _token(
+            ns="staging",
+            iss=auth.access_token_issuer("staging"),
+            aud=auth.access_token_audience("staging"),
+        )
+    )
+
+
 def test_expired_token_is_rejected_at_exact_expiry() -> None:
     _assert_unauthorized(_token(exp=NOW + 10), now=NOW + 10)
 
@@ -112,7 +128,9 @@ def test_unknown_and_nbf_claims_are_rejected(claim: str) -> None:
 
 @pytest.mark.parametrize(
     "claim",
-    ["typ", "iss", "aud", "sub", "jti", "ns", "email"],
+    [
+        "typ", "iss", "aud", "sub", "jti", "ns", "email", "sid",
+    ],
 )
 def test_text_claims_must_be_canonical(claim: str) -> None:
     value = _claims().get(claim, "person@example.com")

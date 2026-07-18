@@ -23,6 +23,12 @@ class ServiceConfig:
     # Access JWTs always carry this exact namespace. Staging/prod reject a
     # missing namespace and cannot start without one.
     namespace: str = ""
+    revocation_redis_url: str = ""
+    revocation_stream_key: str = ""
+    revocation_authority_url: str = ""
+    revocation_authority_service_token: str = ""
+    revocation_authority_response_max_age_seconds: float = 10.0
+    require_revocation_stream: bool = False
     # Intentionally OFF: Entangled's local ``users`` table isn't authoritative;
     # each environment's Gateway Postgres is the account authority. Public WS
     # access is already fail-closed at Gateway (namespace + active user), then
