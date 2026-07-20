@@ -14,12 +14,16 @@ client ``depth`` and that default are absent, ``DEFAULT_STREAM_HEAD_DEPTH`` appl
 
 import json
 import logging
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
+
+_CANONICAL_USER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
+_CANONICAL_ENTITY = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
 
 def _pk_value_from_row(row: Optional[dict], id_field: str) -> Optional[str]:
@@ -180,13 +184,61 @@ def _state_key(
 
 
 def _state_key_has_user(state_key: str, user_id: str) -> bool:
+    valid, owner = classify_state_key_owner(state_key)
+    return valid and owner == user_id
+
+
+def is_canonical_user_id(user_id: object) -> bool:
+    """Return whether a process-local owner can be attributed exactly."""
+
+    return (
+        isinstance(user_id, str)
+        and bool(_CANONICAL_USER_ID.fullmatch(user_id))
+        and ".." not in user_id
+    )
+
+
+def classify_state_key_owner(state_key: object) -> tuple[bool, str | None]:
+    """Classify a sync key as valid-global, valid-user, or unattributed."""
+
+    if not isinstance(state_key, str) or not state_key:
+        return False, None
     if ":" not in state_key:
-        return False
+        return bool(_CANONICAL_ENTITY.fullmatch(state_key)), None
+    entity, raw_payload = state_key.split(":", 1)
+    if not _CANONICAL_ENTITY.fullmatch(entity) or not raw_payload:
+        return False, None
     try:
-        payload = json.loads(state_key.split(":", 1)[1])
+        payload = json.loads(raw_payload)
     except (TypeError, ValueError):
-        return False
-    return isinstance(payload, dict) and payload.get("user_id") == user_id
+        return False, None
+    def valid_params(value: object) -> bool:
+        if not isinstance(value, list):
+            return False
+        keys: set[str] = set()
+        for item in value:
+            if (
+                not isinstance(item, list)
+                or len(item) != 2
+                or not all(isinstance(part, str) for part in item)
+                or item[0] in keys
+            ):
+                return False
+            keys.add(item[0])
+        return True
+
+    if isinstance(payload, list):
+        if not valid_params(payload):
+            return False, None
+        return True, None
+    if not isinstance(payload, dict) or set(payload) != {"params", "user_id"}:
+        return False, None
+    owner = payload.get("user_id")
+    if not is_canonical_user_id(owner):
+        return False, None
+    if not valid_params(payload.get("params")):
+        return False, None
+    return True, owner
 
 
 class SyncRegistry:
@@ -322,16 +374,30 @@ class SyncRegistry:
         return list(state.subscribers.keys())
 
     def count_user_states(self, user_id: str) -> int:
+        keys = set(self._states)
+        for subscriptions in self._client_subs.values():
+            keys.update(subscriptions)
         return sum(
-            1 for key in self._states if _state_key_has_user(key, user_id)
+            1 for key in keys if _state_key_has_user(key, user_id)
+        )
+
+    def count_unattributed_user_owners(self) -> int:
+        """Count unique state partitions with malformed user ownership."""
+
+        keys = set(self._states)
+        for subscriptions in self._client_subs.values():
+            keys.update(subscriptions)
+        return sum(
+            1 for key in keys if not classify_state_key_owner(key)[0]
         )
 
     def purge_user(self, user_id: str) -> int:
         """Remove one account's process-local versions, op logs, and subscriptions."""
 
-        keys = {
-            key for key in self._states if _state_key_has_user(key, user_id)
-        }
+        all_keys = set(self._states)
+        for subscriptions in self._client_subs.values():
+            all_keys.update(subscriptions)
+        keys = {key for key in all_keys if _state_key_has_user(key, user_id)}
         for key in keys:
             self._states.pop(key, None)
         for client_id, subscriptions in list(self._client_subs.items()):

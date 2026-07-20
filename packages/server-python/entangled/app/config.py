@@ -32,6 +32,10 @@ class ServiceConfig:
     # Dedicated account-lifecycle trust domain.  main.py only populates this
     # value from an owner-only file; it is never shared with CRUD or JWT auth.
     account_deletion_service_token: str = ""
+    # Account deletion observes process-local connection and subscription state.
+    # Both fields default fail-closed and are populated only from main.py CLI.
+    account_deletion_replica_count: int = 0
+    account_deletion_topology_attestation: str = ""
     # Intentionally OFF: Entangled's local ``users`` table isn't authoritative;
     # each environment's Gateway Postgres is the account authority. Public WS
     # access is already fail-closed at Gateway (namespace + active user), then

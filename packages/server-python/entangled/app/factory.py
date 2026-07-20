@@ -33,6 +33,7 @@ from .account_deletion import (
     AccountDeletionWriteBarrier,
     EntangledDeletionDomain,
     EntangledDeletionService,
+    EntangledDeletionTopology,
     PostgresDeletionLedger,
     create_account_deletion_router,
     ensure_account_deletion_schema,
@@ -117,7 +118,12 @@ def create_app(config: ServiceConfig) -> FastAPI:
             "revocation authority response max age must be positive"
         )
     account_deletion_token = config.account_deletion_service_token.strip()
+    account_deletion_topology = EntangledDeletionTopology(
+        replica_count=config.account_deletion_replica_count,
+        attestation=config.account_deletion_topology_attestation,
+    )
     if account_deletion_token:
+        account_deletion_topology.require_single_replica()
         if len(account_deletion_token) < 32:
             raise AuthConfigurationError(
                 "account deletion service token must be at least 32 characters"
@@ -252,6 +258,7 @@ def create_app(config: ServiceConfig) -> FastAPI:
                 ),
                 connections=authenticated_connections,
                 sync_registry_provider=lambda: registry,
+                topology=account_deletion_topology,
             )
         logger.info("Sync engine initialized")
 
