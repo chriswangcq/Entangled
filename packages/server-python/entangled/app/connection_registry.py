@@ -8,6 +8,7 @@ from typing import Awaitable, Callable
 
 from .auth import SessionPrincipal
 from .revocation import RevocationEvent
+from ..server.sync import is_canonical_user_id
 
 
 CloseConnection = Callable[[int, str], Awaitable[None]]
@@ -55,6 +56,16 @@ class AuthenticatedConnectionRegistry:
                 1
                 for connection in self._connections.values()
                 if connection.principal.user_id == user_id
+            )
+
+    async def count_unattributed_user_owners(self) -> int:
+        """Count connections whose immutable principal has no canonical owner."""
+
+        async with self._lock:
+            return sum(
+                1
+                for connection in self._connections.values()
+                if not is_canonical_user_id(connection.principal.user_id)
             )
 
     async def contains(self, connection_id: str) -> bool:

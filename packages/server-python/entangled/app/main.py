@@ -88,6 +88,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Owner-only file containing the dedicated account-deletion v2 token",
     )
+    parser.add_argument(
+        "--account-deletion-replica-count",
+        type=int,
+        default=None,
+        help="Declared Entangled replica count for process-local deletion inventory",
+    )
+    parser.add_argument(
+        "--account-deletion-topology-attestation",
+        default=None,
+        help="Exact versioned deployment attestation for account deletion",
+    )
     return parser
 
 
@@ -158,6 +169,12 @@ def config_from_args(args: argparse.Namespace) -> ServiceConfig:
 
         config.account_deletion_service_token = read_owner_only_secret_file(
             args.account_deletion_token_file
+        )
+    if args.account_deletion_replica_count is not None:
+        config.account_deletion_replica_count = args.account_deletion_replica_count
+    if args.account_deletion_topology_attestation is not None:
+        config.account_deletion_topology_attestation = (
+            args.account_deletion_topology_attestation.strip()
         )
     return config
 

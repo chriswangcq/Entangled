@@ -7,6 +7,7 @@ exist only for the duration of one authenticated request.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import hmac
 import json
@@ -21,6 +22,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from ..server.sync import classify_state_key_owner
 from ..sql.validation import validate_sql_identifier
 
 
@@ -30,6 +32,9 @@ DOMAIN = "entangled"
 CALLER = "account-deletion-worker"
 _CANONICAL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$")
 _SAFE_USER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
+ENTANGLED_SINGLE_REPLICA_ATTESTATION = (
+    "entangled-account-deletion-single-replica-v1"
+)
 
 
 class DeletionResource(BaseModel):
@@ -76,6 +81,23 @@ class OperationLeaseLost(RuntimeError):
 
 class AccountDeletedError(PermissionError):
     """A write attempted to resurrect data for a deleted account."""
+
+
+@dataclass(frozen=True)
+class EntangledDeletionTopology:
+    """Immutable startup-owned proof for process-local deletion inventory."""
+
+    replica_count: int
+    attestation: str
+
+    def require_single_replica(self) -> None:
+        if (
+            self.replica_count != 1
+            or self.attestation != ENTANGLED_SINGLE_REPLICA_ATTESTATION
+        ):
+            raise RuntimeError(
+                "Entangled account deletion requires an attested single replica"
+            )
 
 
 def read_owner_only_secret_file(raw_path: str | Path) -> str:
@@ -373,6 +395,8 @@ def _definition_is_user_owned(store: Any, defn: Any, seen: set[str] | None = Non
 
 
 def _definition_depth(store: Any, defn: Any, seen: set[str] | None = None) -> int:
+    if bool(getattr(defn, "user_scoped", False)):
+        return 0
     parent = getattr(defn, "parent", None)
     if not parent:
         return 0
@@ -383,14 +407,250 @@ def _definition_depth(store: Any, defn: Any, seen: set[str] | None = None) -> in
     return 1 + _definition_depth(store, store.get_def(parent[0]), seen)
 
 
-def _sync_key_has_user(state_key: str, user_id: str) -> bool:
-    if ":" not in state_key:
-        return False
-    try:
-        payload = json.loads(state_key.split(":", 1)[1])
-    except (TypeError, ValueError):
-        return False
-    return isinstance(payload, dict) and payload.get("user_id") == user_id
+def _validate_definition_identifiers(defn: Any) -> None:
+    validate_sql_identifier(str(defn.table), label="entity table")
+    validate_sql_identifier(str(defn.id_field), label="entity id field")
+    if bool(getattr(defn, "user_scoped", False)):
+        validate_sql_identifier("user_id", label="entity owner field")
+    for relationship in [
+        item
+        for item in [getattr(defn, "parent", None)]
+        if item is not None
+    ] + list(getattr(defn, "ownership_refs", ()) or ()):
+        _parent_name, local_fk, parent_pk = relationship
+        validate_sql_identifier(str(local_fk), label="ownership local field")
+        validate_sql_identifier(str(parent_pk), label="ownership target field")
+
+
+def _definition_owner_expression(
+    store: Any,
+    defn: Any,
+    alias: str,
+    *,
+    prefix: str,
+    depth: int = 0,
+    seen: set[str] | None = None,
+) -> str:
+    """Build a scalar canonical owner projection for one registered row."""
+
+    _validate_definition_identifiers(defn)
+    if bool(getattr(defn, "user_scoped", False)):
+        return f"{alias}.user_id"
+    parent = getattr(defn, "parent", None)
+    if not parent:
+        raise RuntimeError("entity ownership definition has no user root")
+    visited = set(seen or ())
+    if defn.name in visited:
+        raise RuntimeError("cyclic entity ownership definition")
+    visited.add(defn.name)
+    parent_name, local_fk, parent_pk = parent
+    parent_def = store.get_def(parent_name)
+    _validate_definition_identifiers(parent_def)
+    parent_alias = f"{prefix}_{depth}"
+    parent_owner = _definition_owner_expression(
+        store,
+        parent_def,
+        parent_alias,
+        prefix=prefix,
+        depth=depth + 1,
+        seen=visited,
+    )
+    return (
+        f"(SELECT {parent_owner} FROM {parent_def.table} AS {parent_alias} "
+        f"WHERE {parent_alias}.{parent_pk} = {alias}.{local_fk} LIMIT 1)"
+    )
+
+
+def _query_has_row(db: Any, sql: str, params: tuple[Any, ...] = ()) -> bool:
+    return db.fetchone(sql, params) is not None
+
+
+def _count_unattributed_registered_state(
+    db: Any,
+    store: Any,
+    all_definitions: list[Any],
+    direct_tables: list[dict[str, Any]],
+) -> int:
+    """Return bounded opaque witnesses for unresolved durable ownership."""
+
+    unattributed = 0
+    for row in direct_tables:
+        table = str(row["table_name"])
+        validate_sql_identifier(table, label="discovered tenant table")
+        if _query_has_row(
+            db,
+            f"""
+            SELECT 1 AS present
+              FROM {table}
+             WHERE user_id IS NULL
+                OR CAST(user_id AS text) = ''
+                OR CAST(user_id AS text) !~ ?
+                OR POSITION('..' IN CAST(user_id AS text)) > 0
+             LIMIT 1
+             /* account-deletion:invalid-direct-owner */
+            """,
+            (_SAFE_USER_ID.pattern,),
+        ):
+            unattributed += 1
+
+    definitions_by_name = {str(item.name): item for item in all_definitions}
+    owned_definition_names: set[str] = set()
+    for defn in all_definitions:
+        try:
+            if _definition_is_user_owned(store, defn):
+                owned_definition_names.add(str(defn.name))
+        except (KeyError, RuntimeError, ValueError):
+            _validate_definition_identifiers(defn)
+            if _query_has_row(
+                db,
+                f"""
+                SELECT 1 AS present FROM {defn.table} LIMIT 1
+                /* account-deletion:unresolved-definition */
+                """,
+            ):
+                unattributed += 1
+
+    for defn in all_definitions:
+        if str(defn.name) not in owned_definition_names:
+            continue
+        _validate_definition_identifiers(defn)
+        parent = getattr(defn, "parent", None)
+        if parent and not bool(getattr(defn, "user_scoped", False)):
+            parent_name, local_fk, parent_pk = parent
+            parent_def = definitions_by_name.get(str(parent_name))
+            if parent_def is None:
+                if _query_has_row(
+                    db,
+                    f"""
+                    SELECT 1 AS present FROM {defn.table} LIMIT 1
+                    /* account-deletion:unresolved-parent */
+                    """,
+                ):
+                    unattributed += 1
+            else:
+                _validate_definition_identifiers(parent_def)
+                if _query_has_row(
+                    db,
+                    f"""
+                    SELECT 1 AS present
+                      FROM {defn.table} AS owned_row
+                      LEFT JOIN {parent_def.table} AS parent_row
+                        ON parent_row.{parent_pk} = owned_row.{local_fk}
+                     WHERE owned_row.{local_fk} IS NULL
+                        OR parent_row.{parent_pk} IS NULL
+                     LIMIT 1
+                     /* account-deletion:orphan-parent */
+                    """,
+                ):
+                    unattributed += 1
+
+        for parent_name, local_fk, parent_pk in list(
+            getattr(defn, "ownership_refs", ()) or ()
+        ):
+            parent_def = definitions_by_name.get(str(parent_name))
+            if parent_def is None:
+                if _query_has_row(
+                    db,
+                    f"""
+                    SELECT 1 AS present FROM {defn.table} LIMIT 1
+                    /* account-deletion:unresolved-ownership-reference */
+                    """,
+                ):
+                    unattributed += 1
+                continue
+            try:
+                child_owner = _definition_owner_expression(
+                    store,
+                    defn,
+                    "owned_row",
+                    prefix="child_owner",
+                )
+                parent_owner = _definition_owner_expression(
+                    store,
+                    parent_def,
+                    "referenced_row",
+                    prefix="reference_owner",
+                )
+            except (KeyError, RuntimeError, ValueError):
+                unattributed += 1
+                continue
+            if _query_has_row(
+                db,
+                f"""
+                SELECT 1 AS present
+                  FROM {defn.table} AS owned_row
+                  LEFT JOIN {parent_def.table} AS referenced_row
+                    ON referenced_row.{parent_pk} = owned_row.{local_fk}
+                 WHERE owned_row.{local_fk} IS NULL
+                    OR referenced_row.{parent_pk} IS NULL
+                    OR ({child_owner}) IS DISTINCT FROM ({parent_owner})
+                 LIMIT 1
+                 /* account-deletion:ownership-reference */
+                """,
+            ):
+                unattributed += 1
+
+    transitions_exist_sql = """
+        SELECT 1 AS present FROM subagent_state_transitions LIMIT 1
+        /* account-deletion:orphan-transition-unresolved */
+    """
+    subagent_def = definitions_by_name.get("subagents")
+    agent_def = definitions_by_name.get("agents")
+    if subagent_def is None or agent_def is None:
+        if _query_has_row(db, transitions_exist_sql):
+            unattributed += 1
+    else:
+        _validate_definition_identifiers(subagent_def)
+        _validate_definition_identifiers(agent_def)
+        subagent_parent = getattr(subagent_def, "parent", None)
+        if not subagent_parent or str(subagent_parent[0]) != "agents":
+            if _query_has_row(db, transitions_exist_sql):
+                unattributed += 1
+        else:
+            _parent_name, subagent_agent_fk, _parent_pk = subagent_parent
+            if _query_has_row(
+                db,
+                f"""
+                SELECT 1 AS present
+                  FROM subagent_state_transitions AS transition_row
+                  LEFT JOIN {subagent_def.table} AS subagent_row
+                    ON subagent_row.{subagent_def.id_field} = transition_row.subagent_id
+                  LEFT JOIN {agent_def.table} AS agent_row
+                    ON agent_row.{agent_def.id_field} = transition_row.agent_id
+                 WHERE subagent_row.{subagent_def.id_field} IS NULL
+                    OR (
+                        transition_row.agent_id IS NOT NULL
+                        AND agent_row.{agent_def.id_field} IS NULL
+                    )
+                    OR (
+                        transition_row.agent_id IS NOT NULL
+                        AND subagent_row.{subagent_agent_fk}
+                            IS DISTINCT FROM transition_row.agent_id
+                    )
+                 LIMIT 1
+                 /* account-deletion:orphan-transition */
+                """,
+            ):
+                unattributed += 1
+    return unattributed
+
+
+def _classify_sync_rows(
+    rows: list[dict[str, Any]], user_id: str
+) -> tuple[list[str], int]:
+    owned: list[str] = []
+    unattributed = 0
+    seen: set[str] = set()
+    for row in rows:
+        state_key = row["state_key"]
+        valid, owner = classify_state_key_owner(state_key)
+        if not valid:
+            unattributed += 1
+            continue
+        if owner == user_id and state_key not in seen:
+            seen.add(state_key)
+            owned.append(state_key)
+    return owned, unattributed
 
 
 class EntangledDeletionDomain:
@@ -401,7 +661,7 @@ class EntangledDeletionDomain:
         self._store = store
         self._barrier = barrier
 
-    def purge_user(self, user_id: str) -> tuple[int, int, int]:
+    def purge_user(self, user_id: str) -> tuple[int, int, int, int]:
         user_digest = self._barrier.user_digest(user_id)
         discovered = 0
         deleted = 0
@@ -412,15 +672,41 @@ class EntangledDeletionDomain:
             ) is None:
                 raise RuntimeError("account deletion block is missing")
 
-            definitions = [
-                item
-                for item in self._store.get_all_defs()
-                if _definition_is_user_owned(self._store, item)
-            ]
+            all_definitions = list(self._store.get_all_defs())
+            definitions = []
+            for item in all_definitions:
+                try:
+                    if _definition_is_user_owned(self._store, item):
+                        definitions.append(item)
+                except (KeyError, RuntimeError, ValueError):
+                    continue
             definitions.sort(
                 key=lambda item: (_definition_depth(self._store, item), item.name),
                 reverse=True,
             )
+
+            registered_tables = {str(item.table) for item in all_definitions}
+            direct_tables = self._db.fetchall(
+                """
+                SELECT DISTINCT table_name
+                  FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND column_name = 'user_id'
+                """
+            )
+            initial_sync_rows = self._db.fetchall(
+                "SELECT state_key FROM entangled_sync_versions"
+            )
+            _initial_sync_keys, initial_sync_unattributed = _classify_sync_rows(
+                initial_sync_rows, user_id
+            )
+            initial_unattributed = _count_unattributed_registered_state(
+                self._db,
+                self._store,
+                all_definitions,
+                direct_tables,
+            ) + initial_sync_unattributed
+            if initial_unattributed:
+                return 0, 0, 0, initial_unattributed
 
             subagent_ids: list[str] = []
             agent_ids: list[str] = []
@@ -468,14 +754,6 @@ class EntangledDeletionDomain:
                 )
                 deleted += int(getattr(cursor, "rowcount", 0) or 0)
 
-            registered_tables = {str(item.table) for item in definitions}
-            direct_tables = self._db.fetchall(
-                """
-                SELECT DISTINCT table_name
-                  FROM information_schema.columns
-                 WHERE table_schema = current_schema() AND column_name = 'user_id'
-                """
-            )
             for row in direct_tables:
                 table = str(row["table_name"])
                 validate_sql_identifier(table, label="discovered tenant table")
@@ -490,14 +768,9 @@ class EntangledDeletionDomain:
                 )
                 deleted += int(getattr(cursor, "rowcount", 0) or 0)
 
-            sync_rows = self._db.fetchall(
-                "SELECT state_key FROM entangled_sync_versions"
+            sync_keys, _sync_unattributed = _classify_sync_rows(
+                initial_sync_rows, user_id
             )
-            sync_keys = [
-                str(row["state_key"])
-                for row in sync_rows
-                if _sync_key_has_user(str(row["state_key"]), user_id)
-            ]
             discovered += len(sync_keys)
             for state_key in sync_keys:
                 cursor = self._db.execute(
@@ -530,14 +803,21 @@ class EntangledDeletionDomain:
                     tuple(transition_values + transition_values),
                 )
                 remaining += int((transition_row or {}).get("cnt", 0) or 0)
-            remaining += sum(
-                1
-                for row in self._db.fetchall(
-                    "SELECT state_key FROM entangled_sync_versions"
-                )
-                if _sync_key_has_user(str(row["state_key"]), user_id)
+            final_sync_rows = self._db.fetchall(
+                "SELECT state_key FROM entangled_sync_versions"
             )
-        return deleted, remaining, discovered
+            final_sync_keys, final_sync_unattributed = _classify_sync_rows(
+                final_sync_rows, user_id
+            )
+            remaining += len(final_sync_keys)
+            final_unattributed = _count_unattributed_registered_state(
+                self._db,
+                self._store,
+                all_definitions,
+                direct_tables,
+            ) + final_sync_unattributed
+            unattributed = max(initial_unattributed, final_unattributed)
+        return deleted, remaining, discovered, unattributed
 
 
 class EntangledDeletionService:
@@ -548,13 +828,16 @@ class EntangledDeletionService:
         domain: EntangledDeletionDomain,
         connections: Any,
         sync_registry_provider: Any,
+        topology: EntangledDeletionTopology,
     ) -> None:
         self._ledger = ledger
         self._domain = domain
         self._connections = connections
         self._sync_registry_provider = sync_registry_provider
+        self._topology = topology
 
     async def execute(self, payload: EntangledDeletionRequest) -> dict[str, Any]:
+        self._topology.require_single_replica()
         owner = secrets.token_hex(16)
         state, previous = self._ledger.claim(payload, owner=owner, now=time.time())
         if state == "completed":
@@ -571,6 +854,7 @@ class EntangledDeletionService:
         try:
             connection_count = await self._connections.close_user(payload.user_id)
             from ..server.notifier import (
+                get_unattributed_client_count,
                 get_user_client_count,
                 unregister_user_clients,
             )
@@ -578,10 +862,19 @@ class EntangledDeletionService:
             subscription_count = unregister_user_clients(payload.user_id)
             sync_registry = self._sync_registry_provider()
             sync_state_count = sync_registry.purge_user(payload.user_id)
-            row_deleted, row_remaining, row_discovered = self._domain.purge_user(
-                payload.user_id
+            (
+                row_deleted,
+                row_remaining,
+                row_discovered,
+                row_unattributed,
+            ) = self._domain.purge_user(payload.user_id)
+            process_unattributed = (
+                await self._connections.count_unattributed_user_owners()
+                + get_unattributed_client_count()
+                + sync_registry.count_unattributed_user_owners()
             )
-            remaining = row_remaining
+            total_unattributed = row_unattributed + process_unattributed
+            remaining = row_remaining + total_unattributed
             remaining += await self._connections.count_user(payload.user_id)
             remaining += get_user_client_count(payload.user_id)
             remaining += sync_registry.count_user_states(payload.user_id)
@@ -589,6 +882,7 @@ class EntangledDeletionService:
                 "entity_rows": row_discovered,
                 "connections": connection_count,
                 "subscriptions": subscription_count + sync_state_count,
+                "unattributed_state": total_unattributed,
             }
             resources = [
                 {
@@ -695,6 +989,8 @@ __all__ = [
     "EntangledDeletionDomain",
     "EntangledDeletionRequest",
     "EntangledDeletionService",
+    "EntangledDeletionTopology",
+    "ENTANGLED_SINGLE_REPLICA_ATTESTATION",
     "PostgresDeletionLedger",
     "create_account_deletion_router",
     "ensure_account_deletion_schema",

@@ -18,7 +18,7 @@ For multi-process deployments, use a process-local store per worker.
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
-from .sync import SyncOp, SyncRegistry
+from .sync import SyncOp, SyncRegistry, is_canonical_user_id
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,15 @@ def get_user_client_count(user_id: str) -> int:
     """Return process-local notifier clients for exactly one account."""
 
     return sum(1 for owner, _push in _clients.values() if owner == user_id)
+
+
+def get_unattributed_client_count() -> int:
+    """Count notifier clients whose account owner cannot be attributed."""
+
+    return sum(
+        1 for owner, _push in list(_clients.values())
+        if not is_canonical_user_id(owner)
+    )
 
 
 def unregister_user_clients(user_id: str) -> int:
