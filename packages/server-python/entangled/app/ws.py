@@ -7,10 +7,11 @@ real-time delta/snapshot pushes.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -31,23 +32,74 @@ from ..server.ws_handler import (
 )
 from ..server.protocol import build_push_frame, build_schema_push_frame
 
-from .auth import decode_jwt_from_raw
+from .auth import SessionPrincipal, decode_principal_from_raw
+from .connection_registry import (
+    AuthenticatedConnection,
+    AuthenticatedConnectionRegistry,
+)
 from .state import get_store
 
 logger = logging.getLogger(__name__)
+
+
+def _log_ref(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 _sync_registry: Optional[SyncRegistry] = None
 _initialized = False
 
 # 用户存在性检查(Xiaoniu 跨环境事故,2026-07-07 纵深防御):factory 注入一个
 # checker(user_id) -> bool | None。True=存在;False=本环境无此用户,拒连;
-# None=无法判定(users 表尚未建等 bootstrap 场景),放行并由 checker 侧记警告。
+# None=非权威表无法判定，不得作为公开鉴权依据。
 _user_existence_checker = None
+_authenticated_connections = AuthenticatedConnectionRegistry()
+_revocation_ready: Callable[[], bool] = lambda: True
+_principal_is_current: Callable[[SessionPrincipal], Awaitable[bool]]
+_account_is_active: Callable[[str], bool] = lambda _user_id: True
+_wall_clock: Callable[[], float] = time.time
+_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+
+
+async def _allow_principal(_principal: SessionPrincipal) -> bool:
+    return True
+
+
+_principal_is_current = _allow_principal
 
 
 def set_user_existence_checker(checker) -> None:
     global _user_existence_checker
     _user_existence_checker = checker
+
+
+def configure_connection_security(
+    *,
+    registry: AuthenticatedConnectionRegistry,
+    revocation_ready: Callable[[], bool],
+    principal_is_current: Callable[[SessionPrincipal], Awaitable[bool]] = _allow_principal,
+    account_is_active: Callable[[str], bool] = lambda _user_id: True,
+    wall_clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Install explicit long-lived-session dependencies at process startup."""
+
+    global _authenticated_connections, _revocation_ready, _principal_is_current
+    global _account_is_active
+    global _wall_clock, _sleep
+    _authenticated_connections = registry
+    _revocation_ready = revocation_ready
+    _principal_is_current = principal_is_current
+    _account_is_active = account_is_active
+    _wall_clock = wall_clock
+    _sleep = sleep
+
+
+def get_authenticated_connection_registry() -> AuthenticatedConnectionRegistry:
+    return _authenticated_connections
+
+
+def connection_revocation_ready() -> bool:
+    return bool(_revocation_ready())
 
 
 def init_sync_engine(on_version_bump=None) -> SyncRegistry:
@@ -91,33 +143,88 @@ class _WsSender:
 async def ws_sync_handler(websocket: WebSocket):
     """WS /v1/sync — the main Entangled sync endpoint."""
 
-    # 1. Auth — extract user_id from query param or header
+    if not _revocation_ready():
+        await websocket.close(code=1013, reason="Revocation plane unavailable")
+        return
+
+    # 1. Auth — extract a token-free v3 principal from query param or header.
     token = websocket.query_params.get("token")
     if not token:
         auth_header = websocket.headers.get("authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:]
 
-    user_id: Optional[str] = None
+    principal: Optional[SessionPrincipal] = None
     if token:
-        user_id = decode_jwt_from_raw(token)
-    if not user_id:
+        principal = decode_principal_from_raw(token)
+    if principal is None:
         await websocket.close(code=4001, reason="Authentication required")
         return
-
-    # 纵深防御:签名有效但本环境不存在的用户,拒连(Xiaoniu 事故里 prod 曾为一个
-    # prod 用户表中不存在的 staging 用户建了孤儿 agent)。checker 返回 None(无法
-    # 判定,如 users 表未建)时放行 —— fail-open 只对 bootstrap,fail-closed 对已知不存在。
-    if _user_existence_checker is not None:
-        exists = _user_existence_checker(user_id)
-        if exists is False:
-            logger.warning("[WS] rejected unknown user %s (not in this environment)", user_id)
-            await websocket.close(code=4403, reason="Unknown user in this environment")
-            return
+    user_id = principal.user_id
 
     await websocket.accept()
 
     client_id = f"ws_{uuid.uuid4().hex[:12]}"
+
+    async def close_authenticated_connection(code: int, reason: str) -> None:
+        await websocket.close(code=code, reason=reason)
+
+    admitted = await _authenticated_connections.register(
+        AuthenticatedConnection(
+            connection_id=client_id,
+            principal=principal,
+            close=close_authenticated_connection,
+        )
+    )
+    if not admitted:
+        await websocket.close(code=1013, reason="Revocation plane unavailable")
+        return
+
+    # Register before the authority round-trip. If a revoke event races the
+    # introspection response, the registry closes this pending connection;
+    # if the event arrived first, current Gateway state rejects it below.
+    try:
+        principal_current = await _principal_is_current(principal)
+    except Exception:
+        logger.error("[WS] authority lookup failed; rejecting connection")
+        await _authenticated_connections.close_connection(
+            client_id,
+            code=1013,
+            reason="Authentication authority unavailable",
+        )
+        return
+    try:
+        account_active = _account_is_active(user_id)
+    except Exception:
+        logger.error("[WS] account deletion barrier lookup failed; rejecting connection")
+        await _authenticated_connections.close_connection(
+            client_id,
+            code=1013,
+            reason="Account authority unavailable",
+        )
+        return
+    if not principal_current or principal.expires_at <= int(_wall_clock()) or not account_active:
+        await _authenticated_connections.close_connection(
+            client_id,
+            code=4401,
+            reason="Session is no longer active",
+        )
+        return
+    if not await _authenticated_connections.contains(client_id):
+        return
+
+    # 纵深防御:此 legacy checker 仅在显式 opt-in 时使用；None 不是权威结论，
+    # 真正的 fail-closed 来自 Gateway introspection。
+    if _user_existence_checker is not None:
+        exists = _user_existence_checker(user_id)
+        if exists is False:
+            logger.warning("[WS] rejected user not proven by environment authority")
+            await _authenticated_connections.close_connection(
+                client_id,
+                code=4403,
+                reason="Unknown user in this environment",
+            )
+            return
     sender = _WsSender(websocket)
     last_activity = time.monotonic()
 
@@ -147,7 +254,7 @@ async def ws_sync_handler(websocket: WebSocket):
 
     consumer_task = asyncio.ensure_future(push_consumer())
     register_client(client_id, user_id, sync_push)
-    logger.info("[WS] Client %s connected (user=%s)", client_id, user_id)
+    logger.info("[WS] Client %s connected (user=%s)", client_id, _log_ref(user_id))
 
     store = get_store()
 
@@ -172,6 +279,17 @@ async def ws_sync_handler(websocket: WebSocket):
             pass
 
     heartbeat_task = asyncio.ensure_future(heartbeat())
+
+    async def expire_access_session() -> None:
+        delay = max(0.0, float(principal.expires_at) - _wall_clock())
+        await _sleep(delay)
+        await _authenticated_connections.close_connection(
+            client_id,
+            code=4401,
+            reason="Access token expired",
+        )
+
+    expiry_task = asyncio.ensure_future(expire_access_session())
 
     # 3. Push schema on connect — same frame as Gateway /app/ws and ws_handler.create_ws_handler
     try:
@@ -210,6 +328,7 @@ async def ws_sync_handler(websocket: WebSocket):
     except Exception as e:
         logger.warning("[WS] Error for client %s: %s", client_id, e)
     finally:
+        await _authenticated_connections.unregister(client_id)
         unregister_client(client_id)
         try:
             push_queue.put_nowait(None)
@@ -217,3 +336,4 @@ async def ws_sync_handler(websocket: WebSocket):
             pass
         consumer_task.cancel()
         heartbeat_task.cancel()
+        expiry_task.cancel()

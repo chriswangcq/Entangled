@@ -20,10 +20,13 @@ def health():
 @router.get("/v1/ready")
 def ready(required: str = Query("", description="Comma-separated required entity names")):
     store = get_store()
+    from .ws import connection_revocation_ready
+
     entity_names = set(store.entities)
     required_names = {name.strip() for name in required.split(",") if name.strip()}
     missing = sorted(required_names - entity_names)
-    if not entity_names or missing:
+    revocation_ready = connection_revocation_ready()
+    if not entity_names or missing or not revocation_ready:
         raise HTTPException(
             status_code=503,
             detail={
@@ -31,6 +34,7 @@ def ready(required: str = Query("", description="Comma-separated required entity
                 "entities": len(entity_names),
                 "entity_names": sorted(entity_names),
                 "missing": missing,
+                "revocation_ready": revocation_ready,
             },
         )
     return {
@@ -38,4 +42,5 @@ def ready(required: str = Query("", description="Comma-separated required entity
         "entities": len(entity_names),
         "entity_names": sorted(entity_names),
         "missing": [],
+        "revocation_ready": True,
     }

@@ -64,6 +64,16 @@ class SqlEntityStore(BaseStore):
     def __init__(self, db=None):
         super().__init__([])
         self._db = db
+        self._account_deletion_guard = None
+
+    def configure_account_deletion_guard(self, guard: Any) -> None:
+        """Install the durable write barrier at process startup."""
+
+        self._account_deletion_guard = guard
+
+    def _assert_account_write_allowed(self, user_id: str) -> None:
+        if self._account_deletion_guard is not None:
+            self._account_deletion_guard.assert_writable_in_transaction(user_id)
 
     @property
     def db(self):
@@ -525,6 +535,7 @@ class SqlEntityStore(BaseStore):
         self._apply_defaults(defn, row)
         self._check_required(defn, row)
         with self.db.transaction(defn.lock_type, resource_id=res_id or ""):
+            self._assert_account_write_allowed(user_id)
             self._assert_parent_owned(defn, user_id, row)
             self._insert_row(defn, row, is_auto_int=bool(is_auto_int))
             if is_auto_int and row.get(defn.id_field):
@@ -557,6 +568,7 @@ class SqlEntityStore(BaseStore):
         where_vals.append(entity_id)
         sql = f"UPDATE {defn.table} SET {', '.join(set_parts)} WHERE {where}"
         with self.db.transaction(defn.lock_type, resource_id=entity_id):
+            self._assert_account_write_allowed(user_id)
             self._assert_parent_move_owned(defn, user_id, row)
             cur = self.db.execute(sql, tuple(set_vals + where_vals))
             self._assert_tenant_update_matched(
@@ -605,6 +617,7 @@ class SqlEntityStore(BaseStore):
         if ownership_guard:
             sql += f" WHERE {ownership_guard}"
         with self.db.transaction(defn.lock_type, resource_id=entity_id):
+            self._assert_account_write_allowed(user_id)
             self._assert_parent_owned(defn, user_id, row)
             cur = self.db.execute(
                 sql,
@@ -642,6 +655,7 @@ class SqlEntityStore(BaseStore):
         sql = f"UPDATE {defn.table} SET {', '.join(set_parts)} WHERE {where}"
         res_id = entity_ids[0] if entity_ids else "batch"
         with self.db.transaction("global", resource_id=res_id, timeout=10.0):
+            self._assert_account_write_allowed(user_id)
             self._assert_parent_move_owned(defn, user_id, row)
             cur = self.db.execute(sql, tuple(set_vals + where_vals))
             rowcount = cur.rowcount
@@ -752,6 +766,8 @@ class SqlEntityStore(BaseStore):
                       target.user_id AS user_id
         """
         with self.db.transaction("global", resource_id=f"tenant-migration:{entity}", timeout=15.0):
+            for target_user_id in sorted({item[1] for item in normalized}):
+                self._assert_account_write_allowed(target_user_id)
             completed_rows = self.db.fetchall(sql, tuple(values))
 
         completed_ids = sorted(str(row["entity_id"]) for row in completed_rows)
@@ -821,6 +837,7 @@ class SqlEntityStore(BaseStore):
         sql = f"UPDATE {defn.table} SET {', '.join(set_parts)} WHERE {where}"
         res_id = (params or {}).get(defn.key_params[0] if defn.key_params else "", "batch") or "batch"
         with self.db.transaction("global", resource_id=res_id):
+            self._assert_account_write_allowed(user_id)
             self._assert_parent_move_owned(defn, user_id, row)
             cur = self.db.execute(sql, tuple(set_vals + where_vals))
         rowcount = cur.rowcount
@@ -892,6 +909,7 @@ class SqlEntityStore(BaseStore):
         self._apply_defaults(defn, row)
         self._check_required(defn, row)
         with self.db.transaction(defn.lock_type, resource_id=lock_id):
+            self._assert_account_write_allowed(user_id)
             self._assert_parent_owned(defn, user_id, row)
             self._insert_row(defn, row, is_auto_int=bool(is_auto_int))
             if is_auto_int and row.get(defn.id_field):
@@ -931,6 +949,7 @@ class SqlEntityStore(BaseStore):
         sql = f"UPDATE {defn.table} SET {', '.join(update_parts)} WHERE {where}"
         resource_id = where_condition.get(defn.id_field, "")
         with self.db.transaction(defn.lock_type, resource_id=str(resource_id)):
+            self._assert_account_write_allowed(user_id)
             self._assert_parent_move_owned(defn, user_id, row)
             cur = self.db.execute(sql, tuple(values + where_values))
             if cur.rowcount == 0:

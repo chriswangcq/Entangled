@@ -61,6 +61,33 @@ def build_parser() -> argparse.ArgumentParser:
         "users table (opt-in: requires the table to be the authoritative "
         "user store — see app/config.py)",
     )
+    parser.add_argument(
+        "--revocation-redis-url",
+        default=None,
+        help="Namespace-local Redis URL for durable auth revocation delivery",
+    )
+    parser.add_argument("--revocation-stream-key", default=None)
+    parser.add_argument(
+        "--revocation-authority-url",
+        default=None,
+        help="Gateway base URL for service-authenticated session introspection",
+    )
+    parser.add_argument("--revocation-authority-service-token-file", default=None)
+    parser.add_argument(
+        "--revocation-authority-response-max-age-seconds",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--require-revocation-stream",
+        action="store_true",
+        help="Fail startup unless the long-lived-session revocation plane is configured",
+    )
+    parser.add_argument(
+        "--account-deletion-token-file",
+        default=None,
+        help="Owner-only file containing the dedicated account-deletion v2 token",
+    )
     return parser
 
 
@@ -109,6 +136,29 @@ def config_from_args(args: argparse.Namespace) -> ServiceConfig:
         config.strict_auth = True
     if args.enforce_user_exists:
         config.enforce_user_exists = True
+    if args.revocation_redis_url:
+        config.revocation_redis_url = args.revocation_redis_url.strip()
+    if args.revocation_stream_key:
+        config.revocation_stream_key = args.revocation_stream_key.strip()
+    if args.revocation_authority_url:
+        config.revocation_authority_url = args.revocation_authority_url.strip()
+    if args.revocation_authority_service_token_file:
+        config.revocation_authority_service_token = _read_secret_file(
+            args.revocation_authority_service_token_file,
+            label="Gateway authority service token",
+        )
+    if args.revocation_authority_response_max_age_seconds is not None:
+        config.revocation_authority_response_max_age_seconds = (
+            args.revocation_authority_response_max_age_seconds
+        )
+    if args.require_revocation_stream:
+        config.require_revocation_stream = True
+    if args.account_deletion_token_file:
+        from .account_deletion import read_owner_only_secret_file
+
+        config.account_deletion_service_token = read_owner_only_secret_file(
+            args.account_deletion_token_file
+        )
     return config
 
 

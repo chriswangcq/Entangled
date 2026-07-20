@@ -179,6 +179,16 @@ def _state_key(
     return f"{entity}:{json.dumps(sorted_params)}"
 
 
+def _state_key_has_user(state_key: str, user_id: str) -> bool:
+    if ":" not in state_key:
+        return False
+    try:
+        payload = json.loads(state_key.split(":", 1)[1])
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("user_id") == user_id
+
+
 class SyncRegistry:
     """Registry of sync states. Bind to an EntityStore, not a global singleton."""
 
@@ -310,6 +320,25 @@ class SyncRegistry:
         params = _normalize_params(params)
         state = self.get_state(entity, params, user_id=user_id)
         return list(state.subscribers.keys())
+
+    def count_user_states(self, user_id: str) -> int:
+        return sum(
+            1 for key in self._states if _state_key_has_user(key, user_id)
+        )
+
+    def purge_user(self, user_id: str) -> int:
+        """Remove one account's process-local versions, op logs, and subscriptions."""
+
+        keys = {
+            key for key in self._states if _state_key_has_user(key, user_id)
+        }
+        for key in keys:
+            self._states.pop(key, None)
+        for client_id, subscriptions in list(self._client_subs.items()):
+            subscriptions.difference_update(keys)
+            if not subscriptions:
+                self._client_subs.pop(client_id, None)
+        return len(keys)
 
     def reset(self) -> None:
         """Clear all state (for testing)."""

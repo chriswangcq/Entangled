@@ -44,6 +44,7 @@ def build_jwt(
     now: int | None = None,
     ttl_seconds: int = 300,
     jti: str | None = None,
+    sid: str | None = None,
 ) -> str:
     from jose import jwt
     from entangled.app.auth import (
@@ -63,13 +64,19 @@ def build_jwt(
         "iss": access_token_issuer(namespace.strip()),
         "aud": access_token_audience(namespace.strip()),
         "sub": user_id.strip(),
+        "auth_time": issued_at,
         "iat": issued_at,
         "exp": issued_at + ttl_seconds,
         "ns": namespace.strip(),
         "jti": (jti or secrets.token_urlsafe(24)).strip(),
+        "auth_version": 3,
+        "sid": (sid or f"smoke-{secrets.token_urlsafe(18)}").strip(),
+        "auth_epoch": 0,
     }
     if not claims["jti"]:
         raise ValueError("smoke JWT jti is required")
+    if not claims["sid"]:
+        raise ValueError("smoke JWT sid is required")
     return jwt.encode(claims, secret.strip(), algorithm=ACCESS_TOKEN_ALGORITHM)
 
 
