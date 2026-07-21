@@ -262,17 +262,34 @@ def create_app(config: ServiceConfig) -> FastAPI:
             )
         logger.info("Sync engine initialized")
 
-        logger.info("Entangled Service ready")
-        yield
+        from entangled.staging_fixture.runtime import (
+            build_entangled_owner_fixture_runtime,
+        )
 
-        revocation_stop.set()
-        if revocation_task is not None:
-            revocation_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await revocation_task
-        await authenticated_connections.close_everything("Service shutting down")
-        close_database()
-        logger.info("Entangled Service shutdown")
+        fixture_runtime = build_entangled_owner_fixture_runtime(
+            namespace=namespace,
+            socket_dir=config.account_deletion_fixture_socket_dir,
+            secret_dir=config.account_deletion_fixture_secret_dir,
+            state_dir=config.account_deletion_fixture_state_dir,
+            store=store,
+        )
+        try:
+            if fixture_runtime is not None:
+                await fixture_runtime.start()
+                logger.info("Sealed Entangled Staging fixture socket enabled")
+            logger.info("Entangled Service ready")
+            yield
+        finally:
+            if fixture_runtime is not None:
+                await fixture_runtime.close()
+            revocation_stop.set()
+            if revocation_task is not None:
+                revocation_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await revocation_task
+            await authenticated_connections.close_everything("Service shutting down")
+            close_database()
+            logger.info("Entangled Service shutdown")
 
     app = FastAPI(
         title="Entangled Service",
