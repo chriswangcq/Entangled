@@ -725,10 +725,7 @@ def test_app_factory_requires_topology_when_account_deletion_is_enabled():
             ),
         )
     )
-    assert any(
-        route.path == "/internal/account-deletion/v2/purge_entangled"
-        for route in app.routes
-    )
+    assert "/internal/account-deletion/v2/purge_entangled" in app.openapi()["paths"]
 
 
 def test_sync_registry_purges_only_target_user_state_and_subscriptions():

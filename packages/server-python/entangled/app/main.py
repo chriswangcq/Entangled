@@ -99,6 +99,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Exact versioned deployment attestation for account deletion",
     )
+    parser.add_argument("--account-deletion-fixture-socket-dir", default=None)
+    parser.add_argument("--account-deletion-fixture-secret-dir", default=None)
+    parser.add_argument("--account-deletion-fixture-state-dir", default=None)
     return parser
 
 
@@ -175,6 +178,18 @@ def config_from_args(args: argparse.Namespace) -> ServiceConfig:
     if args.account_deletion_topology_attestation is not None:
         config.account_deletion_topology_attestation = (
             args.account_deletion_topology_attestation.strip()
+        )
+    if args.account_deletion_fixture_socket_dir is not None:
+        config.account_deletion_fixture_socket_dir = (
+            args.account_deletion_fixture_socket_dir.strip()
+        )
+    if args.account_deletion_fixture_secret_dir is not None:
+        config.account_deletion_fixture_secret_dir = (
+            args.account_deletion_fixture_secret_dir.strip()
+        )
+    if args.account_deletion_fixture_state_dir is not None:
+        config.account_deletion_fixture_state_dir = (
+            args.account_deletion_fixture_state_dir.strip()
         )
     return config
 
