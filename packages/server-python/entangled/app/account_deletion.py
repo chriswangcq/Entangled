@@ -474,9 +474,15 @@ def _count_unattributed_registered_state(
     """Return bounded opaque witnesses for unresolved durable ownership."""
 
     unattributed = 0
+    registered_tables = {str(item.table) for item in all_definitions}
     for row in direct_tables:
         table = str(row["table_name"])
         validate_sql_identifier(table, label="discovered tenant table")
+        if table in registered_tables:
+            # Registered definitions are classified by their declared ownership
+            # graph below.  A global entity may retain a nullable ``user_id``
+            # compatibility column without making its shared rows unattributed.
+            continue
         if _query_has_row(
             db,
             f"""
