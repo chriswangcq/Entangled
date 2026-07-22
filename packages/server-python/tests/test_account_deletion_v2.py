@@ -317,6 +317,25 @@ def test_durable_inventory_blocks_extant_rows_with_unresolved_parent_definition(
     assert count == 1
 
 
+def test_durable_inventory_uses_registered_global_ownership_instead_of_nullable_user_column():
+    definition = _definition("models", user_scoped=False)
+    db = _InventoryProbeDb(["account-deletion:invalid-direct-owner"])
+    store = _DefinitionStore([definition])
+
+    count = account_deletion._count_unattributed_registered_state(
+        db,
+        store,
+        [definition],
+        [{"table_name": "models"}],
+    )
+
+    assert count == 0
+    assert all(
+        "account-deletion:invalid-direct-owner" not in query
+        for query, _params in db.queries
+    )
+
+
 def test_ownership_reference_probe_compares_recursive_canonical_owners():
     definitions = [
         _definition("agents", user_scoped=True),
